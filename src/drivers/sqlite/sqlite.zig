@@ -77,6 +77,15 @@ pub const Migrator = struct {
 pub const PoolConfig = struct {
     database: Config = .{},
     max_open: usize = 4,
+    max_idle: usize = 4,
+};
+
+pub const PoolStats = struct {
+    open: usize,
+    idle: usize,
+    leased: usize,
+    max_open: usize,
+    max_idle: usize,
 };
 
 pub const Pool = struct {
@@ -129,6 +138,21 @@ pub const Pool = struct {
             .conn_value = conn,
         };
     }
+
+    pub fn stats(self: *const Pool) PoolStats {
+        const idle_count = self.idle.items.len;
+        return .{
+            .open = self.open_count,
+            .idle = idle_count,
+            .leased = self.open_count - idle_count,
+            .max_open = self.config.max_open,
+            .max_idle = self.effectiveMaxIdle(),
+        };
+    }
+
+    fn effectiveMaxIdle(self: *const Pool) usize {
+        return @min(self.config.max_idle, self.config.max_open);
+    }
 };
 
 pub const Lease = struct {
@@ -146,8 +170,14 @@ pub const Lease = struct {
         if (!self.open) return error.LeaseClosed;
         if (self.pool.closed) return error.PoolClosed;
 
-        self.conn_value.close();
-        try self.pool.idle.append(self.pool.allocator, self.db);
+        if (self.pool.idle.items.len < self.pool.effectiveMaxIdle()) {
+            try self.pool.idle.append(self.pool.allocator, self.db);
+            self.conn_value.close();
+        } else {
+            self.conn_value.close();
+            self.db.deinit();
+            self.pool.open_count -= 1;
+        }
         self.open = false;
     }
 
@@ -1229,24 +1259,99 @@ test "SQLite pool releases and reuses leases" {
     var pool = try Pool.init(std.testing.allocator, .{ .max_open = 1 });
     defer pool.deinit();
 
+    try std.testing.expectEqualDeep(PoolStats{
+        .open = 0,
+        .idle = 0,
+        .leased = 0,
+        .max_open = 1,
+        .max_idle = 1,
+    }, pool.stats());
+
     var first = try pool.acquire();
+    try std.testing.expectEqualDeep(PoolStats{
+        .open = 1,
+        .idle = 0,
+        .leased = 1,
+        .max_open = 1,
+        .max_idle = 1,
+    }, pool.stats());
+
     var first_conn = try first.conn();
     _ = try first_conn.exec("create table pooled_reuse (id integer)", &.{});
     _ = try first_conn.exec("insert into pooled_reuse (id) values (?)", &.{.{ .integer = 1 }});
     try first.release();
     try std.testing.expect(!first.open);
-    try std.testing.expectEqual(@as(usize, 1), pool.open_count);
-    try std.testing.expectEqual(@as(usize, 1), pool.idle.items.len);
+    try std.testing.expectEqualDeep(PoolStats{
+        .open = 1,
+        .idle = 1,
+        .leased = 0,
+        .max_open = 1,
+        .max_idle = 1,
+    }, pool.stats());
 
     var second = try pool.acquire();
     defer second.release() catch unreachable;
-    try std.testing.expectEqual(@as(usize, 1), pool.open_count);
-    try std.testing.expectEqual(@as(usize, 0), pool.idle.items.len);
+    try std.testing.expectEqualDeep(PoolStats{
+        .open = 1,
+        .idle = 0,
+        .leased = 1,
+        .max_open = 1,
+        .max_idle = 1,
+    }, pool.stats());
 
     var rows = try (try second.conn()).query("select id from pooled_reuse", &.{});
     defer rows.deinit();
     const row = (try rows.next()).?;
     try std.testing.expectEqual(@as(i64, 1), try (try row.value("id")).asInt());
+}
+
+test "SQLite pool max idle closes excess released leases" {
+    var pool = try Pool.init(std.testing.allocator, .{ .max_open = 2, .max_idle = 1 });
+    defer pool.deinit();
+
+    var first = try pool.acquire();
+    var second = try pool.acquire();
+    try std.testing.expectEqualDeep(PoolStats{
+        .open = 2,
+        .idle = 0,
+        .leased = 2,
+        .max_open = 2,
+        .max_idle = 1,
+    }, pool.stats());
+
+    try first.release();
+    try std.testing.expectEqualDeep(PoolStats{
+        .open = 2,
+        .idle = 1,
+        .leased = 1,
+        .max_open = 2,
+        .max_idle = 1,
+    }, pool.stats());
+
+    try second.release();
+    try std.testing.expectEqualDeep(PoolStats{
+        .open = 1,
+        .idle = 1,
+        .leased = 0,
+        .max_open = 2,
+        .max_idle = 1,
+    }, pool.stats());
+}
+
+test "SQLite pool zero max idle closes releases immediately" {
+    var pool = try Pool.init(std.testing.allocator, .{ .max_open = 1, .max_idle = 0 });
+    defer pool.deinit();
+
+    var lease = try pool.acquire();
+    try lease.release();
+
+    try std.testing.expectEqualDeep(PoolStats{
+        .open = 0,
+        .idle = 0,
+        .leased = 0,
+        .max_open = 1,
+        .max_idle = 0,
+    }, pool.stats());
 }
 
 test "SQLite pool enforces max open leases" {
