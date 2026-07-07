@@ -36,3 +36,9 @@ Run the test gate with Zig 0.16:
 ```sh
 zig build test
 ```
+
+Run the SQLite example with leak checking:
+
+```sh
+zig build sqlite-example -Denable-sqlite=true
+```

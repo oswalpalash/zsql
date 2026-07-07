@@ -32,4 +32,25 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run zsql tests");
     test_step.dependOn(&run_tests.step);
+
+    const sqlite_example_step = b.step("sqlite-example", "Run the SQLite GPA leak-checked example");
+    if (enable_sqlite) {
+        const sqlite_example_mod = b.createModule(.{
+            .root_source_file = b.path("examples/sqlite_basic.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        sqlite_example_mod.addImport("zsql", zsql_mod);
+        sqlite_example_mod.linkSystemLibrary("sqlite3", .{});
+
+        const sqlite_example = b.addExecutable(.{
+            .name = "sqlite-basic",
+            .root_module = sqlite_example_mod,
+        });
+
+        const run_sqlite_example = b.addRunArtifact(sqlite_example);
+        sqlite_example_step.dependOn(&run_sqlite_example.step);
+    } else {
+        sqlite_example_step.dependOn(&run_tests.step);
+    }
 }
