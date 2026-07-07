@@ -545,6 +545,38 @@ test "SQLite query decodes borrowed row values" {
     try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
 }
 
+test "SQLite query row maps to scalar struct" {
+    const Item = struct {
+        id: i64,
+        name: []const u8,
+        score: f64,
+        missing: ?[]const u8,
+    };
+
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table mapped_items (id integer, name text, score real, missing text)", &.{});
+    _ = try conn.exec("insert into mapped_items (id, name, score, missing) values (?, ?, ?, ?)", &.{
+        .{ .integer = 11 },
+        .{ .text = "bolt" },
+        .{ .real = 8.25 },
+        .{ .null = {} },
+    });
+
+    var rows = try conn.query("select id, name, score, missing from mapped_items", &.{});
+    defer rows.deinit();
+
+    const item = try (try rows.next()).?.to(Item);
+    try std.testing.expectEqual(@as(i64, 11), item.id);
+    try std.testing.expectEqualStrings("bolt", item.name);
+    try std.testing.expectEqual(@as(f64, 8.25), item.score);
+    try std.testing.expectEqual(@as(?[]const u8, null), item.missing);
+}
+
 test "SQLite query can be prepared statement owned by rows" {
     var db = try Database.open(std.testing.allocator, .{});
     defer db.deinit();

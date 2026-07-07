@@ -33,6 +33,10 @@ pub const Row = struct {
         }
         return null;
     }
+
+    pub fn to(self: Row, comptime T: type) !T {
+        return mapRow(T, self);
+    }
 };
 
 pub const OwnedRow = struct {
@@ -108,7 +112,76 @@ pub const OwnedRow = struct {
         }
         return null;
     }
+
+    pub fn to(self: OwnedRow, comptime T: type) !T {
+        return mapOwnedRow(T, self);
+    }
 };
+
+fn mapRow(comptime T: type, row: Row) !T {
+    const info = @typeInfo(T);
+    if (info != .@"struct") @compileError("Row.to expects a struct type");
+
+    var result: T = undefined;
+    inline for (info.@"struct".fields, 0..) |field, ordinal| {
+        const value = if (row.indexOf(field.name)) |index|
+            try row.valueAt(index)
+        else
+            try row.valueAt(ordinal);
+        @field(result, field.name) = try convertValue(field.type, value);
+    }
+    return result;
+}
+
+fn convertValue(comptime T: type, value: Value) !T {
+    const info = @typeInfo(T);
+    return switch (info) {
+        .optional => |optional| {
+            if (value.isNull()) return null;
+            return try convertValue(optional.child, value);
+        },
+        .bool => switch (value) {
+            .boolean => |v| v,
+            .integer => |v| v != 0,
+            else => error.InvalidColumnType,
+        },
+        .int => switch (value) {
+            .integer => |v| std.math.cast(T, v) orelse error.InvalidColumnType,
+            else => error.InvalidColumnType,
+        },
+        .float => switch (value) {
+            .real => |v| @as(T, @floatCast(v)),
+            .integer => |v| @as(T, @floatFromInt(v)),
+            else => error.InvalidColumnType,
+        },
+        .pointer => |pointer| {
+            if (pointer.size != .slice or pointer.child != u8) {
+                @compileError("Row.to only supports []const u8 string/blob slices for pointer fields");
+            }
+            return switch (value) {
+                .text => |v| v,
+                .blob => |v| v,
+                else => error.InvalidColumnType,
+            };
+        },
+        else => @compileError("Row.to only supports scalar, optional scalar, and []const u8 fields"),
+    };
+}
+
+fn mapOwnedRow(comptime T: type, row: OwnedRow) !T {
+    const info = @typeInfo(T);
+    if (info != .@"struct") @compileError("OwnedRow.to expects a struct type");
+
+    var result: T = undefined;
+    inline for (info.@"struct".fields, 0..) |field, ordinal| {
+        const value = if (row.indexOf(field.name)) |index|
+            try row.valueAt(index)
+        else
+            try row.valueAt(ordinal);
+        @field(result, field.name) = try convertValue(field.type, value);
+    }
+    return result;
+}
 
 test "Row reads values by index and column name" {
     const row = try Row.init(&.{ "id", "name" }, &.{
@@ -137,4 +210,52 @@ test "OwnedRow duplicates text and blob values" {
     try std.testing.expectEqual(@as(usize, 2), owned.len());
     try std.testing.expectEqualStrings("ada", try (try owned.value("name")).asText());
     try std.testing.expectEqualStrings("zig", try (try owned.value("payload")).asBlob());
+}
+
+test "Row maps to struct by field name and ordinal fallback" {
+    const User = struct {
+        id: u32,
+        name: []const u8,
+        active: bool,
+        score: ?f32,
+    };
+    const row = try Row.init(&.{ "name", "id", "active", "score" }, &.{
+        .{ .text = "ada" },
+        .{ .integer = 7 },
+        .{ .integer = 1 },
+        .{ .real = 2.5 },
+    });
+
+    const user = try row.to(User);
+    try std.testing.expectEqual(@as(u32, 7), user.id);
+    try std.testing.expectEqualStrings("ada", user.name);
+    try std.testing.expect(user.active);
+    try std.testing.expectEqual(@as(?f32, 2.5), user.score);
+
+    const Pair = struct {
+        first: i64,
+        second: []const u8,
+    };
+    const ordinal_row = try Row.init(&.{ "a", "b" }, &.{
+        .{ .integer = 1 },
+        .{ .text = "two" },
+    });
+    const pair = try ordinal_row.to(Pair);
+    try std.testing.expectEqual(@as(i64, 1), pair.first);
+    try std.testing.expectEqualStrings("two", pair.second);
+}
+
+test "Row.to handles null optionals and rejects invalid field types" {
+    const MaybeUser = struct {
+        nickname: ?[]const u8,
+    };
+    const row = try Row.init(&.{"nickname"}, &.{.{ .null = {} }});
+    const user = try row.to(MaybeUser);
+    try std.testing.expectEqual(@as(?[]const u8, null), user.nickname);
+
+    const Bad = struct {
+        id: u8,
+    };
+    const bad_row = try Row.init(&.{"id"}, &.{.{ .integer = 300 }});
+    try std.testing.expectError(error.InvalidColumnType, bad_row.to(Bad));
 }
