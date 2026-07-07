@@ -14,6 +14,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     zsql_mod.addOptions("zsql_options", options);
+    if (enable_sqlite) {
+        zsql_mod.linkSystemLibrary("sqlite3", .{});
+    }
 
     const lib = b.addLibrary(.{
         .linkage = .static,
