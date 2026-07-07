@@ -3,7 +3,7 @@
 
 ## Status
 
-This repository is in the buildable-core phase. The package currently exposes the public core names that driver work will build on:
+This repository is in the SQLite driver foundation phase. The package currently exposes the public core names that driver work will build on:
 
 - `zsql.Database`
 - `zsql.Conn`
@@ -12,10 +12,17 @@ This repository is in the buildable-core phase. The package currently exposes th
 - `zsql.Row`
 - `zsql.Value`
 - `zsql.params`
+- `zsql.drivers.sqlite` with `-Denable-sqlite=true`
 
 Execution methods currently return `error.DriverUnavailable` until SQLite and PostgreSQL drivers are implemented.
 
 The `zsql.params` module can classify SQL placeholders while ignoring quoted SQL and comments. It recognizes `?`, `?NNN`, `:name`, `@name`, and `$name` forms for future driver binding. Prepared statements record that metadata and reject bind-count mismatches before driver execution.
+
+The SQLite surface is currently an opt-in skeleton:
+
+```sh
+zig build test -Denable-sqlite=true
+```
 
 ## Development
 

@@ -6,6 +6,17 @@ pub const Stmt = @import("core/stmt.zig").Stmt;
 pub const Conn = @import("core/conn.zig").Conn;
 pub const Database = @import("core/database.zig").Database;
 pub const params = @import("core/params.zig");
+const options = @import("zsql_options");
+
+pub const drivers = struct {
+    pub const sqlite = if (options.enable_sqlite) @import("drivers/sqlite/sqlite.zig") else unavailable.sqlite;
+};
+
+pub const unavailable = struct {
+    pub const sqlite = struct {
+        pub const enabled = false;
+    };
+};
 
 test {
     _ = @import("core/value.zig");
@@ -15,4 +26,7 @@ test {
     _ = @import("core/conn.zig");
     _ = @import("core/database.zig");
     _ = @import("core/params.zig");
+    if (options.enable_sqlite) {
+        _ = @import("drivers/sqlite/sqlite.zig");
+    }
 }
