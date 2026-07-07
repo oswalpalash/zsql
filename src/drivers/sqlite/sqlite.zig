@@ -14,6 +14,11 @@ pub const Config = struct {
     mode: OpenMode = .memory,
 };
 
+pub const NamedValue = struct {
+    name: []const u8,
+    value: core.Value,
+};
+
 pub const Database = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -87,6 +92,18 @@ pub const Conn = struct {
         errdefer stmt.close();
         return Rows.init(stmt, binds);
     }
+
+    pub fn execNamed(self: *Conn, sql: []const u8, binds: []const NamedValue) !core.ExecResult {
+        var stmt = try self.prepare(sql);
+        defer stmt.close();
+        return stmt.execNamed(binds);
+    }
+
+    pub fn queryNamed(self: *Conn, sql: []const u8, binds: []const NamedValue) !Rows {
+        var stmt = try self.prepare(sql);
+        errdefer stmt.close();
+        return Rows.initNamed(stmt, binds);
+    }
 };
 
 pub const Stmt = struct {
@@ -125,6 +142,16 @@ pub const Stmt = struct {
     pub fn exec(self: *Stmt, binds: []const core.Value) !core.ExecResult {
         if (self.closed) return error.StatementClosed;
         try self.bindValues(binds);
+        return self.stepExec();
+    }
+
+    pub fn execNamed(self: *Stmt, binds: []const NamedValue) !core.ExecResult {
+        if (self.closed) return error.StatementClosed;
+        try self.bindNamedValues(binds);
+        return self.stepExec();
+    }
+
+    fn stepExec(self: *Stmt) !core.ExecResult {
         const rc = c.sqlite3_step(self.handle);
         switch (rc) {
             c.SQLITE_DONE => {
@@ -148,6 +175,10 @@ pub const Stmt = struct {
         return Rows.init(self, binds);
     }
 
+    pub fn queryNamed(self: Stmt, binds: []const NamedValue) !Rows {
+        return Rows.initNamed(self, binds);
+    }
+
     pub fn bindValues(self: *Stmt, binds: []const core.Value) !void {
         if (self.closed) return error.StatementClosed;
         try self.validateBindCount(binds);
@@ -160,10 +191,61 @@ pub const Stmt = struct {
         }
     }
 
+    pub fn bindNamedValues(self: *Stmt, binds: []const NamedValue) !void {
+        if (self.closed) return error.StatementClosed;
+        try self.validateNamedBindCount(binds);
+        self.freeBindBuffers();
+        _ = c.sqlite3_clear_bindings(self.handle);
+        _ = c.sqlite3_reset(self.handle);
+
+        for (binds) |bind| {
+            try self.bindValue(try self.namedBindIndex(bind.name), bind.value);
+        }
+    }
+
     fn validateBindCount(self: Stmt, binds: []const core.Value) !void {
         if (binds.len != @as(usize, @intCast(c.sqlite3_bind_parameter_count(self.handle)))) {
             return error.InvalidBindValue;
         }
+    }
+
+    fn validateNamedBindCount(self: Stmt, binds: []const NamedValue) !void {
+        const count = try sqliteParameterCount(self.handle);
+        if (binds.len != count) return error.InvalidBindValue;
+
+        for (binds, 0..) |bind, index| {
+            _ = try self.namedBindIndex(bind.name);
+            for (binds[0..index]) |previous| {
+                if (sameBindName(bind.name, previous.name)) return error.InvalidBindValue;
+            }
+        }
+    }
+
+    fn namedBindIndex(self: Stmt, name: []const u8) !c_int {
+        if (name.len == 0) return error.InvalidBindValue;
+
+        if (isBindMarker(name[0])) return self.lookupNamedBindIndex(name);
+
+        var prefixed_buffer: [256]u8 = undefined;
+        if (name.len + 1 > prefixed_buffer.len) return error.InvalidBindValue;
+        inline for (.{ ':', '@', '$' }) |marker| {
+            prefixed_buffer[0] = marker;
+            @memcpy(prefixed_buffer[1 .. name.len + 1], name);
+            if (self.lookupNamedBindIndex(prefixed_buffer[0 .. name.len + 1])) |index| {
+                return index;
+            } else |_| {}
+        }
+
+        return error.InvalidBindValue;
+    }
+
+    fn lookupNamedBindIndex(self: Stmt, name: []const u8) !c_int {
+        const lookup_z = self.allocator.dupeZ(u8, name) catch return error.InvalidBindValue;
+        defer self.allocator.free(lookup_z);
+
+        const index = c.sqlite3_bind_parameter_index(self.handle, lookup_z.ptr);
+        if (index == 0) return error.InvalidBindValue;
+        return index;
     }
 
     fn bindValue(self: *Stmt, index: c_int, value: core.Value) !void {
@@ -223,20 +305,34 @@ pub const Rows = struct {
         errdefer owned_stmt.close();
 
         try owned_stmt.bindValues(binds);
-        const column_count = try sqliteColumnCount(owned_stmt.handle);
-        const columns = try owned_stmt.allocator.alloc([]const u8, column_count);
-        errdefer owned_stmt.allocator.free(columns);
-        const values = try owned_stmt.allocator.alloc(core.Value, column_count);
-        errdefer owned_stmt.allocator.free(values);
+        return initBound(owned_stmt);
+    }
+
+    pub fn initNamed(stmt: Stmt, binds: []const NamedValue) !Rows {
+        var owned_stmt = stmt;
+        errdefer owned_stmt.close();
+
+        try owned_stmt.bindNamedValues(binds);
+        return initBound(owned_stmt);
+    }
+
+    fn initBound(owned_stmt: Stmt) !Rows {
+        var stmt = owned_stmt;
+
+        const column_count = try sqliteColumnCount(stmt.handle);
+        const columns = try stmt.allocator.alloc([]const u8, column_count);
+        errdefer stmt.allocator.free(columns);
+        const values = try stmt.allocator.alloc(core.Value, column_count);
+        errdefer stmt.allocator.free(values);
 
         for (columns, 0..) |*column, index| {
-            const name = c.sqlite3_column_name(owned_stmt.handle, try sqliteIndex(index));
+            const name = c.sqlite3_column_name(stmt.handle, try sqliteIndex(index));
             if (name == null) return error.DriverError;
             column.* = std.mem.span(name);
         }
 
         return .{
-            .stmt = owned_stmt,
+            .stmt = stmt,
             .columns = columns,
             .values = values,
         };
@@ -286,6 +382,23 @@ fn sqliteIndex(index: usize) !c_int {
 
 fn sqliteLen(len: usize) !c_int {
     return std.math.cast(c_int, len) orelse error.InvalidBindValue;
+}
+
+fn sqliteParameterCount(stmt: *c.sqlite3_stmt) !usize {
+    return std.math.cast(usize, c.sqlite3_bind_parameter_count(stmt)) orelse error.InvalidBindValue;
+}
+
+fn isBindMarker(c_: u8) bool {
+    return c_ == ':' or c_ == '@' or c_ == '$';
+}
+
+fn sameBindName(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, stripBindMarker(a), stripBindMarker(b));
+}
+
+fn stripBindMarker(name: []const u8) []const u8 {
+    if (name.len > 0 and isBindMarker(name[0])) return name[1..];
+    return name;
 }
 
 fn sqliteColumnCount(stmt: *c.sqlite3_stmt) !usize {
@@ -475,6 +588,59 @@ test "SQLite borrowed row can be copied into owned row" {
 
     try std.testing.expectEqualStrings("note", try (try owned.value("title")).asText());
     try std.testing.expectEqualStrings("payload", try (try owned.value("body")).asBlob());
+}
+
+test "SQLite supports named exec and query binds" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table people (id integer, name text, active integer)", &.{});
+    const result = try conn.execNamed(
+        "insert into people (id, name, active) values (:id, @name, $active)",
+        &.{
+            .{ .name = "id", .value = .{ .integer = 9 } },
+            .{ .name = "name", .value = .{ .text = "ada" } },
+            .{ .name = "active", .value = .{ .boolean = true } },
+        },
+    );
+    try std.testing.expectEqual(@as(u64, 1), result.rows_affected);
+
+    var rows = try conn.queryNamed(
+        "select name, active from people where id = :id",
+        &.{.{ .name = ":id", .value = .{ .integer = 9 } }},
+    );
+    defer rows.deinit();
+
+    const row = (try rows.next()).?;
+    try std.testing.expectEqualStrings("ada", try (try row.value("name")).asText());
+    try std.testing.expectEqual(@as(i64, 1), try (try row.value("active")).asInt());
+    try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
+}
+
+test "SQLite named binds reject missing unknown and duplicate names" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    var stmt = try conn.prepare("select :id, :name");
+    defer stmt.close();
+
+    try std.testing.expectError(error.InvalidBindValue, stmt.bindNamedValues(&.{
+        .{ .name = "id", .value = .{ .integer = 1 } },
+    }));
+    try std.testing.expectError(error.InvalidBindValue, stmt.bindNamedValues(&.{
+        .{ .name = "id", .value = .{ .integer = 1 } },
+        .{ .name = "missing", .value = .{ .text = "ada" } },
+    }));
+    try std.testing.expectError(error.InvalidBindValue, stmt.bindNamedValues(&.{
+        .{ .name = "id", .value = .{ .integer = 1 } },
+        .{ .name = ":id", .value = .{ .integer = 2 } },
+    }));
 }
 
 test "SQLite validates binds against SQLite parameter count" {
