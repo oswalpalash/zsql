@@ -5,6 +5,7 @@ pub const Rows = @import("core/rows.zig").Rows;
 pub const Stmt = @import("core/stmt.zig").Stmt;
 pub const Conn = @import("core/conn.zig").Conn;
 pub const Database = @import("core/database.zig").Database;
+pub const params = @import("core/params.zig");
 
 test {
     _ = @import("core/value.zig");
@@ -13,4 +14,5 @@ test {
     _ = @import("core/stmt.zig");
     _ = @import("core/conn.zig");
     _ = @import("core/database.zig");
+    _ = @import("core/params.zig");
 }
