@@ -45,3 +45,9 @@ Run the SQLite example with leak checking:
 ```sh
 zig build sqlite-example -Denable-sqlite=true
 ```
+
+Run the SQLite migration example with leak checking:
+
+```sh
+zig build sqlite-migrate-example -Denable-sqlite=true
+```
