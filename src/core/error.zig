@@ -5,6 +5,7 @@ pub const Error = error{
     InvalidColumnType,
     InvalidBindValue,
     InvalidSql,
+    UnexpectedRow,
     StatementClosed,
     ConnectionClosed,
     OutOfMemory,

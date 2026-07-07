@@ -119,7 +119,21 @@ pub const Stmt = struct {
     pub fn exec(self: *Stmt, binds: []const core.Value) !void {
         if (self.closed) return error.StatementClosed;
         try self.bindValues(binds);
-        return error.DriverUnavailable;
+        const rc = c.sqlite3_step(self.handle);
+        switch (rc) {
+            c.SQLITE_DONE => {
+                const reset_rc = c.sqlite3_reset(self.handle);
+                if (reset_rc != c.SQLITE_OK) return error.DriverError;
+            },
+            c.SQLITE_ROW => {
+                _ = c.sqlite3_reset(self.handle);
+                return error.UnexpectedRow;
+            },
+            else => {
+                _ = c.sqlite3_reset(self.handle);
+                return error.DriverError;
+            },
+        }
     }
 
     pub fn bindValues(self: *Stmt, binds: []const core.Value) !void {
@@ -186,14 +200,14 @@ fn sqliteLen(len: usize) !c_int {
     return std.math.cast(c_int, len) orelse error.InvalidBindValue;
 }
 
-test "SQLite opens memory database and preserves driver unavailable execution" {
+test "SQLite opens memory database and rejects row-returning exec" {
     var db = try Database.open(std.testing.allocator, .{});
     defer db.deinit();
 
     var conn = try db.connect();
     defer conn.close();
 
-    try std.testing.expectError(error.DriverUnavailable, conn.exec("select ?", &.{.{ .integer = 1 }}));
+    try std.testing.expectError(error.UnexpectedRow, conn.exec("select ?", &.{.{ .integer = 1 }}));
 }
 
 test "SQLite prepares and finalizes statements" {
@@ -208,7 +222,7 @@ test "SQLite prepares and finalizes statements" {
 
     try std.testing.expectEqual(@as(usize, 2), stmt.placeholders.total);
     try std.testing.expectError(error.InvalidBindValue, stmt.exec(&.{.{ .integer = 1 }}));
-    try std.testing.expectError(error.DriverUnavailable, stmt.exec(&.{
+    try std.testing.expectError(error.UnexpectedRow, stmt.exec(&.{
         .{ .integer = 1 },
         .{ .text = "ada" },
     }));
@@ -240,7 +254,7 @@ test "SQLite binds all value variants before execution is implemented" {
         std.mem.span(expanded),
     );
 
-    try std.testing.expectError(error.DriverUnavailable, stmt.exec(&.{
+    try std.testing.expectError(error.UnexpectedRow, stmt.exec(&.{
         .{ .null = {} },
         .{ .integer = 42 },
         .{ .real = 3.5 },
@@ -248,6 +262,24 @@ test "SQLite binds all value variants before execution is implemented" {
         .{ .blob = "sql" },
         .{ .boolean = false },
     }));
+}
+
+test "SQLite exec steps statements that do not return rows" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    try conn.exec("create table users (id integer not null, name text not null, active integer not null)", &.{});
+    try conn.exec("insert into users (id, name, active) values (?, ?, ?)", &.{
+        .{ .integer = 1 },
+        .{ .text = "ada" },
+        .{ .boolean = true },
+    });
+
+    try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_changes(db.handle));
+    try std.testing.expectError(error.UnexpectedRow, conn.exec("select id from users", &.{}));
 }
 
 test "SQLite validates binds against SQLite parameter count" {
