@@ -18,7 +18,7 @@ Execution methods currently return `error.DriverUnavailable` until SQLite and Po
 
 The `zsql.params` module can classify SQL placeholders while ignoring quoted SQL and comments. It recognizes `?`, `?NNN`, `:name`, `@name`, and `$name` forms for future driver binding. Prepared statements record that metadata and reject bind-count mismatches before driver execution.
 
-The SQLite surface is currently opt-in and links against system SQLite for open/close lifecycle tests:
+The SQLite surface is currently opt-in and links against system SQLite for open/close and prepare/finalize lifecycle tests:
 
 ```sh
 zig build test -Denable-sqlite=true
