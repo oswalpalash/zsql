@@ -19,6 +19,33 @@ pub const NamedValue = struct {
     value: core.Value,
 };
 
+pub const MigrationRecord = struct {
+    version: u64,
+    name: []u8,
+    checksum: core.migrate.Checksum,
+    applied_at: []u8,
+    dirty: bool,
+
+    pub fn deinit(self: *MigrationRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.applied_at);
+        self.* = undefined;
+    }
+};
+
+pub const MigrationStatus = struct {
+    allocator: std.mem.Allocator,
+    records: []MigrationRecord,
+
+    pub fn deinit(self: *MigrationStatus) void {
+        for (self.records) |*record| {
+            record.deinit(self.allocator);
+        }
+        self.allocator.free(self.records);
+        self.* = undefined;
+    }
+};
+
 pub const PoolConfig = struct {
     database: Config = .{},
     max_open: usize = 4,
@@ -200,6 +227,58 @@ pub const Conn = struct {
         };
     }
 };
+
+pub fn ensureMigrationTable(conn: *Conn) !void {
+    _ = try conn.exec(
+        \\create table if not exists zsql_migrations (
+        \\  version integer primary key,
+        \\  name text not null,
+        \\  checksum text not null,
+        \\  applied_at text not null default current_timestamp,
+        \\  dirty integer not null default 0 check (dirty in (0, 1))
+        \\)
+    , &.{});
+}
+
+pub fn migrationStatus(allocator: std.mem.Allocator, conn: *Conn) !MigrationStatus {
+    var rows = try conn.query(
+        \\select version, name, checksum, applied_at, dirty
+        \\from zsql_migrations
+        \\order by version
+    , &.{});
+    defer rows.deinit();
+
+    var records: std.ArrayListUnmanaged(MigrationRecord) = .empty;
+    errdefer {
+        for (records.items) |*record| {
+            record.deinit(allocator);
+        }
+        records.deinit(allocator);
+    }
+
+    while (try rows.next()) |row| {
+        const version = try unsignedVersion(try (try row.value("version")).asInt());
+        const name = try allocator.dupe(u8, try (try row.value("name")).asText());
+        errdefer allocator.free(name);
+        const checksum = try parseChecksum(try (try row.value("checksum")).asText());
+        const applied_at = try allocator.dupe(u8, try (try row.value("applied_at")).asText());
+        errdefer allocator.free(applied_at);
+        const dirty = try sqliteBool(try (try row.value("dirty")).asInt());
+
+        try records.append(allocator, .{
+            .version = version,
+            .name = name,
+            .checksum = checksum,
+            .applied_at = applied_at,
+            .dirty = dirty,
+        });
+    }
+
+    return .{
+        .allocator = allocator,
+        .records = try records.toOwnedSlice(allocator),
+    };
+}
 
 pub const Tx = struct {
     conn: *Conn,
@@ -611,6 +690,29 @@ fn columnBlob(stmt: *c.sqlite3_stmt, index: c_int) ![]const u8 {
 
 fn sqliteColumnBytes(stmt: *c.sqlite3_stmt, index: c_int) !usize {
     return std.math.cast(usize, c.sqlite3_column_bytes(stmt, index)) orelse error.DriverError;
+}
+
+fn unsignedVersion(value: i64) !u64 {
+    return std.math.cast(u64, value) orelse error.InvalidColumnType;
+}
+
+fn sqliteBool(value: i64) !bool {
+    return switch (value) {
+        0 => false,
+        1 => true,
+        else => error.InvalidColumnType,
+    };
+}
+
+fn parseChecksum(value: []const u8) !core.migrate.Checksum {
+    if (value.len != 64) return error.InvalidColumnType;
+    for (value) |c_| {
+        if (!std.ascii.isHex(c_)) return error.InvalidColumnType;
+    }
+
+    var checksum: core.migrate.Checksum = undefined;
+    @memcpy(&checksum, value);
+    return checksum;
 }
 
 test "SQLite opens memory database and rejects row-returning exec" {
@@ -1052,6 +1154,89 @@ test "SQLite pool validates closed lifetime" {
 
     pool.deinit();
     try std.testing.expectError(error.PoolClosed, pool.acquire());
+}
+
+test "SQLite migration table starts with empty status" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    try ensureMigrationTable(&conn);
+    var status = try migrationStatus(std.testing.allocator, &conn);
+    defer status.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), status.records.len);
+}
+
+test "SQLite migration status returns applied records by version" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    try ensureMigrationTable(&conn);
+    const first_checksum = core.migrate.checksumSql("create table users (id integer primary key);\n");
+    const second_checksum = core.migrate.checksumSql("alter table users add column name text;\n");
+    _ = try conn.exec(
+        \\insert into zsql_migrations (version, name, checksum, applied_at, dirty)
+        \\values (?, ?, ?, ?, ?)
+    , &.{
+        .{ .integer = 2 },
+        .{ .text = "add_users" },
+        .{ .text = &second_checksum },
+        .{ .text = "2026-07-07T10:05:00Z" },
+        .{ .integer = 1 },
+    });
+    _ = try conn.exec(
+        \\insert into zsql_migrations (version, name, checksum, applied_at, dirty)
+        \\values (?, ?, ?, ?, ?)
+    , &.{
+        .{ .integer = 1 },
+        .{ .text = "create_users" },
+        .{ .text = &first_checksum },
+        .{ .text = "2026-07-07T10:00:00Z" },
+        .{ .integer = 0 },
+    });
+
+    var status = try migrationStatus(std.testing.allocator, &conn);
+    defer status.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), status.records.len);
+    try std.testing.expectEqual(@as(u64, 1), status.records[0].version);
+    try std.testing.expectEqualStrings("create_users", status.records[0].name);
+    try std.testing.expectEqual(first_checksum, status.records[0].checksum);
+    try std.testing.expectEqualStrings("2026-07-07T10:00:00Z", status.records[0].applied_at);
+    try std.testing.expect(!status.records[0].dirty);
+
+    try std.testing.expectEqual(@as(u64, 2), status.records[1].version);
+    try std.testing.expectEqualStrings("add_users", status.records[1].name);
+    try std.testing.expectEqual(second_checksum, status.records[1].checksum);
+    try std.testing.expect(status.records[1].dirty);
+}
+
+test "SQLite migration status rejects invalid checksum metadata" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    try ensureMigrationTable(&conn);
+    _ = try conn.exec(
+        \\insert into zsql_migrations (version, name, checksum, applied_at, dirty)
+        \\values (?, ?, ?, ?, ?)
+    , &.{
+        .{ .integer = 1 },
+        .{ .text = "bad_checksum" },
+        .{ .text = "not-a-checksum" },
+        .{ .text = "2026-07-07T10:00:00Z" },
+        .{ .integer = 0 },
+    });
+
+    try std.testing.expectError(error.InvalidColumnType, migrationStatus(std.testing.allocator, &conn));
 }
 
 test "SQLite validates binds against SQLite parameter count" {
