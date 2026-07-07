@@ -117,6 +117,7 @@ pub const Conn = struct {
 pub const Tx = struct {
     conn: *Conn,
     open: bool = true,
+    next_savepoint_id: usize = 0,
 
     pub fn commit(self: *Tx) !void {
         if (!self.open) return error.TransactionClosed;
@@ -144,6 +145,61 @@ pub const Tx = struct {
     pub fn query(self: *Tx, sql: []const u8, binds: []const core.Value) !Rows {
         if (!self.open) return error.TransactionClosed;
         return self.conn.query(sql, binds);
+    }
+
+    pub fn savepoint(self: *Tx) !Savepoint {
+        if (!self.open) return error.TransactionClosed;
+        const id = self.next_savepoint_id;
+        self.next_savepoint_id += 1;
+
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "zsql_sp_{d}", .{id});
+        try self.execSavepointSql("savepoint", name);
+
+        var stored_name: [64]u8 = undefined;
+        @memcpy(stored_name[0..name.len], name);
+        return .{
+            .tx = self,
+            .name = stored_name,
+            .name_len = name.len,
+        };
+    }
+
+    fn execSavepointSql(self: *Tx, comptime verb: []const u8, name: []const u8) !void {
+        var sql_buffer: [96]u8 = undefined;
+        const sql = try std.fmt.bufPrint(&sql_buffer, verb ++ " {s}", .{name});
+        _ = try self.conn.exec(sql, &.{});
+    }
+};
+
+pub const Savepoint = struct {
+    tx: *Tx,
+    name: [64]u8,
+    name_len: usize,
+    open: bool = true,
+
+    pub fn release(self: *Savepoint) !void {
+        if (!self.open) return error.SavepointClosed;
+        if (!self.tx.open) return error.TransactionClosed;
+        try self.tx.execSavepointSql("release savepoint", self.nameSlice());
+        self.open = false;
+    }
+
+    pub fn rollback(self: *Savepoint) !void {
+        if (!self.open) return error.SavepointClosed;
+        if (!self.tx.open) return error.TransactionClosed;
+        try self.tx.execSavepointSql("rollback to savepoint", self.nameSlice());
+        try self.tx.execSavepointSql("release savepoint", self.nameSlice());
+        self.open = false;
+    }
+
+    pub fn rollbackIfOpen(self: *Savepoint) void {
+        if (!self.open or !self.tx.open) return;
+        self.rollback() catch {};
+    }
+
+    fn nameSlice(self: *Savepoint) []const u8 {
+        return self.name[0..self.name_len];
     }
 };
 
@@ -773,6 +829,78 @@ test "SQLite rollbackIfOpen rolls back once" {
     try std.testing.expect(!tx.open);
 
     var rows = try conn.query("select id from tx_auto_rollback", &.{});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
+}
+
+test "SQLite savepoint release keeps inner changes" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table sp_release (id integer)", &.{});
+    var tx = try conn.begin();
+    defer tx.rollbackIfOpen();
+
+    var sp = try tx.savepoint();
+    _ = try tx.exec("insert into sp_release (id) values (?)", &.{.{ .integer = 1 }});
+    try sp.release();
+    try std.testing.expect(!sp.open);
+    try std.testing.expectError(error.SavepointClosed, sp.release());
+    try tx.commit();
+
+    var rows = try conn.query("select id from sp_release", &.{});
+    defer rows.deinit();
+    const row = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 1), try (try row.value("id")).asInt());
+}
+
+test "SQLite savepoint rollback discards inner changes only" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table sp_rollback (id integer)", &.{});
+    var tx = try conn.begin();
+    defer tx.rollbackIfOpen();
+
+    _ = try tx.exec("insert into sp_rollback (id) values (?)", &.{.{ .integer = 1 }});
+    var sp = try tx.savepoint();
+    _ = try tx.exec("insert into sp_rollback (id) values (?)", &.{.{ .integer = 2 }});
+    try sp.rollback();
+    try std.testing.expectError(error.SavepointClosed, sp.rollback());
+    try tx.commit();
+
+    var rows = try conn.query("select id from sp_rollback order by id", &.{});
+    defer rows.deinit();
+    const row = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 1), try (try row.value("id")).asInt());
+    try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
+}
+
+test "SQLite savepoint rollbackIfOpen rolls back once" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table sp_auto_rollback (id integer)", &.{});
+    var tx = try conn.begin();
+    defer tx.rollbackIfOpen();
+
+    var sp = try tx.savepoint();
+    defer sp.rollbackIfOpen();
+    _ = try tx.exec("insert into sp_auto_rollback (id) values (?)", &.{.{ .integer = 1 }});
+    sp.rollbackIfOpen();
+    try std.testing.expect(!sp.open);
+    try tx.commit();
+
+    var rows = try conn.query("select id from sp_auto_rollback", &.{});
     defer rows.deinit();
     try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
 }

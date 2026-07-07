@@ -9,6 +9,7 @@ This repository is in the SQLite driver foundation phase. The package currently 
 - `zsql.Conn`
 - `zsql.Stmt`
 - `zsql.Tx`
+- `zsql.Savepoint`
 - `zsql.Rows`
 - `zsql.Row`
 - `zsql.OwnedRow`
@@ -22,7 +23,7 @@ Execution methods currently return `error.DriverUnavailable` until SQLite and Po
 
 The `zsql.params` module can classify SQL placeholders while ignoring quoted SQL and comments. It recognizes `?`, `?NNN`, `:name`, `@name`, and `$name` forms for future driver binding. Prepared statements record that metadata and reject bind-count mismatches before driver execution.
 
-The SQLite surface is currently opt-in and links against system SQLite for open/close, prepare/finalize, positional and named typed binds, non-row `exec` metadata, borrowed row decoding, `Row.to` struct mapping, and transaction tests:
+The SQLite surface is currently opt-in and links against system SQLite for open/close, prepare/finalize, positional and named typed binds, non-row `exec` metadata, borrowed row decoding, `Row.to` struct mapping, transactions, and savepoint tests:
 
 ```sh
 zig build test -Denable-sqlite=true

@@ -9,5 +9,6 @@ pub const Error = error{
     StatementClosed,
     ConnectionClosed,
     TransactionClosed,
+    SavepointClosed,
     OutOfMemory,
 };
