@@ -9,6 +9,7 @@ pub const Stmt = @import("core/stmt.zig").Stmt;
 pub const Conn = @import("core/conn.zig").Conn;
 pub const Database = @import("core/database.zig").Database;
 pub const params = @import("core/params.zig");
+pub const migrate = @import("migrate/migrate.zig");
 const options = @import("zsql_options");
 
 pub const drivers = struct {
@@ -30,6 +31,7 @@ test {
     _ = @import("core/conn.zig");
     _ = @import("core/database.zig");
     _ = @import("core/params.zig");
+    _ = @import("migrate/migrate.zig");
     if (options.enable_sqlite) {
         _ = @import("drivers/sqlite/sqlite.zig");
     }
