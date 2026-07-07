@@ -45,7 +45,8 @@ pub fn main() !void {
     var conn = try db.connect();
     defer conn.close();
 
-    const result = try zsql.drivers.sqlite.applyMigrations(&conn, migrations.files);
+    const migrator = zsql.drivers.sqlite.Migrator.init(&conn);
+    const result = try migrator.apply(migrations.files);
     if (result.applied != 2) return error.UnexpectedMigrationCount;
 
     var rows = try conn.query("select name from users order by id", &.{});
@@ -57,7 +58,7 @@ pub fn main() !void {
     if (!std.mem.eql(u8, try (try second.value("name")).asText(), "grace")) return error.InvalidUser;
     if (try rows.next() != null) return error.UnexpectedRow;
 
-    var status = try zsql.drivers.sqlite.migrationStatus(allocator, &conn);
+    var status = try migrator.status(allocator);
     defer status.deinit();
     if (status.records.len != 2) return error.UnexpectedMigrationCount;
     if (status.records[0].dirty or status.records[1].dirty) return error.DirtyMigration;

@@ -10,6 +10,7 @@ This repository is in the SQLite driver foundation phase. The package currently 
 - `zsql.Stmt`
 - `zsql.Tx`
 - `zsql.Savepoint`
+- `zsql.drivers.sqlite.Migrator`
 - `zsql.drivers.sqlite.Pool`
 - `zsql.drivers.sqlite.Lease`
 - `zsql.Rows`
@@ -26,7 +27,7 @@ The `zsql.params` module can classify SQL placeholders while ignoring quoted SQL
 
 The `zsql.migrate` module can parse and scan versioned migration files such as `V0001__create_users.sql`, return sorted unique migration entries, reject duplicate versions, and compute deterministic SHA-256 SQL checksums.
 
-The SQLite surface is currently opt-in and links against system SQLite for open/close, prepare/finalize, positional and named typed binds, non-row `exec` metadata, borrowed row decoding, `Row.to` struct mapping, transactions, savepoints, a minimal max-open connection pool, and migration metadata/status/apply helpers:
+The SQLite surface is currently opt-in and links against system SQLite for open/close, prepare/finalize, positional and named typed binds, non-row `exec` metadata, borrowed row decoding, `Row.to` struct mapping, transactions, savepoints, a minimal max-open connection pool, and a `Migrator` wrapper over migration metadata/status/validation/apply helpers:
 
 ```sh
 zig build test -Denable-sqlite=true

@@ -50,6 +50,30 @@ pub const ApplyResult = struct {
     applied: usize,
 };
 
+pub const Migrator = struct {
+    conn: *Conn,
+
+    pub fn init(conn: *Conn) Migrator {
+        return .{ .conn = conn };
+    }
+
+    pub fn ensureTable(self: Migrator) !void {
+        return ensureMigrationTable(self.conn);
+    }
+
+    pub fn status(self: Migrator, allocator: std.mem.Allocator) !MigrationStatus {
+        return migrationStatus(allocator, self.conn);
+    }
+
+    pub fn validate(self: Migrator, migrations: []const core.migrate.MigrationFile) !void {
+        return validateMigrationStatus(self.conn, migrations);
+    }
+
+    pub fn apply(self: Migrator, migrations: []const core.migrate.MigrationFile) !ApplyResult {
+        return applyMigrations(self.conn, migrations);
+    }
+};
+
 pub const PoolConfig = struct {
     database: Config = .{},
     max_open: usize = 4,
@@ -1601,6 +1625,36 @@ test "SQLite migration apply works from scanned directory" {
     try std.testing.expectEqualStrings("seed_scan_users", status.records[1].name);
     try std.testing.expectEqual(migrations.files[1].checksum, status.records[1].checksum);
     try std.testing.expect(!status.records[1].dirty);
+}
+
+test "SQLite migrator wrapper applies and reports status" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    const sql = "create table migrator_users (id integer primary key);\n";
+    const migrations = [_]core.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "create_users",
+            .filename = "V0001__create_users.sql",
+        },
+        .sql = sql,
+        .checksum = core.migrate.checksumSql(sql),
+    }};
+
+    const migrator = Migrator.init(&conn);
+    try migrator.ensureTable();
+    try migrator.validate(&migrations);
+    try std.testing.expectEqual(@as(usize, 1), (try migrator.apply(&migrations)).applied);
+
+    var status = try migrator.status(std.testing.allocator);
+    defer status.deinit();
+    try std.testing.expectEqual(@as(usize, 1), status.records.len);
+    try std.testing.expectEqual(@as(u64, 1), status.records[0].version);
+    try std.testing.expect(!status.records[0].dirty);
 }
 
 test "SQLite migration apply skips already applied migrations" {
