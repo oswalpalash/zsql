@@ -76,7 +76,7 @@ pub const Conn = struct {
         return Stmt.init(self.allocator, self.handle, sql);
     }
 
-    pub fn exec(self: *Conn, sql: []const u8, binds: []const core.Value) !void {
+    pub fn exec(self: *Conn, sql: []const u8, binds: []const core.Value) !core.ExecResult {
         var stmt = try self.prepare(sql);
         defer stmt.close();
         return stmt.exec(binds);
@@ -122,14 +122,16 @@ pub const Stmt = struct {
         self.closed = true;
     }
 
-    pub fn exec(self: *Stmt, binds: []const core.Value) !void {
+    pub fn exec(self: *Stmt, binds: []const core.Value) !core.ExecResult {
         if (self.closed) return error.StatementClosed;
         try self.bindValues(binds);
         const rc = c.sqlite3_step(self.handle);
         switch (rc) {
             c.SQLITE_DONE => {
+                const result = execResult(c.sqlite3_db_handle(self.handle));
                 const reset_rc = c.sqlite3_reset(self.handle);
                 if (reset_rc != c.SQLITE_OK) return error.DriverError;
+                return result;
             },
             c.SQLITE_ROW => {
                 _ = c.sqlite3_reset(self.handle);
@@ -201,6 +203,14 @@ pub const Stmt = struct {
         self.owned_bind_buffers.clearRetainingCapacity();
     }
 };
+
+fn execResult(db: ?*c.sqlite3) core.ExecResult {
+    const handle = db.?;
+    return .{
+        .rows_affected = @intCast(c.sqlite3_changes64(handle)),
+        .last_insert_id = c.sqlite3_last_insert_rowid(handle),
+    };
+}
 
 pub const Rows = struct {
     stmt: Stmt,
@@ -377,13 +387,17 @@ test "SQLite exec steps statements that do not return rows" {
     var conn = try db.connect();
     defer conn.close();
 
-    try conn.exec("create table users (id integer not null, name text not null, active integer not null)", &.{});
-    try conn.exec("insert into users (id, name, active) values (?, ?, ?)", &.{
+    const create_result = try conn.exec("create table users (id integer not null, name text not null, active integer not null)", &.{});
+    try std.testing.expectEqual(@as(u64, 0), create_result.rows_affected);
+
+    const insert_result = try conn.exec("insert into users (id, name, active) values (?, ?, ?)", &.{
         .{ .integer = 1 },
         .{ .text = "ada" },
         .{ .boolean = true },
     });
 
+    try std.testing.expectEqual(@as(u64, 1), insert_result.rows_affected);
+    try std.testing.expectEqual(@as(?i64, 1), insert_result.last_insert_id);
     try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_changes(db.handle));
     try std.testing.expectError(error.UnexpectedRow, conn.exec("select id from users", &.{}));
 }
@@ -395,8 +409,8 @@ test "SQLite query decodes borrowed row values" {
     var conn = try db.connect();
     defer conn.close();
 
-    try conn.exec("create table items (id integer, score real, name text, payload blob, missing text)", &.{});
-    try conn.exec("insert into items (id, score, name, payload, missing) values (?, ?, ?, ?, ?)", &.{
+    _ = try conn.exec("create table items (id integer, score real, name text, payload blob, missing text)", &.{});
+    _ = try conn.exec("insert into items (id, score, name, payload, missing) values (?, ?, ?, ?, ?)", &.{
         .{ .integer = 7 },
         .{ .real = 2.5 },
         .{ .text = "ada" },
@@ -425,9 +439,9 @@ test "SQLite query can be prepared statement owned by rows" {
     var conn = try db.connect();
     defer conn.close();
 
-    try conn.exec("create table nums (n integer)", &.{});
-    try conn.exec("insert into nums (n) values (1)", &.{});
-    try conn.exec("insert into nums (n) values (2)", &.{});
+    _ = try conn.exec("create table nums (n integer)", &.{});
+    _ = try conn.exec("insert into nums (n) values (1)", &.{});
+    _ = try conn.exec("insert into nums (n) values (2)", &.{});
 
     const stmt = try conn.prepare("select n from nums order by n");
     var rows = try stmt.query(&.{});
