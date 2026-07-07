@@ -8,5 +8,6 @@ pub const Error = error{
     UnexpectedRow,
     StatementClosed,
     ConnectionClosed,
+    TransactionClosed,
     OutOfMemory,
 };

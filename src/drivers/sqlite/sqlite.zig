@@ -104,6 +104,47 @@ pub const Conn = struct {
         errdefer stmt.close();
         return Rows.initNamed(stmt, binds);
     }
+
+    pub fn begin(self: *Conn) !Tx {
+        if (self.closed) return error.ConnectionClosed;
+        _ = try self.exec("begin", &.{});
+        return .{
+            .conn = self,
+        };
+    }
+};
+
+pub const Tx = struct {
+    conn: *Conn,
+    open: bool = true,
+
+    pub fn commit(self: *Tx) !void {
+        if (!self.open) return error.TransactionClosed;
+        _ = try self.conn.exec("commit", &.{});
+        self.open = false;
+    }
+
+    pub fn rollback(self: *Tx) !void {
+        if (!self.open) return error.TransactionClosed;
+        _ = try self.conn.exec("rollback", &.{});
+        self.open = false;
+    }
+
+    pub fn rollbackIfOpen(self: *Tx) void {
+        if (!self.open) return;
+        _ = self.conn.exec("rollback", &.{}) catch {};
+        self.open = false;
+    }
+
+    pub fn exec(self: *Tx, sql: []const u8, binds: []const core.Value) !core.ExecResult {
+        if (!self.open) return error.TransactionClosed;
+        return self.conn.exec(sql, binds);
+    }
+
+    pub fn query(self: *Tx, sql: []const u8, binds: []const core.Value) !Rows {
+        if (!self.open) return error.TransactionClosed;
+        return self.conn.query(sql, binds);
+    }
 };
 
 pub const Stmt = struct {
@@ -673,6 +714,67 @@ test "SQLite named binds reject missing unknown and duplicate names" {
         .{ .name = "id", .value = .{ .integer = 1 } },
         .{ .name = ":id", .value = .{ .integer = 2 } },
     }));
+}
+
+test "SQLite transaction commit persists changes" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table tx_commit (id integer)", &.{});
+    var tx = try conn.begin();
+    try std.testing.expect(tx.open);
+    _ = try tx.exec("insert into tx_commit (id) values (?)", &.{.{ .integer = 1 }});
+    try tx.commit();
+    try std.testing.expect(!tx.open);
+    try std.testing.expectError(error.TransactionClosed, tx.commit());
+
+    var rows = try conn.query("select id from tx_commit", &.{});
+    defer rows.deinit();
+
+    const row = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 1), try (try row.value("id")).asInt());
+    try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
+}
+
+test "SQLite transaction rollback discards changes" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table tx_rollback (id integer)", &.{});
+    var tx = try conn.begin();
+    _ = try tx.exec("insert into tx_rollback (id) values (?)", &.{.{ .integer = 1 }});
+    try tx.rollback();
+    try std.testing.expectError(error.TransactionClosed, tx.rollback());
+
+    var rows = try conn.query("select id from tx_rollback", &.{});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
+}
+
+test "SQLite rollbackIfOpen rolls back once" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table tx_auto_rollback (id integer)", &.{});
+    var tx = try conn.begin();
+    defer tx.rollbackIfOpen();
+    _ = try tx.exec("insert into tx_auto_rollback (id) values (?)", &.{.{ .integer = 1 }});
+
+    tx.rollbackIfOpen();
+    try std.testing.expect(!tx.open);
+
+    var rows = try conn.query("select id from tx_auto_rollback", &.{});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
 }
 
 test "SQLite validates binds against SQLite parameter count" {
