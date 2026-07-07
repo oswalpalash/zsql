@@ -62,6 +62,46 @@ pub const Value = union(enum) {
     }
 };
 
+pub const OwnedValue = union(enum) {
+    null,
+    integer: i64,
+    real: f64,
+    text: []u8,
+    blob: []u8,
+    boolean: bool,
+
+    pub fn from(allocator: std.mem.Allocator, value: Value) !OwnedValue {
+        return switch (value) {
+            .null => .{ .null = {} },
+            .integer => |v| .{ .integer = v },
+            .real => |v| .{ .real = v },
+            .text => |v| .{ .text = try allocator.dupe(u8, v) },
+            .blob => |v| .{ .blob = try allocator.dupe(u8, v) },
+            .boolean => |v| .{ .boolean = v },
+        };
+    }
+
+    pub fn deinit(self: *OwnedValue, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .text => |value| allocator.free(value),
+            .blob => |value| allocator.free(value),
+            else => {},
+        }
+        self.* = .{ .null = {} };
+    }
+
+    pub fn borrowed(self: OwnedValue) Value {
+        return switch (self) {
+            .null => .{ .null = {} },
+            .integer => |v| .{ .integer = v },
+            .real => |v| .{ .real = v },
+            .text => |v| .{ .text = v },
+            .blob => |v| .{ .blob = v },
+            .boolean => |v| .{ .boolean = v },
+        };
+    }
+};
+
 test "Value exposes typed accessors" {
     try std.testing.expectEqual(@as(i64, 42), try (Value{ .integer = 42 }).asInt());
     try std.testing.expectEqual(@as(f64, 42.0), try (Value{ .integer = 42 }).asFloat());
@@ -73,4 +113,14 @@ test "Value exposes typed accessors" {
 test "Value compares owned by content" {
     try std.testing.expect((Value{ .text = "same" }).eql(.{ .text = "same" }));
     try std.testing.expect(!(Value{ .blob = "a" }).eql(.{ .blob = "b" }));
+}
+
+test "OwnedValue duplicates text and blob values" {
+    var text = try OwnedValue.from(std.testing.allocator, .{ .text = "owned" });
+    defer text.deinit(std.testing.allocator);
+    var blob = try OwnedValue.from(std.testing.allocator, .{ .blob = "bytes" });
+    defer blob.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("owned", try text.borrowed().asText());
+    try std.testing.expectEqualStrings("bytes", try blob.borrowed().asBlob());
 }

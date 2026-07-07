@@ -454,6 +454,29 @@ test "SQLite query can be prepared statement owned by rows" {
     try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
 }
 
+test "SQLite borrowed row can be copied into owned row" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table docs (title text, body blob)", &.{});
+    _ = try conn.exec("insert into docs (title, body) values (?, ?)", &.{
+        .{ .text = "note" },
+        .{ .blob = "payload" },
+    });
+
+    var rows = try conn.query("select title, body from docs", &.{});
+    const row = (try rows.next()).?;
+    var owned = try core.OwnedRow.init(std.testing.allocator, row);
+    rows.deinit();
+    defer owned.deinit();
+
+    try std.testing.expectEqualStrings("note", try (try owned.value("title")).asText());
+    try std.testing.expectEqualStrings("payload", try (try owned.value("body")).asBlob());
+}
+
 test "SQLite validates binds against SQLite parameter count" {
     var db = try Database.open(std.testing.allocator, .{});
     defer db.deinit();

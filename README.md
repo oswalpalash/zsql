@@ -10,8 +10,10 @@ This repository is in the SQLite driver foundation phase. The package currently 
 - `zsql.Stmt`
 - `zsql.Rows`
 - `zsql.Row`
+- `zsql.OwnedRow`
 - `zsql.ExecResult`
 - `zsql.Value`
+- `zsql.OwnedValue`
 - `zsql.params`
 - `zsql.drivers.sqlite` with `-Denable-sqlite=true`
 

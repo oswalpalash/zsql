@@ -1,6 +1,8 @@
 pub const Error = @import("core/error.zig").Error;
 pub const Value = @import("core/value.zig").Value;
+pub const OwnedValue = @import("core/value.zig").OwnedValue;
 pub const Row = @import("core/row.zig").Row;
+pub const OwnedRow = @import("core/row.zig").OwnedRow;
 pub const Rows = @import("core/rows.zig").Rows;
 pub const ExecResult = @import("core/exec_result.zig").ExecResult;
 pub const Stmt = @import("core/stmt.zig").Stmt;
