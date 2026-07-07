@@ -10,5 +10,8 @@ pub const Error = error{
     ConnectionClosed,
     TransactionClosed,
     SavepointClosed,
+    PoolClosed,
+    PoolExhausted,
+    LeaseClosed,
     OutOfMemory,
 };

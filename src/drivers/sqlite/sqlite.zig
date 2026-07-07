@@ -19,6 +19,93 @@ pub const NamedValue = struct {
     value: core.Value,
 };
 
+pub const PoolConfig = struct {
+    database: Config = .{},
+    max_open: usize = 4,
+};
+
+pub const Pool = struct {
+    allocator: std.mem.Allocator,
+    config: PoolConfig,
+    idle: std.ArrayListUnmanaged(Database) = .empty,
+    open_count: usize = 0,
+    closed: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator, config: PoolConfig) !Pool {
+        if (config.max_open == 0) return error.InvalidBindValue;
+        return .{
+            .allocator = allocator,
+            .config = config,
+        };
+    }
+
+    pub fn deinit(self: *Pool) void {
+        if (self.closed) return;
+        std.debug.assert(self.open_count == self.idle.items.len);
+
+        for (self.idle.items) |*db| {
+            db.deinit();
+        }
+        self.idle.deinit(self.allocator);
+        self.open_count = 0;
+        self.closed = true;
+    }
+
+    pub fn acquire(self: *Pool) !Lease {
+        if (self.closed) return error.PoolClosed;
+
+        var db = if (self.idle.pop()) |idle_db|
+            idle_db
+        else blk: {
+            if (self.open_count >= self.config.max_open) return error.PoolExhausted;
+            const opened = try Database.open(self.allocator, self.config.database);
+            self.open_count += 1;
+            break :blk opened;
+        };
+        errdefer {
+            db.deinit();
+            self.open_count -= 1;
+        }
+
+        const conn = try db.connect();
+        return .{
+            .pool = self,
+            .db = db,
+            .conn_value = conn,
+        };
+    }
+};
+
+pub const Lease = struct {
+    pool: *Pool,
+    db: Database,
+    conn_value: Conn,
+    open: bool = true,
+
+    pub fn conn(self: *Lease) !*Conn {
+        if (!self.open) return error.LeaseClosed;
+        return &self.conn_value;
+    }
+
+    pub fn release(self: *Lease) !void {
+        if (!self.open) return error.LeaseClosed;
+        if (self.pool.closed) return error.PoolClosed;
+
+        self.conn_value.close();
+        try self.pool.idle.append(self.pool.allocator, self.db);
+        self.open = false;
+    }
+
+    pub fn discard(self: *Lease) !void {
+        if (!self.open) return error.LeaseClosed;
+
+        self.conn_value.close();
+        self.db.deinit();
+        self.pool.open_count -= 1;
+        self.open = false;
+    }
+};
+
 pub const Database = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -903,6 +990,68 @@ test "SQLite savepoint rollbackIfOpen rolls back once" {
     var rows = try conn.query("select id from sp_auto_rollback", &.{});
     defer rows.deinit();
     try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
+}
+
+test "SQLite pool releases and reuses leases" {
+    var pool = try Pool.init(std.testing.allocator, .{ .max_open = 1 });
+    defer pool.deinit();
+
+    var first = try pool.acquire();
+    var first_conn = try first.conn();
+    _ = try first_conn.exec("create table pooled_reuse (id integer)", &.{});
+    _ = try first_conn.exec("insert into pooled_reuse (id) values (?)", &.{.{ .integer = 1 }});
+    try first.release();
+    try std.testing.expect(!first.open);
+    try std.testing.expectEqual(@as(usize, 1), pool.open_count);
+    try std.testing.expectEqual(@as(usize, 1), pool.idle.items.len);
+
+    var second = try pool.acquire();
+    defer second.release() catch unreachable;
+    try std.testing.expectEqual(@as(usize, 1), pool.open_count);
+    try std.testing.expectEqual(@as(usize, 0), pool.idle.items.len);
+
+    var rows = try (try second.conn()).query("select id from pooled_reuse", &.{});
+    defer rows.deinit();
+    const row = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 1), try (try row.value("id")).asInt());
+}
+
+test "SQLite pool enforces max open leases" {
+    var pool = try Pool.init(std.testing.allocator, .{ .max_open = 1 });
+    defer pool.deinit();
+
+    var lease = try pool.acquire();
+    try std.testing.expectError(error.PoolExhausted, pool.acquire());
+    try lease.release();
+}
+
+test "SQLite pool discard closes lease and allows replacement" {
+    var pool = try Pool.init(std.testing.allocator, .{ .max_open = 1 });
+    defer pool.deinit();
+
+    var first = try pool.acquire();
+    _ = try (try first.conn()).exec("create table discarded (id integer)", &.{});
+    try first.discard();
+    try std.testing.expect(!first.open);
+    try std.testing.expectEqual(@as(usize, 0), pool.open_count);
+
+    var second = try pool.acquire();
+    defer second.release() catch unreachable;
+    try std.testing.expectEqual(@as(usize, 1), pool.open_count);
+    try std.testing.expectError(error.InvalidSql, (try second.conn()).query("select id from discarded", &.{}));
+}
+
+test "SQLite pool validates closed lifetime" {
+    try std.testing.expectError(error.InvalidBindValue, Pool.init(std.testing.allocator, .{ .max_open = 0 }));
+
+    var pool = try Pool.init(std.testing.allocator, .{});
+    var lease = try pool.acquire();
+    try lease.release();
+    try std.testing.expectError(error.LeaseClosed, lease.conn());
+    try std.testing.expectError(error.LeaseClosed, lease.release());
+
+    pool.deinit();
+    try std.testing.expectError(error.PoolClosed, pool.acquire());
 }
 
 test "SQLite validates binds against SQLite parameter count" {
