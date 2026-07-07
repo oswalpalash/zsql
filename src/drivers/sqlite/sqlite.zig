@@ -87,6 +87,7 @@ pub const Stmt = struct {
     allocator: std.mem.Allocator,
     handle: *c.sqlite3_stmt,
     placeholders: core.params.Summary,
+    owned_bind_buffers: std.ArrayListUnmanaged([]u8) = .empty,
     closed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, db: *c.sqlite3, sql: []const u8) !Stmt {
@@ -108,23 +109,82 @@ pub const Stmt = struct {
 
     pub fn close(self: *Stmt) void {
         if (self.closed) return;
+        self.freeBindBuffers();
         const rc = c.sqlite3_finalize(self.handle);
         std.debug.assert(rc == c.SQLITE_OK);
+        self.owned_bind_buffers.deinit(self.allocator);
         self.closed = true;
     }
 
     pub fn exec(self: *Stmt, binds: []const core.Value) !void {
         if (self.closed) return error.StatementClosed;
-        try self.validateBindCount(binds);
+        try self.bindValues(binds);
         return error.DriverUnavailable;
     }
 
+    pub fn bindValues(self: *Stmt, binds: []const core.Value) !void {
+        if (self.closed) return error.StatementClosed;
+        try self.validateBindCount(binds);
+        self.freeBindBuffers();
+        _ = c.sqlite3_clear_bindings(self.handle);
+        _ = c.sqlite3_reset(self.handle);
+
+        for (binds, 1..) |value, index| {
+            try self.bindValue(try sqliteIndex(index), value);
+        }
+    }
+
     fn validateBindCount(self: Stmt, binds: []const core.Value) !void {
-        if (binds.len != self.placeholders.expectedBindCount()) {
+        if (binds.len != @as(usize, @intCast(c.sqlite3_bind_parameter_count(self.handle)))) {
             return error.InvalidBindValue;
         }
     }
+
+    fn bindValue(self: *Stmt, index: c_int, value: core.Value) !void {
+        const rc = switch (value) {
+            .null => c.sqlite3_bind_null(self.handle, index),
+            .integer => |v| c.sqlite3_bind_int64(self.handle, index, v),
+            .real => |v| c.sqlite3_bind_double(self.handle, index, v),
+            .text => |v| return self.bindOwnedBytes(index, v, .text),
+            .blob => |v| return self.bindOwnedBytes(index, v, .blob),
+            .boolean => |v| c.sqlite3_bind_int(self.handle, index, if (v) 1 else 0),
+        };
+        if (rc != c.SQLITE_OK) return error.InvalidBindValue;
+    }
+
+    const ByteKind = enum {
+        text,
+        blob,
+    };
+
+    fn bindOwnedBytes(self: *Stmt, index: c_int, value: []const u8, kind: ByteKind) !void {
+        const owned = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned);
+
+        const rc = switch (kind) {
+            .text => c.sqlite3_bind_text(self.handle, index, owned.ptr, try sqliteLen(owned.len), null),
+            .blob => c.sqlite3_bind_blob(self.handle, index, owned.ptr, try sqliteLen(owned.len), null),
+        };
+        if (rc != c.SQLITE_OK) return error.InvalidBindValue;
+
+        try self.owned_bind_buffers.append(self.allocator, owned);
+    }
+
+    fn freeBindBuffers(self: *Stmt) void {
+        for (self.owned_bind_buffers.items) |buffer| {
+            self.allocator.free(buffer);
+        }
+        self.owned_bind_buffers.clearRetainingCapacity();
+    }
 };
+
+fn sqliteIndex(index: usize) !c_int {
+    return std.math.cast(c_int, index) orelse error.InvalidBindValue;
+}
+
+fn sqliteLen(len: usize) !c_int {
+    return std.math.cast(c_int, len) orelse error.InvalidBindValue;
+}
 
 test "SQLite opens memory database and preserves driver unavailable execution" {
     var db = try Database.open(std.testing.allocator, .{});
@@ -152,6 +212,63 @@ test "SQLite prepares and finalizes statements" {
         .{ .integer = 1 },
         .{ .text = "ada" },
     }));
+}
+
+test "SQLite binds all value variants before execution is implemented" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    var stmt = try conn.prepare("select ?, ?, ?, ?, ?, ?");
+    defer stmt.close();
+
+    try stmt.bindValues(&.{
+        .{ .null = {} },
+        .{ .integer = 42 },
+        .{ .real = 3.5 },
+        .{ .text = "zig" },
+        .{ .blob = "sql" },
+        .{ .boolean = true },
+    });
+
+    const expanded = c.sqlite3_expanded_sql(stmt.handle) orelse return error.DriverError;
+    defer c.sqlite3_free(expanded);
+    try std.testing.expectEqualStrings(
+        "select NULL, 42, 3.5, 'zig', x'73716c', 1",
+        std.mem.span(expanded),
+    );
+
+    try std.testing.expectError(error.DriverUnavailable, stmt.exec(&.{
+        .{ .null = {} },
+        .{ .integer = 42 },
+        .{ .real = 3.5 },
+        .{ .text = "zig" },
+        .{ .blob = "sql" },
+        .{ .boolean = false },
+    }));
+}
+
+test "SQLite validates binds against SQLite parameter count" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    var stmt = try conn.prepare("select ?3");
+    defer stmt.close();
+
+    try std.testing.expectEqual(@as(usize, 1), stmt.placeholders.total);
+    try std.testing.expectError(error.InvalidBindValue, stmt.bindValues(&.{
+        .{ .integer = 1 },
+    }));
+    try stmt.bindValues(&.{
+        .{ .null = {} },
+        .{ .null = {} },
+        .{ .integer = 3 },
+    });
 }
 
 test "SQLite prepare rejects invalid SQL and closed connections" {
