@@ -1662,6 +1662,42 @@ test "SQLite migration apply rolls back dirty marker on failure" {
     try std.testing.expectEqual(@as(usize, 0), status.records.len);
 }
 
+test "SQLite migration apply refuses existing dirty migration state" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    try ensureMigrationTable(&conn);
+    const dirty_sql = "create table dirty_prior (id integer primary key);\n";
+    const dirty_checksum = core.migrate.checksumSql(dirty_sql);
+    _ = try conn.exec(
+        \\insert into zsql_migrations (version, name, checksum, applied_at, dirty)
+        \\values (?, ?, ?, ?, ?)
+    , &.{
+        .{ .integer = 1 },
+        .{ .text = "dirty_prior" },
+        .{ .text = &dirty_checksum },
+        .{ .text = "2026-07-07T10:00:00Z" },
+        .{ .integer = 1 },
+    });
+
+    const pending_sql = "create table should_not_apply (id integer primary key);\n";
+    const migrations = [_]core.migrate.MigrationFile{.{
+        .id = .{
+            .version = 2,
+            .name = "should_not_apply",
+            .filename = "V0002__should_not_apply.sql",
+        },
+        .sql = pending_sql,
+        .checksum = core.migrate.checksumSql(pending_sql),
+    }};
+
+    try std.testing.expectError(error.DirtyMigration, applyMigrations(&conn, &migrations));
+    try std.testing.expectError(error.InvalidSql, conn.query("select id from should_not_apply", &.{}));
+}
+
 test "SQLite validates binds against SQLite parameter count" {
     var db = try Database.open(std.testing.allocator, .{});
     defer db.deinit();
