@@ -32,6 +32,10 @@ pub const Summary = struct {
             .named => self.named += 1,
         }
     }
+
+    pub fn expectedBindCount(self: Summary) usize {
+        return @max(self.total, self.highest_index);
+    }
 };
 
 pub fn summarize(sql: []const u8) !Summary {

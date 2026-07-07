@@ -15,7 +15,7 @@ This repository is in the buildable-core phase. The package currently exposes th
 
 Execution methods currently return `error.DriverUnavailable` until SQLite and PostgreSQL drivers are implemented.
 
-The `zsql.params` module can classify SQL placeholders while ignoring quoted SQL and comments. It recognizes `?`, `?NNN`, `:name`, `@name`, and `$name` forms for future driver binding.
+The `zsql.params` module can classify SQL placeholders while ignoring quoted SQL and comments. It recognizes `?`, `?NNN`, `:name`, `@name`, and `$name` forms for future driver binding. Prepared statements record that metadata and reject bind-count mismatches before driver execution.
 
 ## Development
 
