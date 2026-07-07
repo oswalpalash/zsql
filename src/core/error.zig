@@ -6,6 +6,7 @@ pub const Error = error{
     InvalidBindValue,
     InvalidSql,
     InvalidMigrationFilename,
+    DuplicateMigrationVersion,
     UnexpectedRow,
     StatementClosed,
     ConnectionClosed,

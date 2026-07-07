@@ -8,6 +8,30 @@ pub const MigrationId = struct {
     filename: []const u8,
 };
 
+pub const MigrationFile = struct {
+    id: MigrationId,
+    checksum: Checksum,
+
+    pub fn deinit(self: *MigrationFile, allocator: std.mem.Allocator) void {
+        allocator.free(self.id.name);
+        allocator.free(self.id.filename);
+        self.* = undefined;
+    }
+};
+
+pub const MigrationList = struct {
+    allocator: std.mem.Allocator,
+    files: []MigrationFile,
+
+    pub fn deinit(self: *MigrationList) void {
+        for (self.files) |*file| {
+            file.deinit(self.allocator);
+        }
+        self.allocator.free(self.files);
+        self.* = undefined;
+    }
+};
+
 pub fn parseFilename(path_or_filename: []const u8) !MigrationId {
     const filename = std.fs.path.basename(path_or_filename);
     if (!std.mem.startsWith(u8, filename, "V")) return error.InvalidMigrationFilename;
@@ -33,6 +57,51 @@ pub fn parseFilename(path_or_filename: []const u8) !MigrationId {
     };
 }
 
+pub fn scanDir(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !MigrationList {
+    var list: std.ArrayListUnmanaged(MigrationFile) = .empty;
+    errdefer {
+        for (list.items) |*file| {
+            file.deinit(allocator);
+        }
+        list.deinit(allocator);
+    }
+
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const parsed = parseFilename(entry.name) catch continue;
+
+        const sql = try dir.readFileAlloc(io, entry.name, allocator, .limited(16 * 1024 * 1024));
+        defer allocator.free(sql);
+
+        const owned_name = try allocator.dupe(u8, parsed.name);
+        errdefer allocator.free(owned_name);
+        const owned_filename = try allocator.dupe(u8, parsed.filename);
+        errdefer allocator.free(owned_filename);
+
+        try list.append(allocator, .{
+            .id = .{
+                .version = parsed.version,
+                .name = owned_name,
+                .filename = owned_filename,
+            },
+            .checksum = checksumSql(sql),
+        });
+    }
+
+    std.mem.sort(MigrationFile, list.items, {}, migrationFileLessThan);
+    for (list.items[1..], 1..) |file, index| {
+        if (file.id.version == list.items[index - 1].id.version) {
+            return error.DuplicateMigrationVersion;
+        }
+    }
+
+    return .{
+        .allocator = allocator,
+        .files = try list.toOwnedSlice(allocator),
+    };
+}
+
 pub fn checksumSql(sql: []const u8) Checksum {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(sql, &digest, .{});
@@ -46,6 +115,11 @@ fn isValidName(name: []const u8) bool {
         return false;
     }
     return true;
+}
+
+fn migrationFileLessThan(_: void, lhs: MigrationFile, rhs: MigrationFile) bool {
+    if (lhs.id.version != rhs.id.version) return lhs.id.version < rhs.id.version;
+    return std.mem.lessThan(u8, lhs.id.filename, rhs.id.filename);
 }
 
 test "migration filename parser accepts versioned sql filenames" {
@@ -89,4 +163,35 @@ test "migration checksum is deterministic sha256 hex" {
         &checksumSql(sql),
     );
     try std.testing.expectEqual(checksumSql(sql), checksumSql(sql));
+}
+
+test "migration directory scanner returns sorted migration files" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "V0002__add_users.sql", .data = "alter table users add column name text;\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "README.md", .data = "ignored\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "V0001__create_users.sql", .data = "create table users (id integer primary key);\n" });
+
+    var migrations = try scanDir(std.testing.allocator, std.testing.io, tmp.dir);
+    defer migrations.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), migrations.files.len);
+    try std.testing.expectEqual(@as(u64, 1), migrations.files[0].id.version);
+    try std.testing.expectEqualStrings("create_users", migrations.files[0].id.name);
+    try std.testing.expectEqualStrings("V0001__create_users.sql", migrations.files[0].id.filename);
+    try std.testing.expectEqualStrings("1c6771824cf03a1eaf811b3418f430f4ba6aee10d59bf8a02cc7cadfc067934a", &migrations.files[0].checksum);
+
+    try std.testing.expectEqual(@as(u64, 2), migrations.files[1].id.version);
+    try std.testing.expectEqualStrings("add_users", migrations.files[1].id.name);
+}
+
+test "migration directory scanner rejects duplicate versions" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "V0001__create_users.sql", .data = "create table users (id integer);\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "V1__add_users.sql", .data = "alter table users add column name text;\n" });
+
+    try std.testing.expectError(error.DuplicateMigrationVersion, scanDir(std.testing.allocator, std.testing.io, tmp.dir));
 }

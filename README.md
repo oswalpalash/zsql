@@ -24,7 +24,7 @@ This repository is in the SQLite driver foundation phase. The package currently 
 
 The `zsql.params` module can classify SQL placeholders while ignoring quoted SQL and comments. It recognizes `?`, `?NNN`, `:name`, `@name`, and `$name` forms for future driver binding. Prepared statements record that metadata and reject bind-count mismatches before driver execution.
 
-The `zsql.migrate` module can parse versioned migration filenames such as `V0001__create_users.sql` and compute deterministic SHA-256 SQL checksums. Migration application is still upcoming.
+The `zsql.migrate` module can parse and scan versioned migration files such as `V0001__create_users.sql`, return sorted unique migration entries, reject duplicate versions, and compute deterministic SHA-256 SQL checksums. Migration application is still upcoming.
 
 The SQLite surface is currently opt-in and links against system SQLite for open/close, prepare/finalize, positional and named typed binds, non-row `exec` metadata, borrowed row decoding, `Row.to` struct mapping, transactions, savepoints, and a minimal max-open connection pool:
 
