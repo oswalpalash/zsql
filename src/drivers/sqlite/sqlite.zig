@@ -280,6 +280,20 @@ pub fn migrationStatus(allocator: std.mem.Allocator, conn: *Conn) !MigrationStat
     };
 }
 
+pub fn validateMigrationStatus(conn: *Conn, migrations: []const core.migrate.MigrationFile) !void {
+    var status = try migrationStatus(conn.allocator, conn);
+    defer status.deinit();
+
+    for (status.records) |record| {
+        if (record.dirty) return error.DirtyMigration;
+
+        const migration = findMigration(migrations, record.version) orelse continue;
+        if (!std.mem.eql(u8, &record.checksum, &migration.checksum)) {
+            return error.MigrationChecksumMismatch;
+        }
+    }
+}
+
 pub const Tx = struct {
     conn: *Conn,
     open: bool = true,
@@ -713,6 +727,13 @@ fn parseChecksum(value: []const u8) !core.migrate.Checksum {
     var checksum: core.migrate.Checksum = undefined;
     @memcpy(&checksum, value);
     return checksum;
+}
+
+fn findMigration(migrations: []const core.migrate.MigrationFile, version: u64) ?core.migrate.MigrationFile {
+    for (migrations) |migration| {
+        if (migration.id.version == version) return migration;
+    }
+    return null;
 }
 
 test "SQLite opens memory database and rejects row-returning exec" {
@@ -1237,6 +1258,127 @@ test "SQLite migration status rejects invalid checksum metadata" {
     });
 
     try std.testing.expectError(error.InvalidColumnType, migrationStatus(std.testing.allocator, &conn));
+}
+
+test "SQLite migration validation accepts matching clean records" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    try ensureMigrationTable(&conn);
+    const sql = "create table users (id integer primary key);\n";
+    const checksum = core.migrate.checksumSql(sql);
+    _ = try conn.exec(
+        \\insert into zsql_migrations (version, name, checksum, applied_at, dirty)
+        \\values (?, ?, ?, ?, ?)
+    , &.{
+        .{ .integer = 1 },
+        .{ .text = "create_users" },
+        .{ .text = &checksum },
+        .{ .text = "2026-07-07T10:00:00Z" },
+        .{ .integer = 0 },
+    });
+
+    const migrations = [_]core.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "create_users",
+            .filename = "V0001__create_users.sql",
+        },
+        .checksum = checksum,
+    }};
+
+    try validateMigrationStatus(&conn, &migrations);
+}
+
+test "SQLite migration validation rejects checksum mismatches" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    try ensureMigrationTable(&conn);
+    const stored_checksum = core.migrate.checksumSql("create table users (id integer primary key);\n");
+    const local_checksum = core.migrate.checksumSql("create table users (id integer primary key, name text);\n");
+    _ = try conn.exec(
+        \\insert into zsql_migrations (version, name, checksum, applied_at, dirty)
+        \\values (?, ?, ?, ?, ?)
+    , &.{
+        .{ .integer = 1 },
+        .{ .text = "create_users" },
+        .{ .text = &stored_checksum },
+        .{ .text = "2026-07-07T10:00:00Z" },
+        .{ .integer = 0 },
+    });
+
+    const migrations = [_]core.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "create_users",
+            .filename = "V0001__create_users.sql",
+        },
+        .checksum = local_checksum,
+    }};
+
+    try std.testing.expectError(error.MigrationChecksumMismatch, validateMigrationStatus(&conn, &migrations));
+}
+
+test "SQLite migration validation rejects dirty records" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    try ensureMigrationTable(&conn);
+    const checksum = core.migrate.checksumSql("create table users (id integer primary key);\n");
+    _ = try conn.exec(
+        \\insert into zsql_migrations (version, name, checksum, applied_at, dirty)
+        \\values (?, ?, ?, ?, ?)
+    , &.{
+        .{ .integer = 1 },
+        .{ .text = "create_users" },
+        .{ .text = &checksum },
+        .{ .text = "2026-07-07T10:00:00Z" },
+        .{ .integer = 1 },
+    });
+
+    const migrations = [_]core.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "create_users",
+            .filename = "V0001__create_users.sql",
+        },
+        .checksum = checksum,
+    }};
+
+    try std.testing.expectError(error.DirtyMigration, validateMigrationStatus(&conn, &migrations));
+}
+
+test "SQLite migration validation ignores stored versions absent locally" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    try ensureMigrationTable(&conn);
+    const checksum = core.migrate.checksumSql("create table users (id integer primary key);\n");
+    _ = try conn.exec(
+        \\insert into zsql_migrations (version, name, checksum, applied_at, dirty)
+        \\values (?, ?, ?, ?, ?)
+    , &.{
+        .{ .integer = 1 },
+        .{ .text = "create_users" },
+        .{ .text = &checksum },
+        .{ .text = "2026-07-07T10:00:00Z" },
+        .{ .integer = 0 },
+    });
+
+    try validateMigrationStatus(&conn, &.{});
 }
 
 test "SQLite validates binds against SQLite parameter count" {

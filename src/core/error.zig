@@ -7,6 +7,8 @@ pub const Error = error{
     InvalidSql,
     InvalidMigrationFilename,
     DuplicateMigrationVersion,
+    MigrationChecksumMismatch,
+    DirtyMigration,
     UnexpectedRow,
     StatementClosed,
     ConnectionClosed,
