@@ -81,6 +81,12 @@ pub const Conn = struct {
         defer stmt.close();
         return stmt.exec(binds);
     }
+
+    pub fn query(self: *Conn, sql: []const u8, binds: []const core.Value) !Rows {
+        var stmt = try self.prepare(sql);
+        errdefer stmt.close();
+        return Rows.init(stmt, binds);
+    }
 };
 
 pub const Stmt = struct {
@@ -134,6 +140,10 @@ pub const Stmt = struct {
                 return error.DriverError;
             },
         }
+    }
+
+    pub fn query(self: Stmt, binds: []const core.Value) !Rows {
+        return Rows.init(self, binds);
     }
 
     pub fn bindValues(self: *Stmt, binds: []const core.Value) !void {
@@ -192,12 +202,108 @@ pub const Stmt = struct {
     }
 };
 
+pub const Rows = struct {
+    stmt: Stmt,
+    columns: []const []const u8,
+    values: []core.Value,
+    done: bool = false,
+
+    pub fn init(stmt: Stmt, binds: []const core.Value) !Rows {
+        var owned_stmt = stmt;
+        errdefer owned_stmt.close();
+
+        try owned_stmt.bindValues(binds);
+        const column_count = try sqliteColumnCount(owned_stmt.handle);
+        const columns = try owned_stmt.allocator.alloc([]const u8, column_count);
+        errdefer owned_stmt.allocator.free(columns);
+        const values = try owned_stmt.allocator.alloc(core.Value, column_count);
+        errdefer owned_stmt.allocator.free(values);
+
+        for (columns, 0..) |*column, index| {
+            const name = c.sqlite3_column_name(owned_stmt.handle, try sqliteIndex(index));
+            if (name == null) return error.DriverError;
+            column.* = std.mem.span(name);
+        }
+
+        return .{
+            .stmt = owned_stmt,
+            .columns = columns,
+            .values = values,
+        };
+    }
+
+    pub fn deinit(self: *Rows) void {
+        self.stmt.allocator.free(self.values);
+        self.stmt.allocator.free(self.columns);
+        self.stmt.close();
+        self.done = true;
+    }
+
+    pub fn next(self: *Rows) !?core.Row {
+        if (self.done) return null;
+
+        const rc = c.sqlite3_step(self.stmt.handle);
+        switch (rc) {
+            c.SQLITE_ROW => {
+                for (self.values, 0..) |*value, index| {
+                    value.* = try self.decodeColumn(try sqliteIndex(index));
+                }
+                return try core.Row.init(self.columns, self.values);
+            },
+            c.SQLITE_DONE => {
+                self.done = true;
+                return null;
+            },
+            else => return error.DriverError,
+        }
+    }
+
+    fn decodeColumn(self: *Rows, index: c_int) !core.Value {
+        return switch (c.sqlite3_column_type(self.stmt.handle, index)) {
+            c.SQLITE_NULL => .{ .null = {} },
+            c.SQLITE_INTEGER => .{ .integer = c.sqlite3_column_int64(self.stmt.handle, index) },
+            c.SQLITE_FLOAT => .{ .real = c.sqlite3_column_double(self.stmt.handle, index) },
+            c.SQLITE_TEXT => .{ .text = try columnText(self.stmt.handle, index) },
+            c.SQLITE_BLOB => .{ .blob = try columnBlob(self.stmt.handle, index) },
+            else => error.InvalidColumnType,
+        };
+    }
+};
+
 fn sqliteIndex(index: usize) !c_int {
     return std.math.cast(c_int, index) orelse error.InvalidBindValue;
 }
 
 fn sqliteLen(len: usize) !c_int {
     return std.math.cast(c_int, len) orelse error.InvalidBindValue;
+}
+
+fn sqliteColumnCount(stmt: *c.sqlite3_stmt) !usize {
+    return std.math.cast(usize, c.sqlite3_column_count(stmt)) orelse error.DriverError;
+}
+
+fn columnText(stmt: *c.sqlite3_stmt, index: c_int) ![]const u8 {
+    const len = try sqliteColumnBytes(stmt, index);
+    const ptr = c.sqlite3_column_text(stmt, index);
+    if (ptr == null) {
+        if (len == 0) return "";
+        return error.DriverError;
+    }
+    return @as([*]const u8, @ptrCast(ptr))[0..len];
+}
+
+fn columnBlob(stmt: *c.sqlite3_stmt, index: c_int) ![]const u8 {
+    const len = try sqliteColumnBytes(stmt, index);
+    const ptr = c.sqlite3_column_blob(stmt, index);
+    if (ptr == null) {
+        if (len == 0) return "";
+        return error.DriverError;
+    }
+    return @as([*]const u8, @ptrCast(ptr))[0..len];
+}
+
+fn sqliteColumnBytes(stmt: *c.sqlite3_stmt, index: c_int) !usize {
+    return std.math.cast(usize, c.sqlite3_column_bytes(stmt, index)) orelse error.DriverError;
 }
 
 test "SQLite opens memory database and rejects row-returning exec" {
@@ -280,6 +386,58 @@ test "SQLite exec steps statements that do not return rows" {
 
     try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_changes(db.handle));
     try std.testing.expectError(error.UnexpectedRow, conn.exec("select id from users", &.{}));
+}
+
+test "SQLite query decodes borrowed row values" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    try conn.exec("create table items (id integer, score real, name text, payload blob, missing text)", &.{});
+    try conn.exec("insert into items (id, score, name, payload, missing) values (?, ?, ?, ?, ?)", &.{
+        .{ .integer = 7 },
+        .{ .real = 2.5 },
+        .{ .text = "ada" },
+        .{ .blob = "zig" },
+        .{ .null = {} },
+    });
+
+    var rows = try conn.query("select id, score, name, payload, missing from items where id = ?", &.{
+        .{ .integer = 7 },
+    });
+    defer rows.deinit();
+
+    const row = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 7), try (try row.value("id")).asInt());
+    try std.testing.expectEqual(@as(f64, 2.5), try (try row.value("score")).asFloat());
+    try std.testing.expectEqualStrings("ada", try (try row.value("name")).asText());
+    try std.testing.expectEqualStrings("zig", try (try row.value("payload")).asBlob());
+    try std.testing.expect((try row.value("missing")).isNull());
+    try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
+}
+
+test "SQLite query can be prepared statement owned by rows" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    try conn.exec("create table nums (n integer)", &.{});
+    try conn.exec("insert into nums (n) values (1)", &.{});
+    try conn.exec("insert into nums (n) values (2)", &.{});
+
+    const stmt = try conn.prepare("select n from nums order by n");
+    var rows = try stmt.query(&.{});
+    defer rows.deinit();
+
+    const first = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 1), try (try first.value("n")).asInt());
+    const second = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 2), try (try second.value("n")).asInt());
+    try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
 }
 
 test "SQLite validates binds against SQLite parameter count" {
