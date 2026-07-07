@@ -205,6 +205,11 @@ pub const Conn = struct {
         return stmt.exec(binds);
     }
 
+    pub fn execScript(self: *Conn, sql: []const u8) !void {
+        if (self.closed) return error.ConnectionClosed;
+        try execScriptSql(self.allocator, self.handle, sql);
+    }
+
     pub fn query(self: *Conn, sql: []const u8, binds: []const core.Value) !Rows {
         var stmt = try self.prepare(sql);
         errdefer stmt.close();
@@ -330,7 +335,7 @@ pub fn applyMigrations(conn: *Conn, migrations: []const core.migrate.MigrationFi
             .{ .text = &migration.checksum },
             .{ .integer = 1 },
         });
-        _ = try tx.exec(migration.sql, &.{});
+        try tx.execScript(migration.sql);
         _ = try tx.exec(
             \\update zsql_migrations
             \\set dirty = 0
@@ -369,6 +374,11 @@ pub const Tx = struct {
     pub fn exec(self: *Tx, sql: []const u8, binds: []const core.Value) !core.ExecResult {
         if (!self.open) return error.TransactionClosed;
         return self.conn.exec(sql, binds);
+    }
+
+    pub fn execScript(self: *Tx, sql: []const u8) !void {
+        if (!self.open) return error.TransactionClosed;
+        return self.conn.execScript(sql);
     }
 
     pub fn query(self: *Tx, sql: []const u8, binds: []const core.Value) !Rows {
@@ -618,6 +628,22 @@ fn execResult(db: ?*c.sqlite3) core.ExecResult {
         .rows_affected = @intCast(c.sqlite3_changes64(handle)),
         .last_insert_id = c.sqlite3_last_insert_rowid(handle),
     };
+}
+
+fn execScriptSql(allocator: std.mem.Allocator, db: *c.sqlite3, sql: []const u8) !void {
+    if (std.mem.trim(u8, sql, " \t\r\n").len == 0) return error.InvalidSql;
+
+    const sql_z = try allocator.dupeZ(u8, sql);
+    defer allocator.free(sql_z);
+
+    var message: [*c]u8 = null;
+    const rc = c.sqlite3_exec(db, sql_z.ptr, null, null, &message);
+    if (message != null) c.sqlite3_free(message);
+    switch (rc) {
+        c.SQLITE_OK => {},
+        c.SQLITE_ERROR => return error.InvalidSql,
+        else => return error.DriverError,
+    }
 }
 
 pub const Rows = struct {
@@ -1486,6 +1512,36 @@ test "SQLite migration apply runs pending migrations and records clean status" {
     try std.testing.expect(!status.records[0].dirty);
     try std.testing.expectEqual(@as(u64, 2), status.records[1].version);
     try std.testing.expect(!status.records[1].dirty);
+}
+
+test "SQLite migration apply executes multi-statement scripts" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    const script =
+        \\create table multi_statement_users (id integer primary key, name text);
+        \\insert into multi_statement_users (id, name) values (1, 'ada');
+        \\update multi_statement_users set name = 'grace' where id = 1;
+    ;
+    const migrations = [_]core.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "create_and_seed_users",
+            .filename = "V0001__create_and_seed_users.sql",
+        },
+        .sql = script,
+        .checksum = core.migrate.checksumSql(script),
+    }};
+
+    try std.testing.expectEqual(@as(usize, 1), (try applyMigrations(&conn, &migrations)).applied);
+
+    var rows = try conn.query("select name from multi_statement_users where id = ?", &.{.{ .integer = 1 }});
+    defer rows.deinit();
+    const row = (try rows.next()).?;
+    try std.testing.expectEqualStrings("grace", try (try row.value("name")).asText());
 }
 
 test "SQLite migration apply skips already applied migrations" {
