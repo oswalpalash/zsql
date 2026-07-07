@@ -1544,6 +1544,65 @@ test "SQLite migration apply executes multi-statement scripts" {
     try std.testing.expectEqualStrings("grace", try (try row.value("name")).asText());
 }
 
+test "SQLite migration apply works from scanned directory" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "V0002__seed_scan_users.sql",
+        .data =
+        \\insert into scan_users (id, name) values (1, 'ada');
+        \\insert into scan_users (id, name) values (2, 'grace');
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "notes.txt",
+        .data = "ignored by migration scanner\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "V0001__create_scan_users.sql",
+        .data =
+        \\create table scan_users (
+        \\  id integer primary key,
+        \\  name text not null
+        \\);
+        ,
+    });
+
+    var migrations = try core.migrate.scanDir(std.testing.allocator, std.testing.io, tmp.dir);
+    defer migrations.deinit();
+
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    try std.testing.expectEqual(@as(usize, 2), migrations.files.len);
+    try std.testing.expectEqual(@as(u64, 1), migrations.files[0].id.version);
+    try std.testing.expectEqual(@as(u64, 2), migrations.files[1].id.version);
+    try std.testing.expectEqual(@as(usize, 2), (try applyMigrations(&conn, migrations.files)).applied);
+
+    var rows = try conn.query("select name from scan_users order by id", &.{});
+    defer rows.deinit();
+
+    const first = (try rows.next()).?;
+    try std.testing.expectEqualStrings("ada", try (try first.value("name")).asText());
+    const second = (try rows.next()).?;
+    try std.testing.expectEqualStrings("grace", try (try second.value("name")).asText());
+    try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
+
+    var status = try migrationStatus(std.testing.allocator, &conn);
+    defer status.deinit();
+    try std.testing.expectEqual(@as(usize, 2), status.records.len);
+    try std.testing.expectEqualStrings("create_scan_users", status.records[0].name);
+    try std.testing.expectEqual(migrations.files[0].checksum, status.records[0].checksum);
+    try std.testing.expect(!status.records[0].dirty);
+    try std.testing.expectEqualStrings("seed_scan_users", status.records[1].name);
+    try std.testing.expectEqual(migrations.files[1].checksum, status.records[1].checksum);
+    try std.testing.expect(!status.records[1].dirty);
+}
+
 test "SQLite migration apply skips already applied migrations" {
     var db = try Database.open(std.testing.allocator, .{});
     defer db.deinit();
