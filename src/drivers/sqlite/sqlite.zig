@@ -46,6 +46,10 @@ pub const MigrationStatus = struct {
     }
 };
 
+pub const ApplyResult = struct {
+    applied: usize,
+};
+
 pub const PoolConfig = struct {
     database: Config = .{},
     max_open: usize = 4,
@@ -226,6 +230,14 @@ pub const Conn = struct {
             .conn = self,
         };
     }
+
+    pub fn beginImmediate(self: *Conn) !Tx {
+        if (self.closed) return error.ConnectionClosed;
+        _ = try self.exec("begin immediate", &.{});
+        return .{
+            .conn = self,
+        };
+    }
 };
 
 pub fn ensureMigrationTable(conn: *Conn) !void {
@@ -292,6 +304,43 @@ pub fn validateMigrationStatus(conn: *Conn, migrations: []const core.migrate.Mig
             return error.MigrationChecksumMismatch;
         }
     }
+}
+
+pub fn applyMigrations(conn: *Conn, migrations: []const core.migrate.MigrationFile) !ApplyResult {
+    try ensureMigrationTable(conn);
+    try validateMigrationStatus(conn, migrations);
+
+    var status = try migrationStatus(conn.allocator, conn);
+    defer status.deinit();
+
+    var tx = try conn.beginImmediate();
+    defer tx.rollbackIfOpen();
+
+    var applied: usize = 0;
+    for (migrations) |migration| {
+        if (findMigrationRecord(status.records, migration.id.version) != null) continue;
+        if (std.mem.trim(u8, migration.sql, " \t\r\n").len == 0) return error.InvalidSql;
+
+        _ = try tx.exec(
+            \\insert into zsql_migrations (version, name, checksum, dirty)
+            \\values (?, ?, ?, ?)
+        , &.{
+            .{ .integer = try sqliteVersion(migration.id.version) },
+            .{ .text = migration.id.name },
+            .{ .text = &migration.checksum },
+            .{ .integer = 1 },
+        });
+        _ = try tx.exec(migration.sql, &.{});
+        _ = try tx.exec(
+            \\update zsql_migrations
+            \\set dirty = 0
+            \\where version = ?
+        , &.{.{ .integer = try sqliteVersion(migration.id.version) }});
+        applied += 1;
+    }
+
+    try tx.commit();
+    return .{ .applied = applied };
 }
 
 pub const Tx = struct {
@@ -710,6 +759,10 @@ fn unsignedVersion(value: i64) !u64 {
     return std.math.cast(u64, value) orelse error.InvalidColumnType;
 }
 
+fn sqliteVersion(version: u64) !i64 {
+    return std.math.cast(i64, version) orelse error.InvalidBindValue;
+}
+
 fn sqliteBool(value: i64) !bool {
     return switch (value) {
         0 => false,
@@ -732,6 +785,13 @@ fn parseChecksum(value: []const u8) !core.migrate.Checksum {
 fn findMigration(migrations: []const core.migrate.MigrationFile, version: u64) ?core.migrate.MigrationFile {
     for (migrations) |migration| {
         if (migration.id.version == version) return migration;
+    }
+    return null;
+}
+
+fn findMigrationRecord(records: []const MigrationRecord, version: u64) ?MigrationRecord {
+    for (records) |record| {
+        if (record.version == version) return record;
     }
     return null;
 }
@@ -1379,6 +1439,112 @@ test "SQLite migration validation ignores stored versions absent locally" {
     });
 
     try validateMigrationStatus(&conn, &.{});
+}
+
+test "SQLite migration apply runs pending migrations and records clean status" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    const create_sql = "create table applied_users (id integer primary key);\n";
+    const insert_sql = "insert into applied_users (id) values (1);\n";
+    const migrations = [_]core.migrate.MigrationFile{
+        .{
+            .id = .{
+                .version = 1,
+                .name = "create_users",
+                .filename = "V0001__create_users.sql",
+            },
+            .sql = create_sql,
+            .checksum = core.migrate.checksumSql(create_sql),
+        },
+        .{
+            .id = .{
+                .version = 2,
+                .name = "seed_users",
+                .filename = "V0002__seed_users.sql",
+            },
+            .sql = insert_sql,
+            .checksum = core.migrate.checksumSql(insert_sql),
+        },
+    };
+
+    const result = try applyMigrations(&conn, &migrations);
+    try std.testing.expectEqual(@as(usize, 2), result.applied);
+
+    var rows = try conn.query("select id from applied_users", &.{});
+    defer rows.deinit();
+    const row = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 1), try (try row.value("id")).asInt());
+
+    var status = try migrationStatus(std.testing.allocator, &conn);
+    defer status.deinit();
+    try std.testing.expectEqual(@as(usize, 2), status.records.len);
+    try std.testing.expectEqual(@as(u64, 1), status.records[0].version);
+    try std.testing.expect(!status.records[0].dirty);
+    try std.testing.expectEqual(@as(u64, 2), status.records[1].version);
+    try std.testing.expect(!status.records[1].dirty);
+}
+
+test "SQLite migration apply skips already applied migrations" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    const create_sql = "create table skip_users (id integer primary key);\n";
+    const insert_sql = "insert into skip_users (id) values (1);\n";
+    const migrations = [_]core.migrate.MigrationFile{
+        .{
+            .id = .{
+                .version = 1,
+                .name = "create_users",
+                .filename = "V0001__create_users.sql",
+            },
+            .sql = create_sql,
+            .checksum = core.migrate.checksumSql(create_sql),
+        },
+        .{
+            .id = .{
+                .version = 2,
+                .name = "seed_users",
+                .filename = "V0002__seed_users.sql",
+            },
+            .sql = insert_sql,
+            .checksum = core.migrate.checksumSql(insert_sql),
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), (try applyMigrations(&conn, &migrations)).applied);
+    try std.testing.expectEqual(@as(usize, 0), (try applyMigrations(&conn, &migrations)).applied);
+}
+
+test "SQLite migration apply rolls back dirty marker on failure" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    const bad_sql = "create table broken (";
+    const migrations = [_]core.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "broken",
+            .filename = "V0001__broken.sql",
+        },
+        .sql = bad_sql,
+        .checksum = core.migrate.checksumSql(bad_sql),
+    }};
+
+    try std.testing.expectError(error.InvalidSql, applyMigrations(&conn, &migrations));
+
+    var status = try migrationStatus(std.testing.allocator, &conn);
+    defer status.deinit();
+    try std.testing.expectEqual(@as(usize, 0), status.records.len);
 }
 
 test "SQLite validates binds against SQLite parameter count" {

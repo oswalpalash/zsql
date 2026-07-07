@@ -10,11 +10,14 @@ pub const MigrationId = struct {
 
 pub const MigrationFile = struct {
     id: MigrationId,
+    sql: []const u8 = "",
+    owned_sql: ?[]u8 = null,
     checksum: Checksum,
 
     pub fn deinit(self: *MigrationFile, allocator: std.mem.Allocator) void {
         allocator.free(self.id.name);
         allocator.free(self.id.filename);
+        if (self.owned_sql) |sql| allocator.free(sql);
         self.* = undefined;
     }
 };
@@ -71,22 +74,27 @@ pub fn scanDir(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Migra
         if (entry.kind != .file) continue;
         const parsed = parseFilename(entry.name) catch continue;
 
-        const sql = try dir.readFileAlloc(io, entry.name, allocator, .limited(16 * 1024 * 1024));
-        defer allocator.free(sql);
+        var sql: ?[]u8 = try dir.readFileAlloc(io, entry.name, allocator, .limited(16 * 1024 * 1024));
+        errdefer if (sql) |owned| allocator.free(owned);
 
-        const owned_name = try allocator.dupe(u8, parsed.name);
-        errdefer allocator.free(owned_name);
-        const owned_filename = try allocator.dupe(u8, parsed.filename);
-        errdefer allocator.free(owned_filename);
+        var owned_name: ?[]u8 = try allocator.dupe(u8, parsed.name);
+        errdefer if (owned_name) |owned| allocator.free(owned);
+        var owned_filename: ?[]u8 = try allocator.dupe(u8, parsed.filename);
+        errdefer if (owned_filename) |owned| allocator.free(owned);
 
         try list.append(allocator, .{
             .id = .{
                 .version = parsed.version,
-                .name = owned_name,
-                .filename = owned_filename,
+                .name = owned_name.?,
+                .filename = owned_filename.?,
             },
-            .checksum = checksumSql(sql),
+            .sql = sql.?,
+            .owned_sql = sql.?,
+            .checksum = checksumSql(sql.?),
         });
+        sql = null;
+        owned_name = null;
+        owned_filename = null;
     }
 
     std.mem.sort(MigrationFile, list.items, {}, migrationFileLessThan);
@@ -180,6 +188,7 @@ test "migration directory scanner returns sorted migration files" {
     try std.testing.expectEqual(@as(u64, 1), migrations.files[0].id.version);
     try std.testing.expectEqualStrings("create_users", migrations.files[0].id.name);
     try std.testing.expectEqualStrings("V0001__create_users.sql", migrations.files[0].id.filename);
+    try std.testing.expectEqualStrings("create table users (id integer primary key);\n", migrations.files[0].sql);
     try std.testing.expectEqualStrings("1c6771824cf03a1eaf811b3418f430f4ba6aee10d59bf8a02cc7cadfc067934a", &migrations.files[0].checksum);
 
     try std.testing.expectEqual(@as(u64, 2), migrations.files[1].id.version);
