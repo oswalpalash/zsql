@@ -164,16 +164,15 @@ fn mapRow(comptime T: type, row: Row) !T {
 
 fn convertValue(comptime T: type, value: Value) !T {
     const info = @typeInfo(T);
+    if (info == .optional) {
+        if (value.isNull()) return null;
+        return try convertValue(info.optional.child, value);
+    }
+    // Non-optional fields must not be SQL NULL.
+    if (value.isNull()) return error.UnexpectedNull;
+
     return switch (info) {
-        .optional => |optional| {
-            if (value.isNull()) return null;
-            return try convertValue(optional.child, value);
-        },
-        .bool => switch (value) {
-            .boolean => |v| v,
-            .integer => |v| v != 0,
-            else => error.InvalidColumnType,
-        },
+        .bool => convertBool(value),
         .int => switch (value) {
             .integer => |v| std.math.cast(T, v) orelse error.IntegerOverflow,
             else => error.InvalidColumnType,
@@ -198,12 +197,41 @@ fn convertValue(comptime T: type, value: Value) !T {
     };
 }
 
-/// Map text (field name) or integer (tag value) into a Zig enum.
+fn convertBool(value: Value) !bool {
+    return switch (value) {
+        .boolean => |v| v,
+        .integer => |v| v != 0,
+        .text => |text| blk: {
+            if (std.ascii.eqlIgnoreCase(text, "true") or
+                std.ascii.eqlIgnoreCase(text, "t") or
+                std.ascii.eqlIgnoreCase(text, "yes") or
+                std.ascii.eqlIgnoreCase(text, "y") or
+                std.ascii.eqlIgnoreCase(text, "on") or
+                std.mem.eql(u8, text, "1"))
+            {
+                break :blk true;
+            }
+            if (std.ascii.eqlIgnoreCase(text, "false") or
+                std.ascii.eqlIgnoreCase(text, "f") or
+                std.ascii.eqlIgnoreCase(text, "no") or
+                std.ascii.eqlIgnoreCase(text, "n") or
+                std.ascii.eqlIgnoreCase(text, "off") or
+                std.mem.eql(u8, text, "0"))
+            {
+                break :blk false;
+            }
+            break :blk error.TypeMismatch;
+        },
+        else => error.InvalidColumnType,
+    };
+}
+
+/// Map text (field name, case-insensitive) or integer (tag value) into a Zig enum.
 fn convertEnum(comptime T: type, value: Value) !T {
     return switch (value) {
         .text => |text| blk: {
             inline for (std.meta.fields(T)) |field| {
-                if (std.mem.eql(u8, field.name, text)) {
+                if (std.ascii.eqlIgnoreCase(field.name, text)) {
                     break :blk @field(T, field.name);
                 }
             }
@@ -340,7 +368,23 @@ test "Row maps enum fields from text names and integer tags" {
     try std.testing.expect(account.status == .active);
     try std.testing.expect(account.maybe_role == null);
 
+    // Case-insensitive enum text (common for Postgres enums / CHECK labels).
+    const mixed = try Row.init(&.{"role"}, &.{.{ .text = "Admin" }});
+    const OnlyRole = struct { role: Role };
+    try std.testing.expect((try mixed.to(OnlyRole)).role == .admin);
+
     const bad = try Row.init(&.{"role"}, &.{.{ .text = "nope" }});
-    const BadRole = struct { role: Role };
-    try std.testing.expectError(error.TypeMismatch, bad.to(BadRole));
+    try std.testing.expectError(error.TypeMismatch, bad.to(OnlyRole));
+}
+
+test "Row.to rejects UnexpectedNull and accepts text bools" {
+    const Required = struct { name: []const u8 };
+    const null_row = try Row.init(&.{"name"}, &.{.{ .null = {} }});
+    try std.testing.expectError(error.UnexpectedNull, null_row.to(Required));
+
+    const Flag = struct { active: bool };
+    const text_true = try Row.init(&.{"active"}, &.{.{ .text = "TRUE" }});
+    try std.testing.expect((try text_true.to(Flag)).active);
+    const text_false = try Row.init(&.{"active"}, &.{.{ .text = "f" }});
+    try std.testing.expect(!(try text_false.to(Flag)).active);
 }

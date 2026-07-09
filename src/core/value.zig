@@ -44,6 +44,24 @@ pub const Value = union(enum) {
     pub fn asBool(self: Value) !bool {
         return switch (self) {
             .boolean => |value| value,
+            .integer => |value| value != 0,
+            .text => |text| {
+                if (std.ascii.eqlIgnoreCase(text, "true") or
+                    std.ascii.eqlIgnoreCase(text, "t") or
+                    std.ascii.eqlIgnoreCase(text, "yes") or
+                    std.ascii.eqlIgnoreCase(text, "y") or
+                    std.ascii.eqlIgnoreCase(text, "on") or
+                    std.mem.eql(u8, text, "1"))
+                    return true;
+                if (std.ascii.eqlIgnoreCase(text, "false") or
+                    std.ascii.eqlIgnoreCase(text, "f") or
+                    std.ascii.eqlIgnoreCase(text, "no") or
+                    std.ascii.eqlIgnoreCase(text, "n") or
+                    std.ascii.eqlIgnoreCase(text, "off") or
+                    std.mem.eql(u8, text, "0"))
+                    return false;
+                return error.TypeMismatch;
+            },
             else => error.InvalidColumnType,
         };
     }
@@ -108,6 +126,11 @@ test "Value exposes typed accessors" {
     try std.testing.expectEqualStrings("zig", try (Value{ .text = "zig" }).asText());
     try std.testing.expect((Value{ .null = {} }).isNull());
     try std.testing.expectError(error.InvalidColumnType, (Value{ .text = "nope" }).asInt());
+    try std.testing.expect(try (Value{ .integer = 1 }).asBool());
+    try std.testing.expect(!try (Value{ .integer = 0 }).asBool());
+    try std.testing.expect(try (Value{ .text = "Yes" }).asBool());
+    try std.testing.expect(!try (Value{ .text = "off" }).asBool());
+    try std.testing.expectError(error.TypeMismatch, (Value{ .text = "maybe" }).asBool());
 }
 
 test "Value compares owned by content" {
