@@ -24,6 +24,7 @@ pub const MigrationRecord = struct {
     name: []u8,
     checksum: core.migrate.Checksum,
     applied_at: []u8,
+    execution_ms: i64 = 0,
     dirty: bool,
 
     pub fn deinit(self: *MigrationRecord, allocator: std.mem.Allocator) void {
@@ -732,7 +733,8 @@ pub fn ensureMigrationTable(conn: *Conn) !void {
 
 pub fn migrationStatus(allocator: std.mem.Allocator, conn: *Conn) !MigrationStatus {
     var rows = try conn.query(
-        \\select version, name, checksum, applied_at, dirty
+        \\select version, name, checksum, applied_at, dirty,
+        \\  coalesce(execution_ms, 0) as execution_ms
         \\from zsql_migrations
         \\order by version
     , &.{});
@@ -754,12 +756,14 @@ pub fn migrationStatus(allocator: std.mem.Allocator, conn: *Conn) !MigrationStat
         const applied_at = try allocator.dupe(u8, try (try row.value("applied_at")).asText());
         errdefer allocator.free(applied_at);
         const dirty = try sqliteBool(try (try row.value("dirty")).asInt());
+        const execution_ms = (try row.value("execution_ms")).asInt() catch 0;
 
         try records.append(allocator, .{
             .version = version,
             .name = name,
             .checksum = checksum,
             .applied_at = applied_at,
+            .execution_ms = execution_ms,
             .dirty = dirty,
         });
     }

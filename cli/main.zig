@@ -248,10 +248,11 @@ fn printMigrationStatus(io: std.Io, allocator: std.mem.Allocator, records: anyty
     defer allocator.free(header);
     try writeOut(io, .stdout, header);
     for (records) |rec| {
+        const exec_ms: i64 = if (@hasField(@TypeOf(rec), "execution_ms")) rec.execution_ms else 0;
         const line = try std.fmt.allocPrint(
             allocator,
-            "  V{d} {s} dirty={s}\n",
-            .{ rec.version, rec.name, if (rec.dirty) "true" else "false" },
+            "  V{d} {s} dirty={s} execution_ms={d}\n",
+            .{ rec.version, rec.name, if (rec.dirty) "true" else "false", exec_ms },
         );
         defer allocator.free(line);
         try writeOut(io, .stdout, line);

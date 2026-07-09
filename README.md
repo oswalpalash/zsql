@@ -54,7 +54,13 @@ Native wire protocol. Prefer parameterized APIs:
 _ = try conn.execParams("insert into users (email) values ($1)", &.{.{ .text = "ada@example.com" }});
 var rows = try conn.queryParams("select id, email from users where id = $1", &.{.{ .integer = 1 }});
 defer rows.deinit();
+
+// Exactly one row (OwnedRow); NoRows / TooManyRows otherwise:
+var one = try conn.queryOneParams("select id, email from users where id = $1", &.{.{ .integer = 1 }});
+defer one.deinit();
 ```
+
+SQLite has the same idea as `Conn.queryOne(sql, binds)`.
 
 TLS uses Zig's `std.crypto.tls.Client` (no OpenSSL). Behavior by `sslmode`:
 
