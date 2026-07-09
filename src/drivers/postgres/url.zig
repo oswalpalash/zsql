@@ -1,8 +1,6 @@
 const std = @import("std");
 
 /// TLS negotiation preference from a connection URL or explicit config.
-/// TLS itself is not implemented yet; parsing preserves the request so later
-/// slices can enforce it.
 pub const SslMode = enum {
     disable,
     allow,
@@ -35,6 +33,33 @@ pub const SslMode = enum {
     }
 };
 
+/// libpq-compatible SCRAM channel binding preference.
+///
+/// - `disable`: never use SCRAM-SHA-256-PLUS
+/// - `prefer` (default): use PLUS when the server offers it and peer leaf cert
+///   channel-binding data is available
+/// - `require`: fail authentication if PLUS cannot be used
+pub const ChannelBindingMode = enum {
+    disable,
+    prefer,
+    require,
+
+    pub fn parse(text: []const u8) !ChannelBindingMode {
+        if (std.ascii.eqlIgnoreCase(text, "disable")) return .disable;
+        if (std.ascii.eqlIgnoreCase(text, "prefer")) return .prefer;
+        if (std.ascii.eqlIgnoreCase(text, "require")) return .require;
+        return error.InvalidUrl;
+    }
+
+    pub fn asText(self: ChannelBindingMode) []const u8 {
+        return switch (self) {
+            .disable => "disable",
+            .prefer => "prefer",
+            .require => "require",
+        };
+    }
+};
+
 /// Allocator-owned PostgreSQL connection configuration parsed from a URL or
 /// built explicitly. Call `deinit` to free owned fields.
 ///
@@ -48,9 +73,14 @@ pub const Config = struct {
     password: []u8,
     database: []u8,
     ssl_mode: SslMode,
+    channel_binding: ChannelBindingMode = .prefer,
     application_name: []u8,
     /// Optional connect timeout in seconds from `connect_timeout=`.
     connect_timeout_secs: ?u32 = null,
+    /// Optional borrowed leaf certificate DER for SCRAM-SHA-256-PLUS
+    /// `tls-server-end-point` when the TLS stack cannot expose the peer cert
+    /// (TLS 1.3 via `std.crypto.tls.Client`). Not freed by `deinit`.
+    peer_cert_der: ?[]const u8 = null,
 
     pub fn deinit(self: *Config) void {
         self.allocator.free(self.host);
@@ -67,8 +97,8 @@ pub const Config = struct {
     /// Redacted summary suitable for logs. Never includes the password.
     pub fn formatRedacted(self: Config, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print(
-            "postgres://{s}@{s}:{d}/{s}?sslmode={s}",
-            .{ self.user, self.host, self.port, self.database, self.ssl_mode.asText() },
+            "postgres://{s}@{s}:{d}/{s}?sslmode={s}&channel_binding={s}",
+            .{ self.user, self.host, self.port, self.database, self.ssl_mode.asText(), self.channel_binding.asText() },
         );
     }
 };
@@ -115,6 +145,7 @@ pub fn parse(allocator: std.mem.Allocator, url: []const u8) !Config {
     const database_raw = stripLeadingSlash(path_raw);
 
     var ssl_mode: SslMode = .prefer;
+    var channel_binding: ChannelBindingMode = .prefer;
     var application_name: []const u8 = "zsql";
     var connect_timeout_secs: ?u32 = null;
 
@@ -128,6 +159,8 @@ pub fn parse(allocator: std.mem.Allocator, url: []const u8) !Config {
             const value = pair[eq + 1 ..];
             if (std.ascii.eqlIgnoreCase(key, "sslmode")) {
                 ssl_mode = try SslMode.parse(value);
+            } else if (std.ascii.eqlIgnoreCase(key, "channel_binding")) {
+                channel_binding = try ChannelBindingMode.parse(value);
             } else if (std.ascii.eqlIgnoreCase(key, "application_name")) {
                 application_name = value;
             } else if (std.ascii.eqlIgnoreCase(key, "connect_timeout")) {
@@ -164,8 +197,10 @@ pub fn parse(allocator: std.mem.Allocator, url: []const u8) !Config {
         .password = password,
         .database = database,
         .ssl_mode = ssl_mode,
+        .channel_binding = channel_binding,
         .application_name = application,
         .connect_timeout_secs = connect_timeout_secs,
+        .peer_cert_der = null,
     };
 }
 
@@ -221,6 +256,25 @@ test "parse rejects non-postgres schemes and bad sslmode" {
     try std.testing.expectError(error.InvalidUrl, parse(std.testing.allocator, "not a url"));
 }
 
+test "parse channel_binding prefer require disable" {
+    var prefer = try parse(std.testing.allocator, "postgres://u@localhost/db?channel_binding=prefer");
+    defer prefer.deinit();
+    try std.testing.expect(prefer.channel_binding == .prefer);
+
+    var require = try parse(std.testing.allocator, "postgres://u@localhost/db?channel_binding=require");
+    defer require.deinit();
+    try std.testing.expect(require.channel_binding == .require);
+
+    var disable = try parse(std.testing.allocator, "postgres://u@localhost/db?channel_binding=disable");
+    defer disable.deinit();
+    try std.testing.expect(disable.channel_binding == .disable);
+
+    try std.testing.expectError(
+        error.InvalidUrl,
+        parse(std.testing.allocator, "postgres://u@localhost/db?channel_binding=maybe"),
+    );
+}
+
 test "redacted format never includes password" {
     var config = try parse(
         std.testing.allocator,
@@ -233,7 +287,7 @@ test "redacted format never includes password" {
     try config.formatRedacted(&writer);
     const text = writer.buffered();
     try std.testing.expectEqualStrings(
-        "postgres://ada@localhost:5432/app?sslmode=require",
+        "postgres://ada@localhost:5432/app?sslmode=require&channel_binding=prefer",
         text,
     );
     try std.testing.expect(std.mem.indexOf(u8, text, "super-secret") == null);

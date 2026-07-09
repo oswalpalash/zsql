@@ -33,7 +33,7 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 - `zsql.StmtCache` (connection-local prepared-statement name LRU)
 - `zsql.inspect`, `zsql.check`
 - `zsql.drivers.sqlite` (`-Denable-sqlite=true`): full open/exec/query/bind/tx/savepoint/pool/migrator/schema inspect
-- `zsql.drivers.postgres`: native (no libpq) URL parse, SCRAM-SHA-256 / MD5 / cleartext, simple + extended query, tx/savepoints, pool, schema inspect, `Conn.lastError()`, optional `enableStmtCache`
+- `zsql.drivers.postgres`: native (no libpq) URL parse, SCRAM-SHA-256 / SCRAM-SHA-256-PLUS / MD5 / cleartext, simple + extended query, tx/savepoints, pool, schema inspect, `Conn.lastError()`, optional `enableStmtCache`
 
 ### SQLite
 
@@ -120,7 +120,23 @@ TLS uses Zig's `std.crypto.tls.Client` (no OpenSSL). Behavior by `sslmode`:
 
 Use `sslmode=verify-full` when you need full certificate checks against OS trust stores.
 
-Auth: trust, cleartext, MD5, **SCRAM-SHA-256**.
+Auth: trust, cleartext, MD5, **SCRAM-SHA-256**, and **SCRAM-SHA-256-PLUS**
+(`tls-server-end-point` channel binding).
+
+SCRAM-PLUS is used when the server offers it, TLS is active, and a leaf
+certificate DER is available for channel binding. Because `std.crypto.tls.Client`
+does not expose the peer certificate after handshake (TLS 1.3 encrypts it),
+pin the server leaf cert when you need PLUS:
+
+```zig
+var config = try zsql.drivers.postgres.parseUrl(allocator, url);
+defer config.deinit();
+config.channel_binding = .require; // or prefer (default) / disable
+config.peer_cert_der = server_leaf_cert_der; // borrowed; not freed by deinit
+var conn = try zsql.drivers.postgres.Conn.open(allocator, io, config);
+```
+
+URL query: `channel_binding=disable|prefer|require` (libpq-compatible).
 
 Failed commands map SQLSTATE into fine-grained errors (`UniqueViolation`, `ForeignKeyViolation`, …) and store rich metadata on the connection:
 

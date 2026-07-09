@@ -52,6 +52,11 @@ pub const Conn = struct {
     /// server prepares and skip Parse on cache hits.
     stmt_cache: ?core.StmtCache = null,
     next_stmt_id: u64 = 0,
+    /// Peer leaf certificate DER for SCRAM-SHA-256-PLUS `tls-server-end-point`.
+    /// Owned copy from `Config.peer_cert_der` when provided. `std.crypto.tls.Client`
+    /// does not expose the peer cert after handshake (esp. TLS 1.3), so callers
+    /// that need PLUS must pin the server leaf cert via Config.
+    peer_cert_der: ?[]u8 = null,
 
     /// Open a TCP connection and complete the PostgreSQL startup handshake.
     ///
@@ -66,17 +71,26 @@ pub const Conn = struct {
         if (config.user.len == 0) return error.InvalidArguments;
 
         return switch (config.ssl_mode) {
-            .disable, .allow => try openPlain(allocator, io, config),
-            .prefer => try openPrefer(allocator, io, config),
-            .require => try openRequireTls(allocator, io, config, .none),
-            .verify_ca => try openRequireTls(allocator, io, config, .ca),
-            .verify_full => try openRequireTls(allocator, io, config, .full),
+            .disable, .allow => openPlain(allocator, io, config),
+            .prefer => openPrefer(allocator, io, config),
+            .require => openRequireTls(allocator, io, config, .none),
+            .verify_ca => openRequireTls(allocator, io, config, .ca),
+            .verify_full => openRequireTls(allocator, io, config, .full),
         };
+    }
+
+    fn attachPeerCert(conn: *Conn, config: url.Config) !void {
+        if (config.peer_cert_der) |der| {
+            if (der.len == 0) return error.InvalidArguments;
+            if (conn.peer_cert_der) |old| conn.allocator.free(old);
+            conn.peer_cert_der = try conn.allocator.dupe(u8, der);
+        }
     }
 
     fn openPlain(allocator: std.mem.Allocator, io: Io, config: url.Config) !Conn {
         var conn = try connectBare(allocator, io, config.host, config.port);
         errdefer conn.deinitTransportOnly();
+        try conn.attachPeerCert(config);
         try conn.startup(config);
         return conn;
     }
@@ -92,12 +106,14 @@ pub const Conn = struct {
         switch (ssl) {
             .rejects_tls => {
                 errdefer conn.deinitTransportOnly();
+                try conn.attachPeerCert(config);
                 try conn.startup(config);
                 return conn;
             },
             .accepts_tls => {
                 errdefer conn.deinitTransportOnly();
                 try conn.upgradeTls(config.host, .none);
+                try conn.attachPeerCert(config);
                 try conn.startup(config);
                 return conn;
             },
@@ -112,6 +128,7 @@ pub const Conn = struct {
         const ssl = conn.negotiateSslRequest() catch return error.TlsFailed;
         if (ssl != .accepts_tls) return error.TlsFailed;
         try conn.upgradeTls(config.host, verify);
+        try conn.attachPeerCert(config);
         try conn.startup(config);
         return conn;
     }
@@ -224,10 +241,12 @@ pub const Conn = struct {
         if (self.tls_read_buf) |buf| self.allocator.free(buf);
         if (self.tls_write_buf) |buf| self.allocator.free(buf);
         if (self.ca_bundle) |*bundle| bundle.deinit(self.allocator);
+        if (self.peer_cert_der) |cert| self.allocator.free(cert);
         self.tls = null;
         self.tls_read_buf = null;
         self.tls_write_buf = null;
         self.ca_bundle = null;
+        self.peer_cert_der = null;
         self.clearLastError();
         self.closed = true;
     }
@@ -266,10 +285,12 @@ pub const Conn = struct {
         if (self.tls_read_buf) |buf| self.allocator.free(buf);
         if (self.tls_write_buf) |buf| self.allocator.free(buf);
         if (self.ca_bundle) |*bundle| bundle.deinit(self.allocator);
+        if (self.peer_cert_der) |cert| self.allocator.free(cert);
         self.tls = null;
         self.tls_read_buf = null;
         self.tls_write_buf = null;
         self.ca_bundle = null;
+        self.peer_cert_der = null;
         self.clearLastError();
         self.closed = true;
     }
@@ -966,8 +987,32 @@ pub const Conn = struct {
                             try self.writeAll(packet);
                         },
                         .sasl => {
-                            if (!scram.mechanismsIncludeScramSha256(parsed.payload)) return error.Unsupported;
                             if (scram_client != null) return error.ProtocolError;
+                            const mechs = scram.MechanismList.parse(parsed.payload);
+
+                            // Channel binding data for SCRAM-SHA-256-PLUS when we
+                            // have a leaf cert (pinned via Config.peer_cert_der).
+                            var cbind_data: ?[]u8 = null;
+                            defer if (cbind_data) |d| self.allocator.free(d);
+                            if (self.tls != null and self.peer_cert_der != null and config.channel_binding != .disable) {
+                                cbind_data = try scram.tlsServerEndPointData(self.allocator, self.peer_cert_der.?);
+                            }
+
+                            const want_plus = cbind_data != null and config.channel_binding != .disable;
+                            const selected = mechs.select(want_plus) orelse {
+                                if (config.channel_binding == .require) return error.AuthFailed;
+                                return error.Unsupported;
+                            };
+                            if (config.channel_binding == .require and selected != .scram_sha_256_plus) {
+                                return error.AuthFailed;
+                            }
+
+                            const channel_binding: scram.ChannelBinding = switch (selected) {
+                                .scram_sha_256 => .none,
+                                .scram_sha_256_plus => .{
+                                    .tls_server_end_point = cbind_data orelse return error.AuthFailed,
+                                },
+                            };
 
                             var nonce_buf: [24]u8 = undefined;
                             try self.fillClientNonce(&nonce_buf);
@@ -976,11 +1021,16 @@ pub const Conn = struct {
                                 config.user,
                                 config.password,
                                 &nonce_buf,
+                                channel_binding,
                             );
 
                             const client_first = try scram_client.?.clientFirstMessage(self.allocator);
                             defer self.allocator.free(client_first);
-                            const body = try scram.buildSaslInitialResponse(self.allocator, client_first);
+                            const body = try scram.buildSaslInitialResponse(
+                                self.allocator,
+                                selected,
+                                client_first,
+                            );
                             defer self.allocator.free(body);
                             const packet = try protocol.buildMessage(self.allocator, .password, body);
                             defer self.allocator.free(packet);
