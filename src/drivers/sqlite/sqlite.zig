@@ -88,8 +88,11 @@ pub const PoolConfig = struct {
     /// `error.PoolTimeout`. Zero means non-blocking exhaustion failure via
     /// `error.PoolExhausted`.
     ///
-    /// Multi-threaded: waiters sleep in short slices (≤1ms) and recheck, so a
-    /// concurrent `release` unblocks them within about one poll interval.
+    /// Acquire wait policy when the pool is at `max_open`:
+    /// - `0`: fail immediately with `PoolExhausted`
+    /// - `std.math.maxInt(u64)`: wait forever on a condition until a lease is
+    ///   released/discarded
+    /// - any other value: wait up to that many nanoseconds (≤1ms poll slices)
     acquire_timeout_ns: u64 = 0,
     /// When non-zero, each newly opened connection enables a prepared-statement
     /// handle cache of this size. Zero leaves caching off (default).
@@ -118,6 +121,8 @@ pub const Pool = struct {
     open_count: usize = 0,
     closed: bool = false,
     mutex: std.Io.Mutex = .init,
+    /// Signaled on release/discard so infinite waiters (`maxInt` timeout) wake.
+    available: std.Io.Condition = .init,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: PoolConfig) !Pool {
         if (config.max_open == 0) return error.InvalidBindValue;
@@ -156,7 +161,7 @@ pub const Pool = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const deadline: ?std.Io.Clock.Timestamp = if (timeout_ns == 0)
+        const deadline: ?std.Io.Clock.Timestamp = if (timeout_ns == 0 or timeout_ns == std.math.maxInt(u64))
             null
         else
             std.Io.Clock.Timestamp.fromNow(self.io, .{ .raw = .{ .nanoseconds = @intCast(timeout_ns) }, .clock = .awake });
@@ -199,18 +204,26 @@ pub const Pool = struct {
             }
 
             // Pool is full: wait or fail.
-            if (deadline) |dl| {
+            if (timeout_ns == 0) {
+                return error.PoolExhausted;
+            } else if (timeout_ns == std.math.maxInt(u64)) {
+                // Infinite wait: condition wait re-locks the mutex on wake.
+                self.available.waitUncancelable(self.io, &self.mutex);
+            } else if (deadline) |dl| {
                 const remaining = dl.durationFromNow(self.io);
                 if (remaining.raw.nanoseconds <= 0) return error.PoolTimeout;
                 const slice_ns: i96 = @min(remaining.raw.nanoseconds, @as(i96, std.time.ns_per_ms));
                 self.mutex.unlock(self.io);
-                // Best-effort sleep; cancellation maps to recheck + timeout.
                 self.io.sleep(.{ .nanoseconds = slice_ns }, .awake) catch {};
                 self.mutex.lockUncancelable(self.io);
             } else {
                 return error.PoolExhausted;
             }
         }
+    }
+
+    fn notifyAvailable(self: *Pool) void {
+        self.available.signal(self.io);
     }
 
     /// Execute a statement under a short-lived lease that is released on success
@@ -290,6 +303,7 @@ pub const Lease = struct {
             self.pool.open_count -|= 1;
         }
         self.open = false;
+        self.pool.notifyAvailable();
     }
 
     pub fn discard(self: *Lease) !void {
@@ -302,6 +316,7 @@ pub const Lease = struct {
         self.db.deinit();
         self.pool.open_count -|= 1;
         self.open = false;
+        self.pool.notifyAvailable();
     }
 };
 
@@ -1976,6 +1991,33 @@ test "SQLite pool timed acquire unblocks after concurrent release" {
 
     try std.testing.expect(ctx.ok.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), ctx.err_len);
+}
+
+test "SQLite pool infinite wait unblocks via condition signal" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{
+        .max_open = 1,
+        .acquire_timeout_ns = std.math.maxInt(u64),
+    });
+    defer pool.deinit();
+
+    var holder = try pool.acquire();
+    const Ctx = struct {
+        pool: *Pool,
+        ok: std.atomic.Value(bool) = .init(false),
+        fn worker(ctx: *@This()) void {
+            var lease = ctx.pool.acquire() catch return;
+            lease.release() catch {};
+            ctx.ok.store(true, .release);
+        }
+    };
+    var ctx = Ctx{ .pool = &pool };
+    const thread = try std.Thread.spawn(.{}, Ctx.worker, .{&ctx});
+    std.testing.io.sleep(.{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    try holder.release();
+    thread.join();
+    try std.testing.expect(ctx.ok.load(.acquire));
 }
 
 test "SQLite pool query holds lease until rows deinit" {

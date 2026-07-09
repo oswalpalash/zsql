@@ -9,9 +9,10 @@ pub const PoolConfig = struct {
     database: url.Config,
     max_open: usize = 4,
     max_idle: usize = 4,
-    /// Nanoseconds to wait when the pool is exhausted before `PoolTimeout`.
-    /// Zero means non-blocking `PoolExhausted`. Waiters poll in ≤1ms slices so
-    /// a concurrent release unblocks them promptly.
+    /// Acquire wait policy when the pool is at `max_open`:
+    /// - `0`: fail immediately with `PoolExhausted`
+    /// - `std.math.maxInt(u64)`: wait forever on a condition until release/discard
+    /// - any other value: wait up to that many nanoseconds (≤1ms poll slices)
     acquire_timeout_ns: u64 = 0,
     /// When non-zero, each newly opened connection enables a statement cache
     /// of this size via `Conn.enableStmtCache`. Zero leaves caching off.
@@ -39,6 +40,7 @@ pub const Pool = struct {
     open_count: usize = 0,
     closed: bool = false,
     mutex: Io.Mutex = .init,
+    available: Io.Condition = .init,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, config: PoolConfig) !Pool {
         if (config.max_open == 0) return error.InvalidArguments;
@@ -68,7 +70,7 @@ pub const Pool = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const deadline: ?Io.Clock.Timestamp = if (timeout_ns == 0)
+        const deadline: ?Io.Clock.Timestamp = if (timeout_ns == 0 or timeout_ns == std.math.maxInt(u64))
             null
         else
             Io.Clock.Timestamp.fromNow(self.io, .{
@@ -115,7 +117,11 @@ pub const Pool = struct {
                 };
             }
 
-            if (deadline) |dl| {
+            if (timeout_ns == 0) {
+                return error.PoolExhausted;
+            } else if (timeout_ns == std.math.maxInt(u64)) {
+                self.available.waitUncancelable(self.io, &self.mutex);
+            } else if (deadline) |dl| {
                 const remaining = dl.durationFromNow(self.io);
                 if (remaining.raw.nanoseconds <= 0) return error.PoolTimeout;
                 const slice_ns: i96 = @min(remaining.raw.nanoseconds, @as(i96, std.time.ns_per_ms));
@@ -126,6 +132,10 @@ pub const Pool = struct {
                 return error.PoolExhausted;
             }
         }
+    }
+
+    fn notifyAvailable(self: *Pool) void {
+        self.available.signal(self.io);
     }
 
     pub fn exec(self: *Pool, sql: []const u8) !core.ExecResult {
@@ -204,6 +214,7 @@ pub const Lease = struct {
             self.pool.open_count -|= 1;
         }
         self.open = false;
+        self.pool.notifyAvailable();
     }
 
     pub fn discard(self: *Lease) !void {
@@ -215,6 +226,7 @@ pub const Lease = struct {
         self.conn_value.deinit();
         self.pool.open_count -|= 1;
         self.open = false;
+        self.pool.notifyAvailable();
     }
 };
 
