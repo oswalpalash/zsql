@@ -63,6 +63,21 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the zsql CLI");
     run_step.dependOn(&run_cli.step);
 
+    // Offline checked-query example (no DB / no SQLite required).
+    const checked_example_mod = b.createModule(.{
+        .root_source_file = b.path("examples/checked_queries.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    checked_example_mod.addImport("zsql", zsql_mod);
+    const checked_example = b.addExecutable(.{
+        .name = "checked-queries",
+        .root_module = checked_example_mod,
+    });
+    const run_checked_example = b.addRunArtifact(checked_example);
+    const checked_example_step = b.step("checked-queries-example", "Run offline checked-query example");
+    checked_example_step.dependOn(&run_checked_example.step);
+
     const sqlite_example_step = b.step("sqlite-example", "Run the SQLite GPA leak-checked example");
     const sqlite_migrate_example_step = b.step("sqlite-migrate-example", "Run the SQLite migration GPA leak-checked example");
     if (enable_sqlite) {
