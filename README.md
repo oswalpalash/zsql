@@ -22,7 +22,7 @@ This repository is in the SQLite driver foundation phase. The package currently 
 - `zsql.params`
 - `zsql.migrate`
 - `zsql.drivers.sqlite` with `-Denable-sqlite=true`
-- `zsql.drivers.postgres` URL parsing and wire-protocol helpers (no libpq; live TCP/query execution in progress)
+- `zsql.drivers.postgres` URL parsing, wire-protocol helpers, cleartext/MD5 auth, and TCP startup handshake (no libpq; query execution next)
 
 The `zsql.params` module can classify SQL placeholders while ignoring quoted SQL and comments. It recognizes `?`, `?NNN`, `:name`, `@name`, and `$name` forms for future driver binding. Prepared statements record that metadata and reject bind-count mismatches before driver execution.
 
