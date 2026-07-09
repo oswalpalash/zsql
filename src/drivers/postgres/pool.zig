@@ -198,6 +198,14 @@ pub const Pool = struct {
         return owned;
     }
 
+    /// Liveness check under a short-lived lease.
+    pub fn ping(self: *Pool) !void {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        try (try lease.conn()).ping();
+        try lease.release();
+    }
+
     pub fn stats(self: *Pool) PoolStats {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

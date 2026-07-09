@@ -288,6 +288,14 @@ pub const Pool = struct {
         return owned;
     }
 
+    /// Liveness check under a short-lived lease.
+    pub fn ping(self: *Pool) !void {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        try (try lease.conn()).ping();
+        try lease.release();
+    }
+
     pub fn stats(self: *Pool) PoolStats {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2062,6 +2070,7 @@ test "SQLite pool queryOne returns single owned row" {
     defer owned.deinit();
     try std.testing.expectEqualStrings("ada", try (try owned.getName("name")).asText());
     try std.testing.expectError(error.NoRows, pool.queryOne("select id from pool_one where id = ?", &.{.{ .integer = 99 }}));
+    try pool.ping();
 }
 
 test "SQLite pool infinite wait unblocks via condition signal" {
