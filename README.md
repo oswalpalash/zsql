@@ -11,7 +11,7 @@ It gives you:
 - connection pooling
 - transactions and savepoints
 - migrations
-- optional offline query checks (JOIN scope, SELECT projections, optional WHERE column refs)
+- optional offline query checks (JOIN scope, SELECT projections, optional WHERE / JOIN ON / ORDER BY column refs)
 
 It does not give you:
 - an ORM
@@ -27,7 +27,7 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 ### Public names
 
 - `zsql.Database`, `zsql.Conn`, `zsql.Stmt`, `zsql.Tx`, `zsql.Savepoint`
-- `zsql.Rows`, `zsql.Row`, `zsql.OwnedRow`, `zsql.Value`, `zsql.OwnedValue`
+- `zsql.Rows`, `zsql.Row`, `zsql.OwnedRow`, `zsql.Value`, `zsql.OwnedValue`, `zsql.decode`
 - `zsql.ExecResult`, `zsql.Error`, `zsql.DbError`, `zsql.OwnedDbError`
 - `zsql.QueryBuilder`, `zsql.params`, `zsql.migrate`
 - `zsql.StmtCache` (connection-local prepared-statement name LRU)
@@ -177,12 +177,34 @@ var qb = zsql.QueryBuilder.init(allocator, .postgres);
 defer qb.deinit();
 try qb.appendTrustedSql("select * from ");
 try qb.ident("users");
+// or: try qb.identPath("public.users");
+// or: try qb.identSegments(&.{ "public", "users" });
 try qb.appendTrustedSql(" where id = ");
-try qb.bind(.{ .integer = 1 });
+try qb.bind(@as(i64, 1)); // Zig scalars OK
 // qb.sqlSlice() + qb.bindsSlice() for driver execParams/queryParams
 ```
 
 Unsafe raw append is named `rawUnsafe` on purpose.
+
+### Typed row decoding
+
+```zig
+// Borrowed until next row / rows deinit:
+const id = try row.as(i64, 0);
+const email = try row.asName([]const u8, "email");
+
+// Allocator-owned text/blob copy (caller frees):
+const owned_email = try row.asNameOwned(allocator, "email");
+defer allocator.free(owned_email);
+
+// Struct mapping (name first, ordinal fallback):
+const user = try row.to(struct { id: i64, email: []const u8 });
+
+// Single-value helper (same rules as Row.as / Row.to):
+const flag = try zsql.decode(bool, try row.get(2));
+```
+
+Postgres `SimpleRow` exposes the same `get` / `getName` / `as` / `asName` / `to` / `getOwned` surface.
 
 ### Offline checks
 
@@ -211,8 +233,9 @@ try zsql.check.checkQuery(.{
         .{ .name = "posts.title", .type_name = "TEXT" },
     },
     .check_projections = true, // also parse SELECT list against the scope
-    .check_where = true, // resolve bare/qualified column refs in WHERE
+    .check_where = true, // resolve bare/qualified column refs in WHERE/HAVING
     .check_join_on = true, // resolve column refs in JOIN ON clauses
+    .check_order_by = true, // resolve column refs in ORDER BY
 });
 
 // Or a reusable checked-query type:
@@ -231,11 +254,12 @@ try get_user.validate(schema);
 ```
 
 When `from_table` / `from_tables` are omitted, `checkQuery` best-effort extracts
-`FROM` / `JOIN` table names and aliases from the SQL. `check_where` and
-`check_join_on` are opt-in: they resolve simple column refs (including those
-inside function arguments like `lower(email)`), while skipping keywords, binds,
-casts, and function *names*. SQLite and PostgreSQL can build a schema graph with
-`Conn.inspectSchema` and render ZON via `zsql.inspect.writeSchemaZon`.
+`FROM` / `JOIN` table names and aliases from the SQL. `check_where`,
+`check_join_on`, and `check_order_by` are opt-in: they resolve simple column refs
+(including those inside function arguments like `lower(email)`), while skipping
+keywords, binds, casts, and function *names*. SQLite and PostgreSQL can build a
+schema graph with `Conn.inspectSchema` and render ZON via
+`zsql.inspect.writeSchemaZon`.
 
 ### CLI
 

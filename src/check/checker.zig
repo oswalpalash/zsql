@@ -52,7 +52,8 @@ const max_projections = 64;
 /// table(s). Supports multi-table / JOIN scope via `from_tables`, qualified
 /// column names (`users.email` / `u.email`), optional SELECT-list projection
 /// checks (`check_projections`), optional WHERE column checks (`check_where`),
-/// and optional JOIN ON column checks (`check_join_on`).
+/// optional JOIN ON column checks (`check_join_on`), and optional ORDER BY
+/// column checks (`check_order_by`).
 ///
 /// Values are never required at check time. Allocation-free.
 pub fn checkQuery(options: struct {
@@ -74,6 +75,9 @@ pub fn checkQuery(options: struct {
     check_where: bool = false,
     /// When true, parse simple JOIN ON column references the same way as WHERE.
     check_join_on: bool = false,
+    /// When true, parse simple ORDER BY column references the same way as WHERE.
+    /// Positional sorts (`ORDER BY 1`) and keywords (`ASC`/`DESC`) are ignored.
+    check_order_by: bool = false,
 }) CheckError!void {
     const summary = params.summarize(options.sql) catch return error.InvalidSql;
 
@@ -172,6 +176,12 @@ pub fn checkQuery(options: struct {
     if (options.check_join_on) {
         var on_buf: [max_projections]Projection = undefined;
         const refs = try parseJoinOnColumnRefs(options.sql, &on_buf);
+        try resolveProjectionRefs(options.schema, resolve_scope, refs);
+    }
+
+    if (options.check_order_by) {
+        var order_buf: [max_projections]Projection = undefined;
+        const refs = try parseOrderByColumnRefs(options.sql, &order_buf);
         try resolveProjectionRefs(options.schema, resolve_scope, refs);
     }
 }
@@ -785,6 +795,20 @@ fn isJoinOnTerminator(sc: Scanner) bool {
         (sc.peek() == ',');
 }
 
+fn isOrderByTerminator(sc: Scanner) bool {
+    // Do not treat "order" as a terminator (we are already inside ORDER BY).
+    return sc.startsWithKeyword("limit") or
+        sc.startsWithKeyword("offset") or
+        sc.startsWithKeyword("fetch") or
+        sc.startsWithKeyword("union") or
+        sc.startsWithKeyword("intersect") or
+        sc.startsWithKeyword("except") or
+        sc.startsWithKeyword("returning") or
+        sc.startsWithKeyword("window") or
+        sc.startsWithKeyword("for") or
+        (sc.peek() == ';');
+}
+
 /// Keywords / pseudo-columns that appear in WHERE but are not schema columns.
 fn isSqlNoiseIdent(name: []const u8) bool {
     const keywords = [_][]const u8{
@@ -1013,6 +1037,26 @@ fn parseHavingColumnRefs(sql: []const u8, buf: *[max_projections]Projection) Che
     return buf[0..count];
 }
 
+/// Collect bare/qualified column references from ORDER BY.
+/// Returns empty when no ORDER BY is present. Best-effort.
+fn parseOrderByColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
+    var sc = Scanner.init(sql);
+    while (sc.index < sc.sql.len) {
+        try sc.skipTrivia();
+        if (sc.index >= sc.sql.len) break;
+        if (try sc.matchKeyword("order")) {
+            try sc.skipTrivia();
+            if (try sc.matchKeyword("by")) break;
+            // Bare "order" without "by" — keep scanning (e.g. a column named order).
+            continue;
+        }
+        if ((try sc.readIdentOrStar()) == null and sc.index < sc.sql.len) sc.advance();
+    } else return buf[0..0];
+
+    const count = try collectColumnRefs(&sc, buf, 0, isOrderByTerminator);
+    return buf[0..count];
+}
+
 /// Build a checked-query type from options. Prefer this for stable embed sites:
 ///
 /// ```zig
@@ -1034,6 +1078,7 @@ pub fn checkedQuery(comptime options: anytype) type {
     const check_projections_value: bool = if (@hasField(@TypeOf(options), "check_projections")) options.check_projections else false;
     const check_where_value: bool = if (@hasField(@TypeOf(options), "check_where")) options.check_where else false;
     const check_join_on_value: bool = if (@hasField(@TypeOf(options), "check_join_on")) options.check_join_on else false;
+    const check_order_by_value: bool = if (@hasField(@TypeOf(options), "check_order_by")) options.check_order_by else false;
 
     const args_value: []const ArgSpec = comptime blk: {
         if (!@hasField(@TypeOf(options), "args")) break :blk &.{};
@@ -1081,6 +1126,7 @@ pub fn checkedQuery(comptime options: anytype) type {
         pub const check_projections = check_projections_value;
         pub const check_where = check_where_value;
         pub const check_join_on = check_join_on_value;
+        pub const check_order_by = check_order_by_value;
 
         pub fn validate(schema: inspect.Schema) CheckError!void {
             try checkQuery(.{
@@ -1093,6 +1139,7 @@ pub fn checkedQuery(comptime options: anytype) type {
                 .check_projections = check_projections,
                 .check_where = check_where,
                 .check_join_on = check_join_on,
+                .check_order_by = check_order_by,
             });
         }
     };
@@ -1605,4 +1652,57 @@ test "checkQuery join ON column refs resolve against scope" {
         .schema = schema,
         .check_join_on = false,
     });
+}
+
+test "checkQuery order by column refs resolve against scope" {
+    const schema = inspect.Schema{
+        .tables = &.{
+            .{
+                .name = "users",
+                .columns = &.{
+                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+                    .{ .name = "email", .type_name = "TEXT", .nullable = false },
+                    .{ .name = "created_at", .type_name = "TEXT", .nullable = false },
+                },
+            },
+        },
+    };
+
+    try checkQuery(.{
+        .sql = "select id, email from users order by email asc, created_at desc nulls last",
+        .schema = schema,
+        .from_table = "users",
+        .check_order_by = true,
+    });
+
+    // Positional ORDER BY and keywords should not fail.
+    try checkQuery(.{
+        .sql = "select id, email from users order by 1, 2 desc",
+        .schema = schema,
+        .from_table = "users",
+        .check_order_by = true,
+    });
+
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select id from users order by missing_col",
+        .schema = schema,
+        .from_table = "users",
+        .check_order_by = true,
+    }));
+
+    // Default off.
+    try checkQuery(.{
+        .sql = "select id from users order by missing_col",
+        .schema = schema,
+        .from_table = "users",
+        .check_order_by = false,
+    });
+
+    const q = checkedQuery(.{
+        .sql = "select id from users order by email",
+        .from_table = "users",
+        .row = &.{.{ .name = "id", .type_name = "INTEGER" }},
+        .check_order_by = true,
+    });
+    try q.validate(schema);
 }

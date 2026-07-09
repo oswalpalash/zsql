@@ -54,7 +54,7 @@ pub const DbError = struct {
             error.InvalidSql, error.InvalidMigrationFilename => .invalid_sql,
             error.InvalidArguments, error.InvalidBindValue, error.BindCountMismatch, error.InvalidUrl => .invalid_arguments,
             error.TypeMismatch, error.InvalidColumnType, error.InvalidColumn, error.UnexpectedNull, error.IntegerOverflow => .type_mismatch,
-            error.ConnectionClosed, error.ConnectionBusy, error.ConnectionTimeout => .connection,
+            error.ConnectionClosed, error.ConnectionBusy, error.ConnectionTimeout, error.QueryTimeout => .connection,
             error.AuthFailed, error.TlsFailed => .auth,
             error.ProtocolError => .protocol,
             error.ConstraintViolation,
@@ -94,6 +94,8 @@ pub const DbError = struct {
         if (std.mem.eql(u8, code, "08000") or std.mem.eql(u8, code, "08003") or std.mem.eql(u8, code, "08006"))
             return error.ConnectionClosed;
         if (std.mem.eql(u8, code, "57P01")) return error.ConnectionClosed;
+        // query_canceled / statement_timeout
+        if (std.mem.eql(u8, code, "57014")) return error.QueryTimeout;
         if (std.mem.eql(u8, code, "53300")) return error.PoolExhausted;
         // Class 22: data exception
         if (std.mem.startsWith(u8, code, "22")) return error.TypeMismatch;
@@ -206,6 +208,7 @@ test "category mapping covers core errors" {
     try std.testing.expect(DbError.categoryOf(error.DeadlockDetected) == .transaction);
     try std.testing.expect(DbError.categoryOf(error.AuthFailed) == .auth);
     try std.testing.expect(DbError.categoryOf(error.PoolTimeout) == .pool);
+    try std.testing.expect(DbError.categoryOf(error.QueryTimeout) == .connection);
 }
 
 test "sqlstate mapping" {
@@ -219,6 +222,7 @@ test "sqlstate mapping" {
     try std.testing.expect(DbError.errorFromSqlState("42601") == error.InvalidSql);
     try std.testing.expect(DbError.errorFromSqlState("22003") == error.TypeMismatch);
     try std.testing.expect(DbError.errorFromSqlState("08006") == error.ConnectionClosed);
+    try std.testing.expect(DbError.errorFromSqlState("57014") == error.QueryTimeout);
 }
 
 test "OwnedDbError duplicates postgres fields without secrets" {

@@ -23,6 +23,8 @@ pub const Error = error{
     ConnectionClosed,
     ConnectionBusy,
     ConnectionTimeout,
+    /// Statement or query exceeded a driver/server timeout (when reported).
+    QueryTimeout,
     TransactionClosed,
     SavepointClosed,
     PoolClosed,

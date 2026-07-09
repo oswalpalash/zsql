@@ -65,6 +65,17 @@ pub const QueryBuilder = struct {
         }
     }
 
+    /// Quote each path segment separately: `identSegments(&.{ "public", "users" })`
+    /// → `"public"."users"`. Prefer this when segments are already split.
+    pub fn identSegments(self: *QueryBuilder, segments: []const []const u8) !void {
+        if (segments.len == 0) return error.InvalidArguments;
+        for (segments, 0..) |part, i| {
+            if (part.len == 0) return error.InvalidArguments;
+            if (i != 0) try self.sql.append(self.allocator, '.');
+            try quoteIdent(&self.sql, self.allocator, part);
+        }
+    }
+
     /// Bind a parameter. Accepts `Value` or common Zig scalars (`bool`, integers,
     /// floats, `[]const u8` text, optionals, and `null`). Values are never
     /// concatenated into the SQL string.
@@ -230,6 +241,15 @@ test "QueryBuilder quotes identifiers and never inlines binds" {
     try std.testing.expectEqualStrings("ada\"; drop table users;--", qb.bindsSlice()[1].text);
     // Bound text must not appear in the SQL string.
     try std.testing.expect(std.mem.indexOf(u8, qb.sqlSlice(), "drop table") == null);
+}
+
+test "QueryBuilder.identSegments quotes each segment" {
+    var qb = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer qb.deinit();
+    try qb.identSegments(&.{ "public", "users", "email" });
+    try std.testing.expectEqualStrings("\"public\".\"users\".\"email\"", qb.sqlSlice());
+    try std.testing.expectError(error.InvalidArguments, qb.identSegments(&.{}));
+    try std.testing.expectError(error.InvalidArguments, qb.identSegments(&.{ "ok", "" }));
 }
 
 test "QueryBuilder escapes embedded quotes in identifiers" {
