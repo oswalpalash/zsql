@@ -29,11 +29,20 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      # Node 24 action runtime (avoids Node 20 deprecation warnings).
+      - uses: actions/checkout@v5
 
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
+      # Install Zig without a Node-based action (setup-zig still targets Node 20).
+      - name: Install Zig 0.16.0
+        run: |
+          set -euo pipefail
+          ZIG_VERSION=0.16.0
+          ARCH=x86_64
+          URL="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL "$URL" -o /tmp/zig.tar.xz
+          sudo tar -xJf /tmp/zig.tar.xz -C /opt
+          echo "/opt/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          zig version
 
       - name: Format check
         run: zig fmt --check .
