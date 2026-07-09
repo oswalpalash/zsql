@@ -11,7 +11,7 @@ It gives you:
 - connection pooling
 - transactions and savepoints
 - migrations
-- optional offline query checks
+- optional offline query checks (including multi-table JOIN scope and SELECT projections)
 
 It does not give you:
 - an ORM

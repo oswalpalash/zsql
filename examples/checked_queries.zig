@@ -13,6 +13,14 @@ pub fn main() !void {
                     .{ .name = "active", .type_name = "INTEGER", .nullable = false },
                 },
             },
+            .{
+                .name = "posts",
+                .columns = &.{
+                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+                    .{ .name = "user_id", .type_name = "INTEGER", .nullable = false },
+                    .{ .name = "title", .type_name = "TEXT", .nullable = false },
+                },
+            },
         },
     };
 
@@ -48,6 +56,23 @@ pub fn main() !void {
         .from_table = "users",
     });
     try get_user.validate(schema);
+
+    // JOIN + projection check: qualified columns, multi-table scope.
+    const user_posts = zsql.checkedQuery(.{
+        .sql =
+        \\select u.email, p.title
+        \\from users u
+        \\join posts p on p.user_id = u.id
+        \\where u.id = :id
+        ,
+        .args = &.{.{ .name = "id" }},
+        .row = &.{
+            .{ .name = "u.email", .type_name = "TEXT" },
+            .{ .name = "p.title", .type_name = "TEXT" },
+        },
+        .check_projections = true,
+    });
+    try user_posts.validate(schema);
 
     var buffer: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
