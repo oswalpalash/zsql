@@ -216,6 +216,15 @@ pub const Pool = struct {
         try lease.release();
     }
 
+    /// Acquire a lease, run `body` inside `Conn.withTx`, then release the lease.
+    /// On body error the connection rolls back and the lease is discarded.
+    pub fn withTx(self: *Pool, ctx: anytype, comptime body: *const fn (@TypeOf(ctx), *conn_mod.Conn) anyerror!void) !void {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        try (try lease.conn()).withTx(ctx, body);
+        try lease.release();
+    }
+
     pub fn stats(self: *Pool) PoolStats {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

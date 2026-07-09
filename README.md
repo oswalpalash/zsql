@@ -99,6 +99,13 @@ try pg_conn.withTx({}, struct {
         _ = try c.execParams("insert into t (n) values ($1)", &.{.{ .integer = 1 }});
     }
 }.run);
+
+// Pools: `Pool.withTx` (and SQLite `Pool.withTxImmediate`) hold a lease for the body.
+try pg_pool.withTx({}, struct {
+    fn run(_: void, c: *zsql.drivers.postgres.Conn) !void {
+        _ = try c.execParams("insert into t (n) values ($1)", &.{.{ .integer = 1 }});
+    }
+}.run);
 ```
 
 Pool acquire timeout: `0` = non-blocking, `std.math.maxInt(u64)` = wait forever (condition), any other value = timed wait (event signal on release).

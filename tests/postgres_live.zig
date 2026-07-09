@@ -189,6 +189,59 @@ test "postgres live: pool queryAllParams collects owned rows" {
     try pool.ping();
 }
 
+test "postgres live: pool withTx commits and rolls back" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var pool = try pg.Pool.init(allocator, io, .{
+        .database = config,
+        .max_open = 2,
+        .max_idle = 1,
+    });
+    defer pool.deinit();
+
+    _ = try pool.exec("drop table if exists zsql_pool_tx");
+    _ = try pool.exec(
+        \\create table zsql_pool_tx (
+        \\  id int primary key,
+        \\  name text not null
+        \\)
+    );
+    defer _ = pool.exec("drop table if exists zsql_pool_tx") catch {};
+
+    try pool.withTx({}, struct {
+        fn run(_: void, c: *pg.Conn) !void {
+            _ = try c.execParams(
+                "insert into zsql_pool_tx (id, name) values ($1, $2)",
+                &.{ .{ .integer = 1 }, .{ .text = "ok" } },
+            );
+        }
+    }.run);
+
+    const failed = pool.withTx({}, struct {
+        fn run(_: void, c: *pg.Conn) !void {
+            _ = try c.execParams(
+                "insert into zsql_pool_tx (id, name) values ($1, $2)",
+                &.{ .{ .integer = 2 }, .{ .text = "nope" } },
+            );
+            return error.ForceRollback;
+        }
+    }.run);
+    try std.testing.expectError(error.ForceRollback, failed);
+
+    const rows = try pool.queryAllParams("select id from zsql_pool_tx order by id", &.{});
+    defer zsql.freeOwnedRows(allocator, rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i64, 1), try (try rows[0].getName("id")).asInt());
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().leased);
+}
+
 test "postgres live: inspectSchema exports user tables" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
