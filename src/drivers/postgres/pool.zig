@@ -13,6 +13,9 @@ pub const PoolConfig = struct {
     /// Zero means non-blocking `PoolExhausted`. Waiters poll in ≤1ms slices so
     /// a concurrent release unblocks them promptly.
     acquire_timeout_ns: u64 = 0,
+    /// When non-zero, each newly opened connection enables a statement cache
+    /// of this size via `Conn.enableStmtCache`. Zero leaves caching off.
+    stmt_cache_size: usize = 0,
 };
 
 pub const PoolStats = struct {
@@ -87,15 +90,22 @@ pub const Pool = struct {
                 // Unlock around TCP handshake so other waiters are not stalled.
                 self.open_count += 1;
                 self.mutex.unlock(self.io);
-                const opened = conn_mod.Conn.open(self.allocator, self.io, self.config.database) catch |err| {
+                var opened = conn_mod.Conn.open(self.allocator, self.io, self.config.database) catch |err| {
                     self.mutex.lockUncancelable(self.io);
                     self.open_count -|= 1;
                     return err;
                 };
+                if (self.config.stmt_cache_size > 0) {
+                    opened.enableStmtCache(self.config.stmt_cache_size) catch |err| {
+                        opened.deinit();
+                        self.mutex.lockUncancelable(self.io);
+                        self.open_count -|= 1;
+                        return err;
+                    };
+                }
                 self.mutex.lockUncancelable(self.io);
                 if (self.closed) {
-                    var doomed = opened;
-                    doomed.deinit();
+                    opened.deinit();
                     self.open_count -|= 1;
                     return error.PoolClosed;
                 }
@@ -247,8 +257,10 @@ test "postgres pool stats start empty" {
         .database = config,
         .max_open = 2,
         .max_idle = 1,
+        .stmt_cache_size = 8,
     });
     defer pool.deinit();
+    try std.testing.expectEqual(@as(usize, 8), pool.config.stmt_cache_size);
     try std.testing.expectEqualDeep(PoolStats{
         .open = 0,
         .idle = 0,
