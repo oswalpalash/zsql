@@ -50,8 +50,8 @@ const max_projections = 64;
 ///
 /// Validates named placeholders and that each result field exists on the named
 /// table(s). Supports multi-table / JOIN scope via `from_tables`, qualified
-/// column names (`users.email` / `u.email`), and optional SELECT-list projection
-/// checks (`check_projections`).
+/// column names (`users.email` / `u.email`), optional SELECT-list projection
+/// checks (`check_projections`), and optional WHERE column checks (`check_where`).
 ///
 /// Values are never required at check time. Allocation-free.
 pub fn checkQuery(options: struct {
@@ -66,6 +66,10 @@ pub fn checkQuery(options: struct {
     /// When true, parse a simple SELECT list and ensure each bare/qualified
     /// projection resolves against the table scope (and schema).
     check_projections: bool = false,
+    /// When true, parse simple WHERE column references and resolve them against
+    /// the table scope. Function calls, SQL keywords, casts, and bind markers
+    /// are skipped. Opt-in so complex expressions do not surprise callers.
+    check_where: bool = false,
 }) CheckError!void {
     const summary = params.summarize(options.sql) catch return error.InvalidSql;
 
@@ -127,27 +131,39 @@ pub fn checkQuery(options: struct {
         }
     }
 
+    const resolve_scope = if (scope.len != 0)
+        scope
+    else
+        schemaAsScope(options.schema, &table_buf);
+
     if (options.check_projections) {
         var proj_buf: [max_projections]Projection = undefined;
         const projs = try parseSelectProjections(options.sql, &proj_buf);
-        const proj_scope = if (scope.len != 0)
-            scope
-        else
-            schemaAsScope(options.schema, &table_buf);
         for (projs) |proj| {
             if (proj.is_star) {
                 if (proj.qualifier) |q| {
                     // table.* — qualifier must resolve to a known table/alias in scope.
-                    _ = findTableRef(proj_scope, q) orelse return error.UnknownTable;
+                    _ = findTableRef(resolve_scope, q) orelse return error.UnknownTable;
                 }
                 continue;
             }
-            const name = if (proj.qualifier) |q|
-                // Build "qual.col" without allocation by resolving parts separately.
-                try resolveQualified(options.schema, proj_scope, q, proj.column)
-            else
-                try resolveField(options.schema, proj_scope, proj.column);
-            _ = name;
+            if (proj.qualifier) |q| {
+                _ = try resolveQualified(options.schema, resolve_scope, q, proj.column);
+            } else {
+                _ = try resolveField(options.schema, resolve_scope, proj.column);
+            }
+        }
+    }
+
+    if (options.check_where) {
+        var where_buf: [max_projections]Projection = undefined;
+        const refs = try parseWhereColumnRefs(options.sql, &where_buf);
+        for (refs) |ref| {
+            if (ref.qualifier) |q| {
+                _ = try resolveQualified(options.schema, resolve_scope, q, ref.column);
+            } else {
+                _ = try resolveField(options.schema, resolve_scope, ref.column);
+            }
         }
     }
 }
@@ -719,6 +735,165 @@ fn skipSelectItem(sc: *Scanner) CheckError!void {
     }
 }
 
+fn isWhereTerminator(sc: Scanner) bool {
+    return sc.startsWithKeyword("group") or
+        sc.startsWithKeyword("order") or
+        sc.startsWithKeyword("limit") or
+        sc.startsWithKeyword("offset") or
+        sc.startsWithKeyword("having") or
+        sc.startsWithKeyword("union") or
+        sc.startsWithKeyword("intersect") or
+        sc.startsWithKeyword("except") or
+        sc.startsWithKeyword("returning") or
+        sc.startsWithKeyword("window") or
+        sc.startsWithKeyword("for") or
+        (sc.peek() == ';');
+}
+
+/// Keywords / pseudo-columns that appear in WHERE but are not schema columns.
+fn isSqlNoiseIdent(name: []const u8) bool {
+    const keywords = [_][]const u8{
+        "and",       "or",        "not",       "in",        "is",        "null",
+        "true",      "false",     "unknown",   "between",   "like",      "ilike",
+        "similar",   "escape",    "exists",    "case",      "when",      "then",
+        "else",      "end",       "any",       "all",       "some",      "distinct",
+        "cast",      "as",        "on",        "using",     "join",      "inner",
+        "left",      "right",     "full",      "cross",     "outer",     "select",
+        "from",      "where",     "group",     "order",     "by",        "limit",
+        "offset",    "having",    "union",     "intersect", "except",    "returning",
+        "window",    "over",      "partition", "asc",       "desc",      "nulls",
+        "first",     "last",      "current",   "row",       "rows",      "unbounded",
+        "preceding", "following", "filter",    "collate",   "symmetric", "asymmetric",
+        "interval",  "date",      "time",      "timestamp", "at",        "zone",
+        "both",      "leading",   "trailing",  "trim",      "extract",   "substring",
+        "position",  "overlay",   "placing",   "values",    "default",   "new",
+        "old",       "array",     "row",       "only",
+    };
+    for (keywords) |kw| {
+        if (std.ascii.eqlIgnoreCase(name, kw)) return true;
+    }
+    return false;
+}
+
+fn skipBindMarker(sc: *Scanner) CheckError!bool {
+    try sc.skipTrivia();
+    const c = sc.peek() orelse return false;
+    if (c != ':' and c != '@' and c != '$') return false;
+    // Postgres `::` cast is not a bind marker.
+    if (c == ':' and sc.index + 1 < sc.sql.len and sc.sql[sc.index + 1] == ':') return false;
+    sc.advance();
+    // $1 / :name / @name
+    if (sc.index < sc.sql.len and std.ascii.isDigit(sc.sql[sc.index])) {
+        while (sc.index < sc.sql.len and std.ascii.isDigit(sc.sql[sc.index])) : (sc.index += 1) {}
+        return true;
+    }
+    _ = try sc.readIdentOrStar();
+    return true;
+}
+
+fn skipNumber(sc: *Scanner) CheckError!bool {
+    try sc.skipTrivia();
+    const c = sc.peek() orelse return false;
+    if (!std.ascii.isDigit(c) and !(c == '.' and sc.index + 1 < sc.sql.len and std.ascii.isDigit(sc.sql[sc.index + 1])))
+        return false;
+    while (sc.index < sc.sql.len) {
+        const ch = sc.sql[sc.index];
+        if (std.ascii.isDigit(ch) or ch == '.' or ch == 'e' or ch == 'E' or ch == '+' or ch == '-') {
+            sc.advance();
+        } else break;
+    }
+    return true;
+}
+
+fn skipParenGroup(sc: *Scanner) CheckError!void {
+    try sc.skipTrivia();
+    if (sc.peek() != '(') return;
+    sc.advance();
+    var depth: i32 = 1;
+    while (sc.index < sc.sql.len and depth > 0) {
+        try sc.skipTrivia();
+        const c = sc.peek() orelse break;
+        if (c == '(') {
+            depth += 1;
+            sc.advance();
+        } else if (c == ')') {
+            depth -= 1;
+            sc.advance();
+        } else if ((try sc.readIdentOrStar()) == null) {
+            sc.advance();
+        }
+    }
+}
+
+/// Collect bare/qualified column references from a simple WHERE clause.
+/// Returns empty when no WHERE is present. Best-effort; not a full SQL parser.
+fn parseWhereColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
+    var sc = Scanner.init(sql);
+    // Find first top-level WHERE (after SELECT … FROM …).
+    while (sc.index < sc.sql.len) {
+        try sc.skipTrivia();
+        if (sc.index >= sc.sql.len) break;
+        if (try sc.matchKeyword("where")) break;
+        if ((try sc.readIdentOrStar()) == null and sc.index < sc.sql.len) sc.advance();
+    } else return buf[0..0];
+
+    var count: usize = 0;
+    while (sc.index < sc.sql.len and count < max_projections) {
+        try sc.skipTrivia();
+        if (sc.index >= sc.sql.len) break;
+        if (isWhereTerminator(sc)) break;
+
+        if (try skipBindMarker(&sc)) continue;
+        if (try skipNumber(&sc)) continue;
+
+        // Postgres / SQL type cast `::typename`
+        if (sc.peek() == ':' and sc.index + 1 < sc.sql.len and sc.sql[sc.index + 1] == ':') {
+            sc.advance();
+            sc.advance();
+            _ = try sc.readIdentOrStar();
+            // optional (precision) after cast type
+            try sc.skipTrivia();
+            if (sc.peek() == '(') try skipParenGroup(&sc);
+            continue;
+        }
+
+        const first = try sc.readIdentOrStar();
+        if (first == null) {
+            // Operator / punctuation
+            if (sc.index < sc.sql.len) sc.advance();
+            continue;
+        }
+        if (std.mem.eql(u8, first.?, "*")) continue;
+        if (isSqlNoiseIdent(first.?)) continue;
+
+        try sc.skipTrivia();
+        // Function call: skip name + argument list (do not treat args as columns
+        // for this best-effort pass — keeps false positives low).
+        if (sc.peek() == '(') {
+            try skipParenGroup(&sc);
+            continue;
+        }
+
+        if (sc.peek() == '.') {
+            sc.advance();
+            const second = try sc.readIdentOrStar() orelse return error.InvalidSql;
+            if (std.mem.eql(u8, second, "*") or isSqlNoiseIdent(second)) continue;
+            // qualified function: schema.func(
+            try sc.skipTrivia();
+            if (sc.peek() == '(') {
+                try skipParenGroup(&sc);
+                continue;
+            }
+            buf[count] = .{ .column = second, .qualifier = first.? };
+            count += 1;
+        } else {
+            buf[count] = .{ .column = first.? };
+            count += 1;
+        }
+    }
+    return buf[0..count];
+}
+
 /// Build a checked-query type from options. Prefer this for stable embed sites:
 ///
 /// ```zig
@@ -738,6 +913,7 @@ pub fn checkedQuery(comptime options: anytype) type {
     const sql_value: []const u8 = options.sql;
     const from_table_value: ?[]const u8 = if (@hasField(@TypeOf(options), "from_table")) options.from_table else null;
     const check_projections_value: bool = if (@hasField(@TypeOf(options), "check_projections")) options.check_projections else false;
+    const check_where_value: bool = if (@hasField(@TypeOf(options), "check_where")) options.check_where else false;
 
     const args_value: []const ArgSpec = comptime blk: {
         if (!@hasField(@TypeOf(options), "args")) break :blk &.{};
@@ -783,6 +959,7 @@ pub fn checkedQuery(comptime options: anytype) type {
         pub const from_table = from_table_value;
         pub const from_tables = from_tables_value;
         pub const check_projections = check_projections_value;
+        pub const check_where = check_where_value;
 
         pub fn validate(schema: inspect.Schema) CheckError!void {
             try checkQuery(.{
@@ -793,6 +970,7 @@ pub fn checkedQuery(comptime options: anytype) type {
                 .from_table = from_table,
                 .from_tables = from_tables,
                 .check_projections = check_projections,
+                .check_where = check_where,
             });
         }
     };
@@ -1083,6 +1261,108 @@ test "checkedQuery supports from_tables and check_projections" {
             .{ .name = "posts.title", .type_name = "TEXT" },
         },
         .check_projections = true,
+    });
+    try q.validate(schema);
+}
+
+test "checkQuery where column refs resolve against scope" {
+    const schema = inspect.Schema{
+        .tables = &.{
+            .{
+                .name = "users",
+                .columns = &.{
+                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+                    .{ .name = "email", .type_name = "TEXT", .nullable = false },
+                    .{ .name = "active", .type_name = "INTEGER", .nullable = false },
+                },
+            },
+            .{
+                .name = "posts",
+                .columns = &.{
+                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+                    .{ .name = "user_id", .type_name = "INTEGER", .nullable = false },
+                    .{ .name = "title", .type_name = "TEXT", .nullable = false },
+                },
+            },
+        },
+    };
+
+    try checkQuery(.{
+        .sql = "select id from users where email = :email and active = 1",
+        .schema = schema,
+        .args = &.{.{ .name = "email" }},
+        .from_table = "users",
+        .check_where = true,
+    });
+
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select id from users where missing_col = 1",
+        .schema = schema,
+        .from_table = "users",
+        .check_where = true,
+    }));
+
+    // Qualified WHERE across a join.
+    try checkQuery(.{
+        .sql =
+        \\select u.email
+        \\from users u
+        \\join posts p on p.user_id = u.id
+        \\where u.id = :id and p.title is not null
+        ,
+        .schema = schema,
+        .args = &.{.{ .name = "id" }},
+        .check_where = true,
+    });
+
+    // Unqualified `id` is ambiguous in join scope.
+    try std.testing.expectError(error.AmbiguousColumn, checkQuery(.{
+        .sql =
+        \\select u.email
+        \\from users u
+        \\join posts p on p.user_id = u.id
+        \\where id = 1
+        ,
+        .schema = schema,
+        .check_where = true,
+    }));
+
+    // Casts and functions should not be treated as unknown columns.
+    try checkQuery(.{
+        .sql = "select id from users where id::text = :s and lower(email) = :e",
+        .schema = schema,
+        .args = &.{ .{ .name = "s" }, .{ .name = "e" } },
+        .from_table = "users",
+        .check_where = true,
+    });
+
+    // Default remains off: unknown WHERE columns are ignored without the flag.
+    try checkQuery(.{
+        .sql = "select id from users where totally_missing = 1",
+        .schema = schema,
+        .from_table = "users",
+        .check_where = false,
+    });
+}
+
+test "checkedQuery supports check_where" {
+    const schema = inspect.Schema{
+        .tables = &.{
+            .{
+                .name = "users",
+                .columns = &.{
+                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+                    .{ .name = "email", .type_name = "TEXT", .nullable = false },
+                },
+            },
+        },
+    };
+    const q = checkedQuery(.{
+        .sql = "select id from users where email = :email",
+        .args = &.{.{ .name = "email" }},
+        .from_table = "users",
+        .row = &.{.{ .name = "id", .type_name = "INTEGER" }},
+        .check_where = true,
     });
     try q.validate(schema);
 }

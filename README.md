@@ -11,7 +11,7 @@ It gives you:
 - connection pooling
 - transactions and savepoints
 - migrations
-- optional offline query checks (including multi-table JOIN scope and SELECT projections)
+- optional offline query checks (JOIN scope, SELECT projections, optional WHERE column refs)
 
 It does not give you:
 - an ORM
@@ -187,6 +187,7 @@ try zsql.check.checkQuery(.{
         .{ .name = "posts.title", .type_name = "TEXT" },
     },
     .check_projections = true, // also parse SELECT list against the scope
+    .check_where = true, // resolve bare/qualified column refs in WHERE
 });
 
 // Or a reusable checked-query type:
@@ -198,15 +199,17 @@ const get_user = zsql.checkedQuery(.{
         .{ .name = "email", .type_name = "TEXT" },
     },
     .from_table = "users",
+    .check_where = true,
 });
 try get_user.validate(schema);
 // get_user.sql is the trusted SQL string for runtime prepare/bind
 ```
 
 When `from_table` / `from_tables` are omitted, `checkQuery` best-effort extracts
-`FROM` / `JOIN` table names and aliases from the SQL. SQLite and PostgreSQL can
-build a schema graph with `Conn.inspectSchema` and render ZON via
-`zsql.inspect.writeSchemaZon`.
+`FROM` / `JOIN` table names and aliases from the SQL. `check_where` is opt-in:
+it resolves simple WHERE column refs (skipping keywords, binds, casts, and
+function calls). SQLite and PostgreSQL can build a schema graph with
+`Conn.inspectSchema` and render ZON via `zsql.inspect.writeSchemaZon`.
 
 ### CLI
 
