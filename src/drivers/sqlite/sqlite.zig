@@ -72,6 +72,11 @@ pub const Migrator = struct {
     pub fn apply(self: Migrator, migrations: []const core.migrate.MigrationFile) !ApplyResult {
         return applyMigrations(self.conn, migrations);
     }
+
+    /// Alias for `apply` matching the public API target (`Migrator.up`).
+    pub fn up(self: Migrator, migrations: []const core.migrate.MigrationFile) !ApplyResult {
+        return self.apply(migrations);
+    }
 };
 
 pub const PoolConfig = struct {

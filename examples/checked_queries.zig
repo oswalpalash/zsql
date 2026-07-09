@@ -32,6 +32,23 @@ pub fn main() !void {
         .from_table = "users",
     });
 
+    // Typed checked-query descriptor (comptime options, runtime/comptime validate).
+    const get_user = zsql.checkedQuery(.{
+        .sql =
+        \\select id, email, active
+        \\from users
+        \\where id = :id
+        ,
+        .args = &.{.{ .name = "id" }},
+        .row = &.{
+            .{ .name = "id", .type_name = "INTEGER" },
+            .{ .name = "email", .type_name = "TEXT" },
+            .{ .name = "active", .type_name = "INTEGER" },
+        },
+        .from_table = "users",
+    });
+    try get_user.validate(schema);
+
     var buffer: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     try zsql.inspect.writeSchemaZon(&writer, schema);

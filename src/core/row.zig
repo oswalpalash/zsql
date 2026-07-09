@@ -27,6 +27,21 @@ pub const Row = struct {
         return self.valueAt(self.indexOf(column) orelse return error.InvalidColumn);
     }
 
+    /// Alias for `valueAt` — ordinal access matching the public API target.
+    pub fn get(self: Row, index: usize) !Value {
+        return self.valueAt(index);
+    }
+
+    /// Alias for `value` — named column access matching the public API target.
+    pub fn getName(self: Row, column: []const u8) !Value {
+        return self.value(column);
+    }
+
+    /// Copy this borrowed row into an allocator-owned `OwnedRow`.
+    pub fn getOwned(self: Row, allocator: std.mem.Allocator) !OwnedRow {
+        return OwnedRow.init(allocator, self);
+    }
+
     pub fn indexOf(self: Row, column: []const u8) ?usize {
         for (self.columns, 0..) |candidate, index| {
             if (std.mem.eql(u8, candidate, column)) return index;
@@ -104,6 +119,14 @@ pub const OwnedRow = struct {
 
     pub fn value(self: OwnedRow, column: []const u8) !Value {
         return self.valueAt(self.indexOf(column) orelse return error.InvalidColumn);
+    }
+
+    pub fn get(self: OwnedRow, index: usize) !Value {
+        return self.valueAt(index);
+    }
+
+    pub fn getName(self: OwnedRow, column: []const u8) !Value {
+        return self.value(column);
     }
 
     pub fn indexOf(self: OwnedRow, column: []const u8) ?usize {
@@ -217,7 +240,13 @@ test "Row reads values by index and column name" {
     try std.testing.expectEqual(@as(usize, 2), row.len());
     try std.testing.expectEqual(@as(i64, 7), try (try row.valueAt(0)).asInt());
     try std.testing.expectEqualStrings("ada", try (try row.value("name")).asText());
+    try std.testing.expectEqual(@as(i64, 7), try (try row.get(0)).asInt());
+    try std.testing.expectEqualStrings("ada", try (try row.getName("name")).asText());
     try std.testing.expectError(error.InvalidColumn, row.value("missing"));
+
+    var owned = try row.getOwned(std.testing.allocator);
+    defer owned.deinit();
+    try std.testing.expectEqualStrings("ada", try (try owned.getName("name")).asText());
 }
 
 test "Row rejects mismatched column and value lengths" {

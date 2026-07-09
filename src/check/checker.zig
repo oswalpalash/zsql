@@ -106,6 +106,69 @@ fn findColumn(table: inspect.Table, name: []const u8) ?inspect.Column {
     return null;
 }
 
+/// Build a checked-query type from options. Prefer this for stable embed sites:
+///
+/// ```zig
+/// const q = zsql.checkedQuery(.{
+///     .sql = "select id from users where id = :id",
+///     .args = &.{.{ .name = "id" }},
+///     .row = &.{.{ .name = "id", .type_name = "INTEGER" }},
+///     .from_table = "users",
+/// });
+/// try q.validate(schema);
+/// ```
+///
+/// Call `validate()` at comptime or runtime against a schema artifact. This is
+/// the ergonomic surface toward the target API shape; it does not invent ORM
+/// behavior — only offline validation of placeholders and row/arg shapes.
+pub fn checkedQuery(comptime options: anytype) type {
+    const sql_value: []const u8 = options.sql;
+    const from_table_value: ?[]const u8 = if (@hasField(@TypeOf(options), "from_table")) options.from_table else null;
+
+    const args_value: []const ArgSpec = comptime blk: {
+        if (!@hasField(@TypeOf(options), "args")) break :blk &.{};
+        const raw = options.args;
+        var out: [raw.len]ArgSpec = undefined;
+        for (raw, 0..) |item, i| {
+            out[i] = .{ .name = item.name };
+        }
+        const frozen = out;
+        break :blk &frozen;
+    };
+
+    const row_value: []const FieldSpec = comptime blk: {
+        if (!@hasField(@TypeOf(options), "row")) break :blk &.{};
+        const raw = options.row;
+        var out: [raw.len]FieldSpec = undefined;
+        for (raw, 0..) |item, i| {
+            out[i] = .{
+                .name = item.name,
+                .type_name = if (@hasField(@TypeOf(item), "type_name")) item.type_name else null,
+                .nullable = if (@hasField(@TypeOf(item), "nullable")) item.nullable else false,
+            };
+        }
+        const frozen = out;
+        break :blk &frozen;
+    };
+
+    return struct {
+        pub const sql = sql_value;
+        pub const args = args_value;
+        pub const row = row_value;
+        pub const from_table = from_table_value;
+
+        pub fn validate(schema: inspect.Schema) CheckError!void {
+            try checkQuery(.{
+                .sql = sql,
+                .schema = schema,
+                .args = args,
+                .row = row,
+                .from_table = from_table,
+            });
+        }
+    };
+}
+
 test "checkQuery validates named params and columns" {
     const schema = inspect.Schema{
         .tables = &.{
@@ -152,4 +215,30 @@ test "checkQuery validates named params and columns" {
         .from_table = "users",
         .row = &.{.{ .name = "bio", .nullable = false }},
     }));
+}
+
+test "checkedQuery type validates against schema" {
+    const schema = inspect.Schema{
+        .tables = &.{
+            .{
+                .name = "users",
+                .columns = &.{
+                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+                    .{ .name = "email", .type_name = "TEXT", .nullable = false },
+                },
+            },
+        },
+    };
+
+    const get_user = checkedQuery(.{
+        .sql = "select id, email from users where id = :id",
+        .args = &.{.{ .name = "id" }},
+        .row = &.{
+            .{ .name = "id", .type_name = "INTEGER" },
+            .{ .name = "email", .type_name = "TEXT" },
+        },
+        .from_table = "users",
+    });
+    try get_user.validate(schema);
+    try std.testing.expectEqualStrings("select id, email from users where id = :id", get_user.sql);
 }

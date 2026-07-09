@@ -126,6 +126,19 @@ try zsql.check.checkQuery(.{
     },
     .from_table = "users",
 });
+
+// Or a reusable checked-query type:
+const get_user = zsql.checkedQuery(.{
+    .sql = "select id, email from users where id = :id",
+    .args = &.{.{ .name = "id" }},
+    .row = &.{
+        .{ .name = "id", .type_name = "INTEGER" },
+        .{ .name = "email", .type_name = "TEXT" },
+    },
+    .from_table = "users",
+});
+try get_user.validate(schema);
+// get_user.sql is the trusted SQL string for runtime prepare/bind
 ```
 
 SQLite and PostgreSQL can build a schema graph with `Conn.inspectSchema` and render ZON via `zsql.inspect.writeSchemaZon`.

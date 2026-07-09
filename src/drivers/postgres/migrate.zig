@@ -186,6 +186,11 @@ pub const Migrator = struct {
         try self.conn.commit();
         return .{ .applied = applied };
     }
+
+    /// Alias for `apply` matching the public API target (`Migrator.up`).
+    pub fn up(self: Migrator, migrations: []const core.migrate.MigrationFile) !ApplyResult {
+        return self.apply(migrations);
+    }
 };
 
 fn findMigration(migrations: []const core.migrate.MigrationFile, version: u64) ?core.migrate.MigrationFile {
