@@ -51,7 +51,8 @@ const max_projections = 64;
 /// Validates named placeholders and that each result field exists on the named
 /// table(s). Supports multi-table / JOIN scope via `from_tables`, qualified
 /// column names (`users.email` / `u.email`), optional SELECT-list projection
-/// checks (`check_projections`), and optional WHERE column checks (`check_where`).
+/// checks (`check_projections`), optional WHERE column checks (`check_where`),
+/// and optional JOIN ON column checks (`check_join_on`).
 ///
 /// Values are never required at check time. Allocation-free.
 pub fn checkQuery(options: struct {
@@ -70,6 +71,8 @@ pub fn checkQuery(options: struct {
     /// the table scope. Function calls, SQL keywords, casts, and bind markers
     /// are skipped. Opt-in so complex expressions do not surprise callers.
     check_where: bool = false,
+    /// When true, parse simple JOIN ON column references the same way as WHERE.
+    check_join_on: bool = false,
 }) CheckError!void {
     const summary = params.summarize(options.sql) catch return error.InvalidSql;
 
@@ -158,12 +161,22 @@ pub fn checkQuery(options: struct {
     if (options.check_where) {
         var where_buf: [max_projections]Projection = undefined;
         const refs = try parseWhereColumnRefs(options.sql, &where_buf);
-        for (refs) |ref| {
-            if (ref.qualifier) |q| {
-                _ = try resolveQualified(options.schema, resolve_scope, q, ref.column);
-            } else {
-                _ = try resolveField(options.schema, resolve_scope, ref.column);
-            }
+        try resolveProjectionRefs(options.schema, resolve_scope, refs);
+    }
+
+    if (options.check_join_on) {
+        var on_buf: [max_projections]Projection = undefined;
+        const refs = try parseJoinOnColumnRefs(options.sql, &on_buf);
+        try resolveProjectionRefs(options.schema, resolve_scope, refs);
+    }
+}
+
+fn resolveProjectionRefs(schema: inspect.Schema, scope: []const TableRef, refs: []const Projection) CheckError!void {
+    for (refs) |ref| {
+        if (ref.qualifier) |q| {
+            _ = try resolveQualified(schema, scope, q, ref.column);
+        } else {
+            _ = try resolveField(schema, scope, ref.column);
         }
     }
 }
@@ -735,7 +748,7 @@ fn skipSelectItem(sc: *Scanner) CheckError!void {
     }
 }
 
-fn isWhereTerminator(sc: Scanner) bool {
+fn isClauseTerminator(sc: Scanner) bool {
     return sc.startsWithKeyword("group") or
         sc.startsWithKeyword("order") or
         sc.startsWithKeyword("limit") or
@@ -748,6 +761,23 @@ fn isWhereTerminator(sc: Scanner) bool {
         sc.startsWithKeyword("window") or
         sc.startsWithKeyword("for") or
         (sc.peek() == ';');
+}
+
+fn isWhereTerminator(sc: Scanner) bool {
+    return isClauseTerminator(sc);
+}
+
+fn isJoinOnTerminator(sc: Scanner) bool {
+    return sc.startsWithKeyword("inner") or
+        sc.startsWithKeyword("left") or
+        sc.startsWithKeyword("right") or
+        sc.startsWithKeyword("full") or
+        sc.startsWithKeyword("cross") or
+        sc.startsWithKeyword("join") or
+        sc.startsWithKeyword("where") or
+        sc.startsWithKeyword("on") or
+        isClauseTerminator(sc) or
+        (sc.peek() == ',');
 }
 
 /// Keywords / pseudo-columns that appear in WHERE but are not schema columns.
@@ -825,41 +855,32 @@ fn skipParenGroup(sc: *Scanner) CheckError!void {
     }
 }
 
-/// Collect bare/qualified column references from a simple WHERE clause.
-/// Returns empty when no WHERE is present. Best-effort; not a full SQL parser.
-fn parseWhereColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
-    var sc = Scanner.init(sql);
-    // Find first top-level WHERE (after SELECT … FROM …).
-    while (sc.index < sc.sql.len) {
-        try sc.skipTrivia();
-        if (sc.index >= sc.sql.len) break;
-        if (try sc.matchKeyword("where")) break;
-        if ((try sc.readIdentOrStar()) == null and sc.index < sc.sql.len) sc.advance();
-    } else return buf[0..0];
+const TerminatorFn = *const fn (Scanner) bool;
 
-    var count: usize = 0;
+/// Collect bare/qualified column refs from the current scanner position until
+/// `is_terminator` returns true. Best-effort; not a full SQL expression parser.
+fn collectColumnRefs(sc: *Scanner, buf: *[max_projections]Projection, start_count: usize, is_terminator: TerminatorFn) CheckError!usize {
+    var count = start_count;
     while (sc.index < sc.sql.len and count < max_projections) {
         try sc.skipTrivia();
         if (sc.index >= sc.sql.len) break;
-        if (isWhereTerminator(sc)) break;
+        if (is_terminator(sc.*)) break;
 
-        if (try skipBindMarker(&sc)) continue;
-        if (try skipNumber(&sc)) continue;
+        if (try skipBindMarker(sc)) continue;
+        if (try skipNumber(sc)) continue;
 
         // Postgres / SQL type cast `::typename`
         if (sc.peek() == ':' and sc.index + 1 < sc.sql.len and sc.sql[sc.index + 1] == ':') {
             sc.advance();
             sc.advance();
             _ = try sc.readIdentOrStar();
-            // optional (precision) after cast type
             try sc.skipTrivia();
-            if (sc.peek() == '(') try skipParenGroup(&sc);
+            if (sc.peek() == '(') try skipParenGroup(sc);
             continue;
         }
 
         const first = try sc.readIdentOrStar();
         if (first == null) {
-            // Operator / punctuation
             if (sc.index < sc.sql.len) sc.advance();
             continue;
         }
@@ -867,10 +888,9 @@ fn parseWhereColumnRefs(sql: []const u8, buf: *[max_projections]Projection) Chec
         if (isSqlNoiseIdent(first.?)) continue;
 
         try sc.skipTrivia();
-        // Function call: skip name + argument list (do not treat args as columns
-        // for this best-effort pass — keeps false positives low).
+        // Function call: skip name + argument list (keeps false positives low).
         if (sc.peek() == '(') {
-            try skipParenGroup(&sc);
+            try skipParenGroup(sc);
             continue;
         }
 
@@ -878,10 +898,9 @@ fn parseWhereColumnRefs(sql: []const u8, buf: *[max_projections]Projection) Chec
             sc.advance();
             const second = try sc.readIdentOrStar() orelse return error.InvalidSql;
             if (std.mem.eql(u8, second, "*") or isSqlNoiseIdent(second)) continue;
-            // qualified function: schema.func(
             try sc.skipTrivia();
             if (sc.peek() == '(') {
-                try skipParenGroup(&sc);
+                try skipParenGroup(sc);
                 continue;
             }
             buf[count] = .{ .column = second, .qualifier = first.? };
@@ -890,6 +909,38 @@ fn parseWhereColumnRefs(sql: []const u8, buf: *[max_projections]Projection) Chec
             buf[count] = .{ .column = first.? };
             count += 1;
         }
+    }
+    return count;
+}
+
+/// Collect bare/qualified column references from a simple WHERE clause.
+/// Returns empty when no WHERE is present. Best-effort; not a full SQL parser.
+fn parseWhereColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
+    var sc = Scanner.init(sql);
+    while (sc.index < sc.sql.len) {
+        try sc.skipTrivia();
+        if (sc.index >= sc.sql.len) break;
+        if (try sc.matchKeyword("where")) break;
+        if ((try sc.readIdentOrStar()) == null and sc.index < sc.sql.len) sc.advance();
+    } else return buf[0..0];
+
+    const count = try collectColumnRefs(&sc, buf, 0, isWhereTerminator);
+    return buf[0..count];
+}
+
+/// Collect column references from every JOIN ON clause. USING (...) lists are
+/// not scanned as expressions. Best-effort.
+fn parseJoinOnColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
+    var sc = Scanner.init(sql);
+    var count: usize = 0;
+    while (sc.index < sc.sql.len and count < max_projections) {
+        try sc.skipTrivia();
+        if (sc.index >= sc.sql.len) break;
+        if (try sc.matchKeyword("on")) {
+            count = try collectColumnRefs(&sc, buf, count, isJoinOnTerminator);
+            continue;
+        }
+        if ((try sc.readIdentOrStar()) == null and sc.index < sc.sql.len) sc.advance();
     }
     return buf[0..count];
 }
@@ -914,6 +965,7 @@ pub fn checkedQuery(comptime options: anytype) type {
     const from_table_value: ?[]const u8 = if (@hasField(@TypeOf(options), "from_table")) options.from_table else null;
     const check_projections_value: bool = if (@hasField(@TypeOf(options), "check_projections")) options.check_projections else false;
     const check_where_value: bool = if (@hasField(@TypeOf(options), "check_where")) options.check_where else false;
+    const check_join_on_value: bool = if (@hasField(@TypeOf(options), "check_join_on")) options.check_join_on else false;
 
     const args_value: []const ArgSpec = comptime blk: {
         if (!@hasField(@TypeOf(options), "args")) break :blk &.{};
@@ -960,6 +1012,7 @@ pub fn checkedQuery(comptime options: anytype) type {
         pub const from_tables = from_tables_value;
         pub const check_projections = check_projections_value;
         pub const check_where = check_where_value;
+        pub const check_join_on = check_join_on_value;
 
         pub fn validate(schema: inspect.Schema) CheckError!void {
             try checkQuery(.{
@@ -971,6 +1024,7 @@ pub fn checkedQuery(comptime options: anytype) type {
                 .from_tables = from_tables,
                 .check_projections = check_projections,
                 .check_where = check_where,
+                .check_join_on = check_join_on,
             });
         }
     };
@@ -1365,4 +1419,57 @@ test "checkedQuery supports check_where" {
         .check_where = true,
     });
     try q.validate(schema);
+}
+
+test "checkQuery join ON column refs resolve against scope" {
+    const schema = inspect.Schema{
+        .tables = &.{
+            .{
+                .name = "users",
+                .columns = &.{
+                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+                    .{ .name = "email", .type_name = "TEXT", .nullable = false },
+                },
+            },
+            .{
+                .name = "posts",
+                .columns = &.{
+                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+                    .{ .name = "user_id", .type_name = "INTEGER", .nullable = false },
+                    .{ .name = "title", .type_name = "TEXT", .nullable = false },
+                },
+            },
+        },
+    };
+
+    try checkQuery(.{
+        .sql =
+        \\select u.email, p.title
+        \\from users u
+        \\join posts p on p.user_id = u.id
+        ,
+        .schema = schema,
+        .check_join_on = true,
+    });
+
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql =
+        \\select u.email
+        \\from users u
+        \\join posts p on p.missing = u.id
+        ,
+        .schema = schema,
+        .check_join_on = true,
+    }));
+
+    // Default off: bad ON columns ignored without the flag.
+    try checkQuery(.{
+        .sql =
+        \\select u.email
+        \\from users u
+        \\join posts p on p.missing = u.id
+        ,
+        .schema = schema,
+        .check_join_on = false,
+    });
 }

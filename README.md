@@ -188,6 +188,7 @@ try zsql.check.checkQuery(.{
     },
     .check_projections = true, // also parse SELECT list against the scope
     .check_where = true, // resolve bare/qualified column refs in WHERE
+    .check_join_on = true, // resolve column refs in JOIN ON clauses
 });
 
 // Or a reusable checked-query type:
@@ -206,10 +207,10 @@ try get_user.validate(schema);
 ```
 
 When `from_table` / `from_tables` are omitted, `checkQuery` best-effort extracts
-`FROM` / `JOIN` table names and aliases from the SQL. `check_where` is opt-in:
-it resolves simple WHERE column refs (skipping keywords, binds, casts, and
-function calls). SQLite and PostgreSQL can build a schema graph with
-`Conn.inspectSchema` and render ZON via `zsql.inspect.writeSchemaZon`.
+`FROM` / `JOIN` table names and aliases from the SQL. `check_where` and
+`check_join_on` are opt-in: they resolve simple column refs (skipping keywords,
+binds, casts, and function calls). SQLite and PostgreSQL can build a schema
+graph with `Conn.inspectSchema` and render ZON via `zsql.inspect.writeSchemaZon`.
 
 ### CLI
 
