@@ -65,8 +65,12 @@ pub const QueryBuilder = struct {
         }
     }
 
-    pub fn bind(self: *QueryBuilder, value: Value) !void {
-        const stored = try self.storeValue(value);
+    /// Bind a parameter. Accepts `Value` or common Zig scalars (`bool`, integers,
+    /// floats, `[]const u8` text, optionals, and `null`). Values are never
+    /// concatenated into the SQL string.
+    pub fn bind(self: *QueryBuilder, value: anytype) !void {
+        const coerced = try coerceValue(value);
+        const stored = try self.storeValue(coerced);
         try self.binds.append(self.allocator, stored);
         switch (self.dialect) {
             .postgres => {
@@ -108,6 +112,83 @@ pub const QueryBuilder = struct {
         };
     }
 };
+
+/// Convert a common Zig value into a `Value` for binding.
+///
+/// Accepts:
+/// - `Value` and anonymous Value literals (`.{ .integer = 7 }`)
+/// - `null` / optionals
+/// - `bool`, integers, floats
+/// - `[]const u8` / string arrays as text
+pub fn coerceValue(value: anytype) !Value {
+    const T = @TypeOf(value);
+    if (T == Value) return value;
+    if (T == @TypeOf(null)) return .{ .null = {} };
+
+    const info = @typeInfo(T);
+    return switch (info) {
+        .null => .{ .null = {} },
+        .optional => {
+            if (value) |inner| return coerceValue(inner);
+            return .{ .null = {} };
+        },
+        .bool => .{ .boolean = value },
+        .int, .comptime_int => .{
+            .integer = std.math.cast(i64, value) orelse return error.IntegerOverflow,
+        },
+        .float, .comptime_float => .{ .real = @floatCast(value) },
+        .pointer => |pointer| {
+            if (pointer.size == .slice and pointer.child == u8) {
+                return .{ .text = value };
+            }
+            if (pointer.size == .one) {
+                return coerceValue(value.*);
+            }
+            @compileError("QueryBuilder.bind does not support " ++ @typeName(T));
+        },
+        .array => |array| {
+            if (array.child == u8) {
+                return .{ .text = value[0..] };
+            }
+            @compileError("QueryBuilder.bind does not support " ++ @typeName(T));
+        },
+        .@"struct" => blk: {
+            // Anonymous Value-like literals: .{ .integer = 7 }, .{ .null = {} }, ...
+            if (comptime isValueLiteralStruct(T)) {
+                break :blk valueLiteralToValue(value);
+            }
+            @compileError("QueryBuilder.bind does not support " ++ @typeName(T) ++ "; use zsql.Value for blobs/custom");
+        },
+        .@"union" => {
+            if (T == Value) return value;
+            @compileError("QueryBuilder.bind does not support " ++ @typeName(T));
+        },
+        else => @compileError("QueryBuilder.bind does not support " ++ @typeName(T) ++ "; use zsql.Value for blobs/custom"),
+    };
+}
+
+fn isValueLiteralStruct(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .@"struct") return false;
+    if (info.@"struct".fields.len != 1) return false;
+    const name = info.@"struct".fields[0].name;
+    inline for (.{ "null", "integer", "real", "text", "blob", "boolean" }) |tag| {
+        if (std.mem.eql(u8, name, tag)) return true;
+    }
+    return false;
+}
+
+fn valueLiteralToValue(value: anytype) Value {
+    const T = @TypeOf(value);
+    const name = @typeInfo(T).@"struct".fields[0].name;
+    if (comptime std.mem.eql(u8, name, "null")) return .{ .null = {} };
+    if (comptime std.mem.eql(u8, name, "integer")) return .{ .integer = @field(value, "integer") };
+    if (comptime std.mem.eql(u8, name, "real")) return .{ .real = @field(value, "real") };
+    if (comptime std.mem.eql(u8, name, "text")) return .{ .text = @field(value, "text") };
+    if (comptime std.mem.eql(u8, name, "blob")) return .{ .blob = @field(value, "blob") };
+    if (comptime std.mem.eql(u8, name, "boolean")) return .{ .boolean = @field(value, "boolean") };
+    unreachable;
+}
 
 fn quoteIdent(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, name: []const u8) !void {
     if (name.len == 0) return error.InvalidArguments;
@@ -166,4 +247,37 @@ test "rawUnsafe is explicit and appends as-is" {
     try qb.rawUnsafe("/* trusted fragment */ ");
     try qb.appendTrustedSql("select 1");
     try std.testing.expectEqualStrings("/* trusted fragment */ select 1", qb.sqlSlice());
+}
+
+test "QueryBuilder.bind coerces Zig scalars and optionals" {
+    var qb = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer qb.deinit();
+
+    try qb.appendTrustedSql("values (");
+    try qb.bind(@as(i32, 42));
+    try qb.appendTrustedSql(", ");
+    try qb.bind(true);
+    try qb.appendTrustedSql(", ");
+    try qb.bind(@as([]const u8, "hello"));
+    try qb.appendTrustedSql(", ");
+    try qb.bind(@as(?i64, null));
+    try qb.appendTrustedSql(", ");
+    try qb.bind(@as(f64, 1.5));
+    try qb.appendTrustedSql(", ");
+    try qb.bind(Value{ .blob = "\x00\x01" });
+    try qb.appendTrustedSql(")");
+
+    try std.testing.expectEqualStrings("values ($1, $2, $3, $4, $5, $6)", qb.sqlSlice());
+    try std.testing.expectEqual(@as(i64, 42), qb.bindsSlice()[0].integer);
+    try std.testing.expect(qb.bindsSlice()[1].boolean);
+    try std.testing.expectEqualStrings("hello", qb.bindsSlice()[2].text);
+    try std.testing.expect(qb.bindsSlice()[3].isNull());
+    try std.testing.expectEqual(@as(f64, 1.5), qb.bindsSlice()[4].real);
+    try std.testing.expectEqualStrings("\x00\x01", qb.bindsSlice()[5].blob);
+    try std.testing.expect(std.mem.indexOf(u8, qb.sqlSlice(), "hello") == null);
+}
+
+test "coerceValue rejects integer overflow into i64" {
+    // u64 max does not fit i64.
+    try std.testing.expectError(error.IntegerOverflow, coerceValue(@as(u64, std.math.maxInt(u64))));
 }

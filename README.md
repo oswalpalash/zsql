@@ -157,6 +157,7 @@ defer zsql.drivers.postgres.freeInspectedSchema(allocator, schema);
 
 ```zig
 var qb = zsql.QueryBuilder.init(allocator, .postgres);
+// bind accepts Value or common Zig scalars (bool/int/float/[]const u8/?T/null)
 defer qb.deinit();
 try qb.appendTrustedSql("select * from ");
 try qb.ident("users");
