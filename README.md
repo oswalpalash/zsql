@@ -55,7 +55,13 @@ var rows = try conn.queryParams("select id, email from users where id = $1", &.{
 defer rows.deinit();
 ```
 
-TLS is not implemented: `sslmode=require|verify-*` returns `error.TlsFailed`. Use `sslmode=disable` on trusted networks for now.
+TLS wire encryption is not implemented yet. Behavior by `sslmode`:
+
+- `disable` / `allow`: plain connection
+- `prefer`: SSLRequest; plain if server rejects; plain reconnect fallback if server accepts (no TLS stack yet)
+- `require` / `verify-*`: SSLRequest then `error.TlsFailed`
+
+Use `sslmode=disable` on trusted networks until client TLS lands.
 
 Auth: trust, cleartext, MD5, **SCRAM-SHA-256**.
 

@@ -74,6 +74,22 @@ pub const protocol_version_3: i32 = 196608;
 /// SSLRequest code used before startup when TLS may be negotiated.
 pub const ssl_request_code: i32 = 80877103;
 
+/// Single-byte server reply to SSLRequest.
+pub const SslResponse = enum {
+    /// Server will proceed with TLS handshake next.
+    accepts_tls,
+    /// Server refuses TLS; continue with plaintext StartupMessage.
+    rejects_tls,
+
+    pub fn fromByte(byte: u8) !SslResponse {
+        return switch (byte) {
+            'S' => .accepts_tls,
+            'N' => .rejects_tls,
+            else => error.ProtocolError,
+        };
+    }
+};
+
 /// Build a StartupMessage payload (no type byte; length-prefixed only).
 ///
 /// Format: Int32 len | Int32 protocol | (key\0 value\0)* | \0
@@ -486,6 +502,12 @@ test "ssl request is fixed 8-byte packet" {
     try std.testing.expectEqual(@as(usize, 8), msg.len);
     try std.testing.expectEqual(@as(u32, 8), readU32(msg[0..4]));
     try std.testing.expectEqual(ssl_request_code, readI32(msg[4..8]));
+}
+
+test "ssl response bytes" {
+    try std.testing.expect((try SslResponse.fromByte('S')) == .accepts_tls);
+    try std.testing.expect((try SslResponse.fromByte('N')) == .rejects_tls);
+    try std.testing.expectError(error.ProtocolError, SslResponse.fromByte('X'));
 }
 
 test "build extended query messages" {

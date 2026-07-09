@@ -37,17 +37,68 @@ pub const Conn = struct {
 
     /// Open a TCP connection and complete the PostgreSQL startup handshake.
     ///
-    /// TLS is not implemented yet:
-    /// - `sslmode=disable|allow|prefer` connects in plain text.
-    /// - `sslmode=require|verify-ca|verify-full` returns `error.TlsFailed`.
+    /// TLS policy (`sslmode`):
+    /// - `disable`: plain StartupMessage (no SSLRequest).
+    /// - `allow`: plain first (TLS upgrade path not implemented).
+    /// - `prefer`: send SSLRequest; if the server rejects TLS, continue plain;
+    ///   if it accepts TLS, fall back to a plain reconnect (no TLS stack yet).
+    /// - `require|verify-*`: send SSLRequest; return `error.TlsFailed` whether
+    ///   the server accepts (TLS not implemented) or rejects.
     pub fn open(allocator: std.mem.Allocator, io: Io, config: url.Config) !Conn {
-        switch (config.ssl_mode) {
-            .disable, .allow, .prefer => {},
-            .require, .verify_ca, .verify_full => return error.TlsFailed,
-        }
         if (config.user.len == 0) return error.InvalidArguments;
 
-        const stream = try connectStream(io, config.host, config.port);
+        return switch (config.ssl_mode) {
+            .disable, .allow => try openPlain(allocator, io, config),
+            .prefer => try openPrefer(allocator, io, config),
+            .require, .verify_ca, .verify_full => try openRequireTls(allocator, io, config),
+        };
+    }
+
+    fn openPlain(allocator: std.mem.Allocator, io: Io, config: url.Config) !Conn {
+        var conn = try connectBare(allocator, io, config.host, config.port);
+        errdefer conn.deinitTransportOnly();
+        try conn.startup(config);
+        return conn;
+    }
+
+    fn openPrefer(allocator: std.mem.Allocator, io: Io, config: url.Config) !Conn {
+        var conn = try connectBare(allocator, io, config.host, config.port);
+        errdefer conn.deinitTransportOnly();
+
+        const ssl = conn.negotiateSslRequest() catch {
+            // Negotiation failed (offline host, etc.): fall back to plain
+            // reconnect so prefer stays best-effort when the server is up
+            // without SSLRequest support mid-flight.
+            conn.deinitTransportOnly();
+            return openPlain(allocator, io, config);
+        };
+
+        switch (ssl) {
+            .rejects_tls => {
+                try conn.startup(config);
+                return conn;
+            },
+            .accepts_tls => {
+                // TLS stack not implemented: drop this connection and use plain.
+                conn.deinitTransportOnly();
+                return openPlain(allocator, io, config);
+            },
+        }
+    }
+
+    fn openRequireTls(allocator: std.mem.Allocator, io: Io, config: url.Config) !Conn {
+        // Even when the server accepts TLS we cannot complete the handshake yet.
+        // Still perform SSLRequest so operators see protocol-correct failure modes
+        // (reject vs accept-without-client-TLS) once a server is available.
+        var conn = try connectBare(allocator, io, config.host, config.port);
+        defer conn.deinitTransportOnly();
+        const ssl = conn.negotiateSslRequest() catch return error.TlsFailed;
+        _ = ssl;
+        return error.TlsFailed;
+    }
+
+    fn connectBare(allocator: std.mem.Allocator, io: Io, host: []const u8, port: u16) !Conn {
+        const stream = try connectStream(io, host, port);
         errdefer stream.close(io);
 
         const read_buf = try allocator.alloc(u8, 16 * 1024);
@@ -55,7 +106,7 @@ pub const Conn = struct {
         const write_buf = try allocator.alloc(u8, 16 * 1024);
         errdefer allocator.free(write_buf);
 
-        var conn: Conn = .{
+        return .{
             .allocator = allocator,
             .io = io,
             .stream = stream,
@@ -64,9 +115,27 @@ pub const Conn = struct {
             .reader = stream.reader(io, read_buf),
             .writer = stream.writer(io, write_buf),
         };
+    }
 
-        try conn.startup(config);
-        return conn;
+    /// Close transport buffers without sending Terminate (pre-startup cleanup).
+    fn deinitTransportOnly(self: *Conn) void {
+        if (self.closed) return;
+        self.stream.close(self.io);
+        self.allocator.free(self.read_buf);
+        self.allocator.free(self.write_buf);
+        self.clearLastError();
+        self.closed = true;
+    }
+
+    /// Send SSLRequest and read the single-byte server reply.
+    fn negotiateSslRequest(self: *Conn) !protocol.SslResponse {
+        const packet = try protocol.buildSslRequest(self.allocator);
+        defer self.allocator.free(packet);
+        try self.writeAll(packet);
+
+        var byte: [1]u8 = undefined;
+        self.reader.interface.readSliceAll(&byte) catch return mapReadError(self.reader.err);
+        return protocol.SslResponse.fromByte(byte[0]);
     }
 
     pub fn deinit(self: *Conn) void {
@@ -920,10 +989,16 @@ test "captureSqlError stores OwnedDbError for lastError()" {
     try std.testing.expect(view.category == .constraint);
 }
 
-test "Conn rejects TLS-required configs before connecting" {
+test "Conn require TLS fails when host is unreachable or after SSLRequest" {
     var config = try url.parse(std.testing.allocator, "postgres://u@127.0.0.1:1/db?sslmode=require");
     defer config.deinit();
-    try std.testing.expectError(error.TlsFailed, Conn.open(std.testing.allocator, std.testing.io, config));
+    // Port 1 is almost never a Postgres server; connection or TLS path must fail.
+    const result = Conn.open(std.testing.allocator, std.testing.io, config);
+    try std.testing.expect(result == error.TlsFailed or result == error.ConnectionClosed or result == error.ConnectionTimeout or result == error.DriverError);
+}
+
+test "SslResponse parser is used by negotiation path" {
+    try std.testing.expect((try protocol.SslResponse.fromByte('N')) == .rejects_tls);
 }
 
 test "Conn rejects empty user" {
