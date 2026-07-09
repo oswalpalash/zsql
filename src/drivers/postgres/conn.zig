@@ -3,6 +3,7 @@ const core = @import("../../zsql.zig");
 const url = @import("url.zig");
 const protocol = @import("protocol.zig");
 const auth = @import("auth.zig");
+const scram = @import("scram.zig");
 const types = @import("types.zig");
 
 const Io = std.Io;
@@ -392,6 +393,9 @@ pub const Conn = struct {
         try self.writeAll(startup_msg);
 
         var authenticated = false;
+        var scram_client: ?scram.Client = null;
+        defer if (scram_client) |*c| c.deinit();
+
         while (true) {
             const msg = try self.readMessage();
             defer self.allocator.free(msg.body);
@@ -430,7 +434,40 @@ pub const Conn = struct {
                             defer self.allocator.free(packet);
                             try self.writeAll(packet);
                         },
-                        .sasl, .sasl_continue, .sasl_final => return error.Unsupported,
+                        .sasl => {
+                            if (!scram.mechanismsIncludeScramSha256(parsed.payload)) return error.Unsupported;
+                            if (scram_client != null) return error.ProtocolError;
+
+                            var nonce_buf: [24]u8 = undefined;
+                            try self.fillClientNonce(&nonce_buf);
+                            scram_client = try scram.Client.init(
+                                self.allocator,
+                                config.user,
+                                config.password,
+                                &nonce_buf,
+                            );
+
+                            const client_first = try scram_client.?.clientFirstMessage(self.allocator);
+                            defer self.allocator.free(client_first);
+                            const body = try scram.buildSaslInitialResponse(self.allocator, client_first);
+                            defer self.allocator.free(body);
+                            const packet = try protocol.buildMessage(self.allocator, .password, body);
+                            defer self.allocator.free(packet);
+                            try self.writeAll(packet);
+                        },
+                        .sasl_continue => {
+                            const client = if (scram_client) |*c| c else return error.ProtocolError;
+                            const client_final = try client.handleServerFirst(parsed.payload);
+                            defer self.allocator.free(client_final);
+                            // SASLResponse is raw message data (not NUL-terminated).
+                            const packet = try protocol.buildMessage(self.allocator, .password, client_final);
+                            defer self.allocator.free(packet);
+                            try self.writeAll(packet);
+                        },
+                        .sasl_final => {
+                            const client = if (scram_client) |*c| c else return error.ProtocolError;
+                            try client.handleServerFinal(parsed.payload);
+                        },
                         else => return error.Unsupported,
                     }
                 },
@@ -461,6 +498,16 @@ pub const Conn = struct {
                 .negotiate_protocol_version => return error.ProtocolError,
                 else => return error.ProtocolError,
             }
+        }
+    }
+
+    fn fillClientNonce(self: *Conn, buf: []u8) !void {
+        // Printable nonce alphabet (no `,`) per SCRAM recommendations.
+        const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
+        var random: [32]u8 = undefined;
+        self.io.randomSecure(&random) catch self.io.random(&random);
+        for (buf, 0..) |*out, i| {
+            out.* = alphabet[random[i % random.len] % alphabet.len];
         }
     }
 

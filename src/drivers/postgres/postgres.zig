@@ -9,6 +9,7 @@
 pub const url = @import("url.zig");
 pub const protocol = @import("protocol.zig");
 pub const auth = @import("auth.zig");
+pub const scram = @import("scram.zig");
 pub const types = @import("types.zig");
 pub const conn = @import("conn.zig");
 
@@ -26,6 +27,7 @@ test {
     _ = url;
     _ = protocol;
     _ = auth;
+    _ = scram;
     _ = types;
     _ = conn;
 }
