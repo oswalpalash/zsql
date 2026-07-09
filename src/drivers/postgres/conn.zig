@@ -553,15 +553,7 @@ fn mapWriteError(err: ?net.Stream.Writer.Error) anyerror {
 fn mapSqlError(body: []const u8) anyerror {
     const fields = protocol.parseErrorFields(body) catch return error.DriverError;
     if (fields.code) |code| {
-        if (std.mem.eql(u8, code, "23505")) return error.ConstraintViolation;
-        if (std.mem.eql(u8, code, "23503")) return error.ConstraintViolation;
-        if (std.mem.eql(u8, code, "23502")) return error.ConstraintViolation;
-        if (std.mem.eql(u8, code, "23514")) return error.ConstraintViolation;
-        if (std.mem.eql(u8, code, "40P01")) return error.DriverError;
-        if (std.mem.eql(u8, code, "40001")) return error.DriverError;
-        if (std.mem.eql(u8, code, "28P01") or std.mem.eql(u8, code, "28000")) return error.AuthFailed;
-        if (std.mem.eql(u8, code, "42601")) return error.InvalidSql;
-        if (std.mem.eql(u8, code, "42P01")) return error.InvalidSql;
+        return core.DbError.errorFromSqlState(code);
     }
     return error.DriverError;
 }

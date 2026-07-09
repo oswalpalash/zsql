@@ -1,4 +1,7 @@
 pub const Error = @import("core/error.zig").Error;
+pub const DbError = @import("core/db_error.zig").DbError;
+pub const ErrorCategory = @import("core/db_error.zig").ErrorCategory;
+pub const DriverKind = @import("core/db_error.zig").DriverKind;
 pub const Value = @import("core/value.zig").Value;
 pub const OwnedValue = @import("core/value.zig").OwnedValue;
 pub const Row = @import("core/row.zig").Row;
@@ -30,6 +33,7 @@ test {
     _ = @import("core/row.zig");
     _ = @import("core/rows.zig");
     _ = @import("core/exec_result.zig");
+    _ = @import("core/db_error.zig");
     _ = @import("core/stmt.zig");
     _ = @import("core/conn.zig");
     _ = @import("core/database.zig");
