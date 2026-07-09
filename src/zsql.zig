@@ -26,6 +26,10 @@ const options = @import("zsql_options");
 /// True when this package was built with `-Denable-sqlite=true`.
 pub const enable_sqlite = options.enable_sqlite;
 
+/// True when SQLite was built from the bundled amalgamation (default when
+/// enabled). False when linked against system `libsqlite3` via `-Dsqlite-system=true`.
+pub const sqlite_amalgamation = options.sqlite_amalgamation;
+
 /// Package version string injected from `build.zig` (matches build.zig.zon).
 pub const version = options.package_version;
 

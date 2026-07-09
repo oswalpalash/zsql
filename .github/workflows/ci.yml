@@ -50,21 +50,28 @@ jobs:
       - name: Postgres pool example (skips without ZSQL_PG_URL)
         run: zig build postgres-pool-example
 
+      # Default SQLite path: bundled amalgamation (no system libsqlite3).
+      - name: Test with SQLite (amalgamation)
+        run: zig build test -Denable-sqlite=true
+
+      - name: SQLite example (amalgamation)
+        run: zig build sqlite-example -Denable-sqlite=true
+
+      - name: SQLite migration example (amalgamation)
+        run: zig build sqlite-migrate-example -Denable-sqlite=true
+
+      - name: CLI doctor with SQLite amalgamation
+        run: zig build run -Denable-sqlite=true -- doctor
+
+      # Optional system-lib path (keeps the escape hatch green).
       - name: Install system SQLite
         run: |
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev pkg-config
           pkg-config --modversion sqlite3
-          pkg-config --libs --cflags sqlite3
 
-      - name: Test with SQLite
-        run: zig build test -Denable-sqlite=true
-
-      - name: SQLite example
-        run: zig build sqlite-example -Denable-sqlite=true
-
-      - name: SQLite migration example
-        run: zig build sqlite-migrate-example -Denable-sqlite=true
+      - name: Test with SQLite (system)
+        run: zig build test -Denable-sqlite=true -Dsqlite-system=true
 
       - name: Live PostgreSQL integration tests
         env:

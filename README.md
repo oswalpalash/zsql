@@ -38,12 +38,18 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 ### SQLite
 
 ```sh
+# Default: compile the bundled SQLite amalgamation (no system libsqlite3)
 zig build test -Denable-sqlite=true
 zig build sqlite-example -Denable-sqlite=true
 zig build sqlite-migrate-example -Denable-sqlite=true
+
+# Optional: link the OS package instead
+zig build test -Denable-sqlite=true -Dsqlite-system=true
 ```
 
-Links system `sqlite3` via explicit C ABI bindings (no `@cImport`).
+Uses explicit C ABI bindings in `src/drivers/sqlite/c.zig` (no `@cImport`).
+With `-Denable-sqlite=true`, the build fetches and compiles the SQLite amalgamation
+by default. Pass `-Dsqlite-system=true` to link system `libsqlite3` via pkg-config.
 
 ### PostgreSQL
 

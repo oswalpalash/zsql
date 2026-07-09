@@ -3,7 +3,15 @@
     .version = "0.0.2",
     .fingerprint = 0x1512c2965ac966e,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        // SQLite amalgamation 3.49.2 — fetched only when -Denable-sqlite=true
+        // without -Dsqlite-system=true (lazy).
+        .sqlite_amalgamation = .{
+            .url = "https://www.sqlite.org/2025/sqlite-amalgamation-3490200.zip",
+            .hash = "N-V-__8AAH-mpwB7g3MnqYU-ooUBF1t99RP27dZ9addtMVXD",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

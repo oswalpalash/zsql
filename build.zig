@@ -1,17 +1,41 @@
 const std = @import("std");
 
+/// Compile flags for the bundled SQLite amalgamation.
+/// Keep conservative: threadsafe, URI filenames, no loadable extensions.
+const sqlite_amalgamation_c_flags = [_][]const u8{
+    "-std=c99",
+    "-DSQLITE_DQS=0",
+    "-DSQLITE_DEFAULT_MEMSTATUS=0",
+    "-DSQLITE_OMIT_DEPRECATED=1",
+    "-DSQLITE_OMIT_LOAD_EXTENSION=1",
+    "-DSQLITE_THREADSAFE=1",
+    "-DSQLITE_USE_URI=1",
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     // Default builds (enable-sqlite=false) must remain free of libc so the
     // CLI and library install cleanly without system SQLite. Do not call
     // std.c.* from code paths compiled into the default package.
-    const enable_sqlite = b.option(bool, "enable-sqlite", "Compile the experimental SQLite driver skeleton") orelse false;
+    const enable_sqlite = b.option(bool, "enable-sqlite", "Compile the SQLite driver") orelse false;
+    // When SQLite is enabled, the amalgamation is the default (reproducible,
+    // no system libsqlite3). Pass -Dsqlite-system=true to link the OS package.
+    const sqlite_system = b.option(bool, "sqlite-system", "Link system libsqlite3 instead of the bundled amalgamation") orelse false;
+    const use_amalgamation = enable_sqlite and !sqlite_system;
 
     const options = b.addOptions();
     options.addOption(bool, "enable_sqlite", enable_sqlite);
+    options.addOption(bool, "sqlite_amalgamation", use_amalgamation);
     // Keep in sync with build.zig.zon version for `zsql doctor`.
     options.addOption([]const u8, "package_version", "0.0.2");
+
+    // Build the amalgamation static library once when requested. Lazy so
+    // default (non-sqlite) builds never fetch the SQLite tarball.
+    const sqlite_amalg_lib: ?*std.Build.Step.Compile = if (use_amalgamation)
+        buildSqliteAmalgamation(b, target, optimize)
+    else
+        null;
 
     const zsql_mod = b.addModule("zsql", .{
         .root_source_file = b.path("src/zsql.zig"),
@@ -20,13 +44,7 @@ pub fn build(b: *std.Build) void {
     });
     zsql_mod.addOptions("zsql_options", options);
     if (enable_sqlite) {
-        // Explicit libc + sqlite3 linkage is required for reliable Linux CI.
-        // `@cImport` is avoided in the driver; symbols come from c.zig externs.
-        zsql_mod.link_libc = true;
-        zsql_mod.linkSystemLibrary("sqlite3", .{
-            .needed = true,
-            .use_pkg_config = .yes,
-        });
+        linkSqlite(zsql_mod, sqlite_system, sqlite_amalg_lib);
     }
 
     const lib = b.addLibrary(.{
@@ -56,11 +74,13 @@ pub fn build(b: *std.Build) void {
     });
     cli_mod.addImport("zsql", zsql_mod);
     if (enable_sqlite) {
-        cli_mod.link_libc = true;
-        cli_mod.linkSystemLibrary("sqlite3", .{
-            .needed = true,
-            .use_pkg_config = .yes,
-        });
+        // Amalgamation symbols come via the zsql module; system builds still
+        // need an explicit link on the executable module for some linkers.
+        if (sqlite_system) {
+            linkSqlite(cli_mod, true, null);
+        } else {
+            cli_mod.link_libc = true;
+        }
     }
     const cli_exe = b.addExecutable(.{
         .name = "zsql",
@@ -130,11 +150,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         sqlite_example_mod.addImport("zsql", zsql_mod);
-        sqlite_example_mod.link_libc = true;
-        sqlite_example_mod.linkSystemLibrary("sqlite3", .{
-            .needed = true,
-            .use_pkg_config = .yes,
-        });
+        if (sqlite_system) {
+            linkSqlite(sqlite_example_mod, true, null);
+        } else {
+            sqlite_example_mod.link_libc = true;
+        }
 
         const sqlite_example = b.addExecutable(.{
             .name = "sqlite-basic",
@@ -150,11 +170,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         sqlite_migrate_example_mod.addImport("zsql", zsql_mod);
-        sqlite_migrate_example_mod.link_libc = true;
-        sqlite_migrate_example_mod.linkSystemLibrary("sqlite3", .{
-            .needed = true,
-            .use_pkg_config = .yes,
-        });
+        if (sqlite_system) {
+            linkSqlite(sqlite_migrate_example_mod, true, null);
+        } else {
+            sqlite_migrate_example_mod.link_libc = true;
+        }
 
         const sqlite_migrate_example = b.addExecutable(.{
             .name = "sqlite-migrate",
@@ -181,4 +201,48 @@ pub fn build(b: *std.Build) void {
 
     // Postgres pool example is optional (skips without ZSQL_PG_URL); always buildable.
     examples_step.dependOn(pg_pool_example_step);
+}
+
+fn buildSqliteAmalgamation(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) ?*std.Build.Step.Compile {
+    // lazyDependency returns null on the first configure pass while the package
+    // is fetched, then rebuilds. Callers treat null as "not ready yet".
+    const dep = b.lazyDependency("sqlite_amalgamation", .{}) orelse return null;
+
+    const lib = b.addLibrary(.{
+        .name = "sqlite3_amalgamation",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    lib.root_module.addCSourceFile(.{
+        .file = dep.path("sqlite3.c"),
+        .flags = &sqlite_amalgamation_c_flags,
+    });
+    lib.root_module.addIncludePath(dep.path("."));
+    return lib;
+}
+
+fn linkSqlite(
+    mod: *std.Build.Module,
+    sqlite_system: bool,
+    amalg_lib: ?*std.Build.Step.Compile,
+) void {
+    mod.link_libc = true;
+    if (sqlite_system) {
+        // Explicit libc + sqlite3 linkage for hosts that ship a package.
+        // `@cImport` is avoided in the driver; symbols come from c.zig externs.
+        mod.linkSystemLibrary("sqlite3", .{
+            .needed = true,
+            .use_pkg_config = .yes,
+        });
+    } else if (amalg_lib) |lib| {
+        mod.linkLibrary(lib);
+    }
 }

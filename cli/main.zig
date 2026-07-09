@@ -103,7 +103,11 @@ fn cmdDoctor(io: std.Io) !void {
     try writeOut(io, .stdout, "\n");
     try writeOut(io, .stdout, "  sqlite driver: ");
     if (zsql.enable_sqlite) {
-        try writeOut(io, .stdout, "enabled\n");
+        if (zsql.sqlite_amalgamation) {
+            try writeOut(io, .stdout, "enabled (bundled amalgamation)\n");
+        } else {
+            try writeOut(io, .stdout, "enabled (system libsqlite3)\n");
+        }
     } else {
         try writeOut(io, .stdout, "available behind -Denable-sqlite=true\n");
     }
