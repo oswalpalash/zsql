@@ -8,9 +8,17 @@ pub const Column = struct {
     primary_key: bool = false,
 };
 
+pub const Index = struct {
+    name: []const u8,
+    unique: bool = false,
+    /// Ordered column names participating in the index.
+    columns: []const []const u8 = &.{},
+};
+
 pub const Table = struct {
     name: []const u8,
     columns: []const Column,
+    indexes: []const Index = &.{},
 };
 
 pub const Schema = struct {
@@ -22,8 +30,18 @@ pub fn freeSchema(allocator: std.mem.Allocator, schema: Schema) void {
     for (schema.tables) |table| {
         allocator.free(table.name);
         freeColumns(allocator, @constCast(table.columns));
+        freeIndexes(allocator, @constCast(table.indexes));
     }
     allocator.free(schema.tables);
+}
+
+pub fn freeIndexes(allocator: std.mem.Allocator, indexes: []Index) void {
+    for (indexes) |idx| {
+        allocator.free(idx.name);
+        for (idx.columns) |col| allocator.free(col);
+        allocator.free(idx.columns);
+    }
+    allocator.free(indexes);
 }
 
 /// Render a Zig-friendly ZON-like schema document for embedding / offline checks.
@@ -40,7 +58,20 @@ pub fn writeSchemaZon(writer: *std.Io.Writer, schema: Schema) !void {
                 .{ col.name, col.type_name, col.nullable, col.primary_key },
             );
         }
-        try writer.writeAll("        } },\n");
+        if (table.indexes.len == 0) {
+            try writer.writeAll("        }, .indexes = .{} },\n");
+        } else {
+            try writer.writeAll("        }, .indexes = .{\n");
+            for (table.indexes) |idx| {
+                try writer.print("            .{{ .name = \"{s}\", .unique = {}, .columns = .{{", .{ idx.name, idx.unique });
+                for (idx.columns, 0..) |col, i| {
+                    if (i != 0) try writer.writeAll(", ");
+                    try writer.print("\"{s}\"", .{col});
+                }
+                try writer.writeAll("} },\n");
+            }
+            try writer.writeAll("        } },\n");
+        }
     }
     try writer.writeAll("    },\n");
     try writer.writeAll("}\n");
@@ -150,6 +181,24 @@ pub const postgres_list_columns_sql =
     \\order by c.ordinal_position
 ;
 
+/// List indexes for one table. Placeholders: $1 schema, $2 table.
+/// Returns one row per index column (ordered); callers group by index_name.
+pub const postgres_list_index_columns_sql =
+    \\select
+    \\  i.relname as index_name,
+    \\  ix.indisunique as is_unique,
+    \\  a.attname as column_name
+    \\from pg_class t
+    \\join pg_namespace n on n.oid = t.relnamespace
+    \\join pg_index ix on t.oid = ix.indrelid
+    \\join pg_class i on i.oid = ix.indexrelid
+    \\join pg_attribute a on a.attrelid = t.oid and a.attnum = any(ix.indkey)
+    \\where n.nspname = $1
+    \\  and t.relname = $2
+    \\  and t.relkind = 'r'
+    \\order by i.relname, array_position(ix.indkey, a.attnum)
+;
+
 pub fn freeColumns(allocator: std.mem.Allocator, columns: []Column) void {
     for (columns) |col| {
         allocator.free(col.name);
@@ -180,7 +229,7 @@ test "writeSchemaZon is deterministic" {
         \\        .{ .name = "users", .columns = .{
         \\            .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
         \\            .{ .name = "email", .type_name = "TEXT", .nullable = false, .primary_key = false },
-        \\        } },
+        \\        }, .indexes = .{} },
         \\    },
         \\}
         \\

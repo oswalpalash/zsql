@@ -525,9 +525,54 @@ pub const Conn = struct {
             }
 
             const columns = try cols.toOwnedSlice(allocator);
+
+            // Indexes via PRAGMA index_list / index_info (table name from catalog).
+            var idx_sql_buf: [256]u8 = undefined;
+            const idx_list_sql = try std.fmt.bufPrint(&idx_sql_buf, "pragma index_list({s})", .{table_name});
+            var idx_rows = try self.query(idx_list_sql, &.{});
+            defer idx_rows.deinit();
+
+            var indexes: std.ArrayListUnmanaged(core.inspect.Index) = .empty;
+            errdefer {
+                for (indexes.items) |idx| {
+                    allocator.free(idx.name);
+                    for (idx.columns) |c_| allocator.free(c_);
+                    allocator.free(idx.columns);
+                }
+                indexes.deinit(allocator);
+            }
+
+            while (try idx_rows.next()) |idx_row| {
+                const iname = try (try idx_row.value("name")).asText();
+                // Skip auto-indexes that mirror PRIMARY KEY / UNIQUE constraints if desired;
+                // keep them for offline completeness.
+                const unique = (try (try idx_row.value("unique")).asInt()) != 0;
+                var info_sql_buf: [288]u8 = undefined;
+                const info_sql = try std.fmt.bufPrint(&info_sql_buf, "pragma index_info({s})", .{iname});
+                var info_rows = try self.query(info_sql, &.{});
+                defer info_rows.deinit();
+
+                var col_names: std.ArrayListUnmanaged([]const u8) = .empty;
+                errdefer {
+                    for (col_names.items) |c_| allocator.free(c_);
+                    col_names.deinit(allocator);
+                }
+                while (try info_rows.next()) |info_row| {
+                    const cname = try allocator.dupe(u8, try (try info_row.value("name")).asText());
+                    try col_names.append(allocator, cname);
+                }
+
+                try indexes.append(allocator, .{
+                    .name = try allocator.dupe(u8, iname),
+                    .unique = unique,
+                    .columns = try col_names.toOwnedSlice(allocator),
+                });
+            }
+
             try tables_list.append(allocator, .{
                 .name = owned_name,
                 .columns = columns,
+                .indexes = try indexes.toOwnedSlice(allocator),
             });
         }
 
@@ -647,7 +692,13 @@ fn freeInspectedTables(allocator: std.mem.Allocator, tables: []core.inspect.Tabl
             allocator.free(col.name);
             allocator.free(col.type_name);
         }
-        allocator.free(table.columns);
+        allocator.free(@constCast(table.columns));
+        for (table.indexes) |idx| {
+            allocator.free(idx.name);
+            for (idx.columns) |c_| allocator.free(c_);
+            allocator.free(@constCast(idx.columns));
+        }
+        allocator.free(@constCast(table.indexes));
     }
     allocator.free(tables);
 }
@@ -1298,6 +1349,7 @@ test "SQLite inspectSchema exports tables and columns" {
         \\  bio text
         \\)
     , &.{});
+    _ = try conn.exec("create unique index inspect_users_email_uq on inspect_users(email)", &.{});
 
     const schema = try conn.inspectSchema(std.testing.allocator);
     defer freeInspectedSchema(std.testing.allocator, schema);
@@ -1308,6 +1360,17 @@ test "SQLite inspectSchema exports tables and columns" {
     try std.testing.expect(schema.tables[0].columns[0].primary_key);
     try std.testing.expect(!schema.tables[0].columns[1].nullable);
     try std.testing.expect(schema.tables[0].columns[2].nullable);
+    try std.testing.expect(schema.tables[0].indexes.len >= 1);
+    var found_email_idx = false;
+    for (schema.tables[0].indexes) |idx| {
+        if (std.mem.eql(u8, idx.name, "inspect_users_email_uq")) {
+            found_email_idx = true;
+            try std.testing.expect(idx.unique);
+            try std.testing.expectEqual(@as(usize, 1), idx.columns.len);
+            try std.testing.expectEqualStrings("email", idx.columns[0]);
+        }
+    }
+    try std.testing.expect(found_email_idx);
 }
 
 test "SQLite opens memory database and rejects row-returning exec" {

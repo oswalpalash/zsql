@@ -517,15 +517,84 @@ pub const Conn = struct {
             }
 
             const columns = try core.inspect.columnsFromPostgresColumnInfo(allocator, info);
+
+            const indexes = try loadPostgresIndexes(self, allocator, schema_name, table_name);
+            errdefer core.inspect.freeIndexes(allocator, @constCast(indexes));
+
             try tables_list.append(allocator, .{
                 .name = display_name,
                 .columns = columns,
+                .indexes = indexes,
             });
         }
 
         return .{
             .tables = try tables_list.toOwnedSlice(allocator),
         };
+    }
+
+    fn loadPostgresIndexes(
+        self: *Conn,
+        allocator: std.mem.Allocator,
+        schema_name: []const u8,
+        table_name: []const u8,
+    ) ![]core.inspect.Index {
+        var idx_rows = try self.queryParams(core.inspect.postgres_list_index_columns_sql, &.{
+            .{ .text = schema_name },
+            .{ .text = table_name },
+        });
+        defer idx_rows.deinit();
+
+        var indexes: std.ArrayListUnmanaged(core.inspect.Index) = .empty;
+        errdefer {
+            for (indexes.items) |idx| {
+                allocator.free(idx.name);
+                for (idx.columns) |c_| allocator.free(c_);
+                allocator.free(idx.columns);
+            }
+            indexes.deinit(allocator);
+        }
+
+        var current_name: ?[]u8 = null;
+        var current_unique: bool = false;
+        var current_cols: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            if (current_name) |n| allocator.free(n);
+            for (current_cols.items) |c_| allocator.free(c_);
+            current_cols.deinit(allocator);
+        }
+
+        while (idx_rows.next()) |row| {
+            const iname = try (try row.value("index_name")).asText();
+            const unique = try (try row.value("is_unique")).asBool();
+            const cname = try (try row.value("column_name")).asText();
+
+            if (current_name == null or !std.mem.eql(u8, current_name.?, iname)) {
+                if (current_name) |prev| {
+                    try indexes.append(allocator, .{
+                        .name = prev,
+                        .unique = current_unique,
+                        .columns = try current_cols.toOwnedSlice(allocator),
+                    });
+                    current_name = null;
+                    current_cols = .empty;
+                }
+                current_name = try allocator.dupe(u8, iname);
+                current_unique = unique;
+            }
+            try current_cols.append(allocator, try allocator.dupe(u8, cname));
+        }
+        if (current_name) |prev| {
+            try indexes.append(allocator, .{
+                .name = prev,
+                .unique = current_unique,
+                .columns = try current_cols.toOwnedSlice(allocator),
+            });
+            current_name = null;
+            current_cols = .empty;
+        }
+
+        return try indexes.toOwnedSlice(allocator);
     }
 
     /// Create a savepoint with an internally generated name.
@@ -1091,6 +1160,12 @@ fn freeInspectedTables(allocator: std.mem.Allocator, tables: []core.inspect.Tabl
             allocator.free(col.type_name);
         }
         allocator.free(@constCast(table.columns));
+        for (table.indexes) |idx| {
+            allocator.free(idx.name);
+            for (idx.columns) |c_| allocator.free(c_);
+            allocator.free(@constCast(idx.columns));
+        }
+        allocator.free(@constCast(table.indexes));
     }
     allocator.free(tables);
 }

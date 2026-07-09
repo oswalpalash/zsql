@@ -5,6 +5,6 @@
             .{ .name = "email", .type_name = "TEXT", .nullable = false, .primary_key = false },
             .{ .name = "active", .type_name = "BOOLEAN", .nullable = false, .primary_key = false },
             .{ .name = "note", .type_name = "TEXT", .nullable = true, .primary_key = false },
-        } },
+        }, .indexes = .{} },
     },
 }
