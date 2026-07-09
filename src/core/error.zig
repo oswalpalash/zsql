@@ -7,6 +7,8 @@ pub const Error = error{
     UnexpectedNull,
     IntegerOverflow,
     InvalidBindValue,
+    /// Positional/named bind slice length does not match the statement.
+    BindCountMismatch,
     InvalidSql,
     InvalidUrl,
     InvalidArguments,

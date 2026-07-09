@@ -52,7 +52,7 @@ pub const DbError = struct {
     pub fn categoryOf(err: anyerror) ErrorCategory {
         return switch (err) {
             error.InvalidSql, error.InvalidMigrationFilename => .invalid_sql,
-            error.InvalidArguments, error.InvalidBindValue, error.InvalidUrl => .invalid_arguments,
+            error.InvalidArguments, error.InvalidBindValue, error.BindCountMismatch, error.InvalidUrl => .invalid_arguments,
             error.TypeMismatch, error.InvalidColumnType, error.InvalidColumn, error.UnexpectedNull, error.IntegerOverflow => .type_mismatch,
             error.ConnectionClosed, error.ConnectionBusy, error.ConnectionTimeout => .connection,
             error.AuthFailed, error.TlsFailed => .auth,

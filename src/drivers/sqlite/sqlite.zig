@@ -131,7 +131,7 @@ pub const Pool = struct {
     slot_event: std.Io.Event = .unset,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: PoolConfig) !Pool {
-        if (config.max_open == 0) return error.InvalidBindValue;
+        if (config.max_open == 0) return error.InvalidArguments;
         return .{
             .allocator = allocator,
             .io = io,
@@ -1192,13 +1192,13 @@ pub const Stmt = struct {
 
     fn validateBindCount(self: Stmt, binds: []const core.Value) !void {
         if (binds.len != @as(usize, @intCast(c.sqlite3_bind_parameter_count(self.handle)))) {
-            return error.InvalidBindValue;
+            return error.BindCountMismatch;
         }
     }
 
     fn validateNamedBindCount(self: Stmt, binds: []const NamedValue) !void {
         const count = try sqliteParameterCount(self.handle);
-        if (binds.len != count) return error.InvalidBindValue;
+        if (binds.len != count) return error.BindCountMismatch;
 
         for (binds, 0..) |bind, index| {
             _ = try self.namedBindIndex(bind.name);
@@ -1665,7 +1665,7 @@ test "SQLite prepares and finalizes statements" {
     defer stmt.close();
 
     try std.testing.expectEqual(@as(usize, 2), stmt.placeholders.total);
-    try std.testing.expectError(error.InvalidBindValue, stmt.exec(&.{.{ .integer = 1 }}));
+    try std.testing.expectError(error.BindCountMismatch, stmt.exec(&.{.{ .integer = 1 }}));
     try std.testing.expectError(error.UnexpectedRow, stmt.exec(&.{
         .{ .integer = 1 },
         .{ .text = "ada" },
@@ -1877,7 +1877,7 @@ test "SQLite named binds reject missing unknown and duplicate names" {
     var stmt = try conn.prepare("select :id, :name");
     defer stmt.close();
 
-    try std.testing.expectError(error.InvalidBindValue, stmt.bindNamedValues(&.{
+    try std.testing.expectError(error.BindCountMismatch, stmt.bindNamedValues(&.{
         .{ .name = "id", .value = .{ .integer = 1 } },
     }));
     try std.testing.expectError(error.InvalidBindValue, stmt.bindNamedValues(&.{
@@ -2343,7 +2343,7 @@ test "SQLite pool discard closes lease and allows replacement" {
 }
 
 test "SQLite pool validates closed lifetime" {
-    try std.testing.expectError(error.InvalidBindValue, Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 0 }));
+    try std.testing.expectError(error.InvalidArguments, Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 0 }));
 
     var pool = try Pool.init(std.testing.allocator, std.testing.io, .{});
     var lease = try pool.acquire();
@@ -2831,7 +2831,7 @@ test "SQLite validates binds against SQLite parameter count" {
     defer stmt.close();
 
     try std.testing.expectEqual(@as(usize, 1), stmt.placeholders.total);
-    try std.testing.expectError(error.InvalidBindValue, stmt.bindValues(&.{
+    try std.testing.expectError(error.BindCountMismatch, stmt.bindValues(&.{
         .{ .integer = 1 },
     }));
     try stmt.bindValues(&.{

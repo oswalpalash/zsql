@@ -34,7 +34,7 @@ pub const Stmt = struct {
 
     fn validateBindCount(self: Stmt, binds: []const Value) !void {
         if (binds.len != self.placeholders.expectedBindCount()) {
-            return error.InvalidBindValue;
+            return error.BindCountMismatch;
         }
     }
 };
@@ -52,7 +52,7 @@ test "Stmt validates bind counts before driver execution" {
     try std.testing.expectEqual(@as(usize, 3), stmt.placeholders.total);
     try std.testing.expectEqual(@as(usize, 3), stmt.placeholders.expectedBindCount());
 
-    try std.testing.expectError(error.InvalidBindValue, stmt.exec(&.{.{ .integer = 1 }}));
+    try std.testing.expectError(error.BindCountMismatch, stmt.exec(&.{.{ .integer = 1 }}));
     try std.testing.expectError(error.DriverUnavailable, stmt.exec(&.{
         .{ .integer = 1 },
         .{ .null = {} },
