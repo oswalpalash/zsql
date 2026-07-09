@@ -141,6 +141,21 @@ try zsql.check.checkQuery(.{
     .from_table = "users",
 });
 
+// Multi-table / JOIN scope (qualified columns; AmbiguousColumn for bare `id`):
+try zsql.check.checkQuery(.{
+    .sql =
+    \\select users.email, posts.title
+    \\from users join posts on posts.user_id = users.id
+    ,
+    .schema = schema,
+    .from_tables = &.{ "users", "posts" },
+    .row = &.{
+        .{ .name = "users.email", .type_name = "TEXT" },
+        .{ .name = "posts.title", .type_name = "TEXT" },
+    },
+    .check_projections = true, // also parse SELECT list against the scope
+});
+
 // Or a reusable checked-query type:
 const get_user = zsql.checkedQuery(.{
     .sql = "select id, email from users where id = :id",
@@ -155,7 +170,10 @@ try get_user.validate(schema);
 // get_user.sql is the trusted SQL string for runtime prepare/bind
 ```
 
-SQLite and PostgreSQL can build a schema graph with `Conn.inspectSchema` and render ZON via `zsql.inspect.writeSchemaZon`.
+When `from_table` / `from_tables` are omitted, `checkQuery` best-effort extracts
+`FROM` / `JOIN` table names and aliases from the SQL. SQLite and PostgreSQL can
+build a schema graph with `Conn.inspectSchema` and render ZON via
+`zsql.inspect.writeSchemaZon`.
 
 ### CLI
 
