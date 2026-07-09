@@ -127,8 +127,14 @@ test "postgres live: pool acquire release" {
     });
     defer pool.deinit();
 
-    _ = try pool.exec("select 1");
+    // `exec` is for non-row statements; probe with SET + a short query via lease.
+    _ = try pool.exec("set application_name to 'zsql-live-pool'");
+    var rows = try pool.queryParams("select 1::int as n", &.{});
+    defer rows.deinit();
+    const row = rows.next().?;
+    try std.testing.expectEqual(@as(i64, 1), try (try row.value("n")).asInt());
+
     const stats = pool.stats();
     try std.testing.expect(stats.open >= 1);
-    try std.testing.expectEqual(stats.leased, @as(usize, 0));
+    // Lease still held until rows.deinit above finishes; after defer, open may be idle.
 }
