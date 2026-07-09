@@ -8,6 +8,11 @@ const types = @import("types.zig");
 
 const Io = std.Io;
 const net = std.Io.net;
+const TlsClient = std.crypto.tls.Client;
+
+/// Stream-side buffer size: large enough for TLS records when encryption is used.
+const stream_buf_len = TlsClient.min_buffer_len;
+const app_buf_len = 16 * 1024;
 
 /// Live PostgreSQL connection after a successful startup handshake.
 ///
@@ -21,10 +26,15 @@ pub const Conn = struct {
     allocator: std.mem.Allocator,
     io: Io,
     stream: net.Stream,
+    /// Encrypted (or plain TCP) stream buffers.
     read_buf: []u8,
     write_buf: []u8,
     reader: net.Stream.Reader,
     writer: net.Stream.Writer,
+    /// Plaintext TLS application buffers (only when `tls` is active).
+    tls_read_buf: ?[]u8 = null,
+    tls_write_buf: ?[]u8 = null,
+    tls: ?TlsClient = null,
     closed: bool = false,
     /// Backend process id from BackendKeyData, if received.
     backend_pid: ?i32 = null,
@@ -43,19 +53,20 @@ pub const Conn = struct {
     /// Open a TCP connection and complete the PostgreSQL startup handshake.
     ///
     /// TLS policy (`sslmode`):
-    /// - `disable`: plain StartupMessage (no SSLRequest).
-    /// - `allow`: plain first (TLS upgrade path not implemented).
-    /// - `prefer`: send SSLRequest; if the server rejects TLS, continue plain;
-    ///   if it accepts TLS, fall back to a plain reconnect (no TLS stack yet).
-    /// - `require|verify-*`: send SSLRequest; return `error.TlsFailed` whether
-    ///   the server accepts (TLS not implemented) or rejects.
+    /// - `disable` / `allow`: plain StartupMessage (no SSLRequest).
+    /// - `prefer`: SSLRequest; plain if rejected; TLS upgrade if accepted
+    ///   (encryption without certificate verification for prefer).
+    /// - `require`: SSLRequest + TLS (encryption, no CA verification yet).
+    /// - `verify-ca` / `verify-full`: return `error.TlsFailed` until CA bundle
+    ///   loading is wired (hostname/CA verification not available yet).
     pub fn open(allocator: std.mem.Allocator, io: Io, config: url.Config) !Conn {
         if (config.user.len == 0) return error.InvalidArguments;
 
         return switch (config.ssl_mode) {
             .disable, .allow => try openPlain(allocator, io, config),
             .prefer => try openPrefer(allocator, io, config),
-            .require, .verify_ca, .verify_full => try openRequireTls(allocator, io, config),
+            .require => try openRequireTls(allocator, io, config),
+            .verify_ca, .verify_full => error.TlsFailed,
         };
     }
 
@@ -70,45 +81,84 @@ pub const Conn = struct {
         var conn = try connectBare(allocator, io, config.host, config.port);
 
         const ssl = conn.negotiateSslRequest() catch {
-            // Negotiation failed (offline host, etc.): fall back to plain
-            // reconnect so prefer stays best-effort.
             conn.deinitTransportOnly();
             return openPlain(allocator, io, config);
         };
 
         switch (ssl) {
             .rejects_tls => {
-                // Ownership transfers to caller only after successful startup.
                 errdefer conn.deinitTransportOnly();
                 try conn.startup(config);
                 return conn;
             },
             .accepts_tls => {
-                // TLS stack not implemented: drop this connection and use plain.
-                conn.deinitTransportOnly();
-                return openPlain(allocator, io, config);
+                errdefer conn.deinitTransportOnly();
+                try conn.upgradeTls(.{ .verify_host = false });
+                try conn.startup(config);
+                return conn;
             },
         }
     }
 
     fn openRequireTls(allocator: std.mem.Allocator, io: Io, config: url.Config) !Conn {
-        // Even when the server accepts TLS we cannot complete the handshake yet.
-        // Still perform SSLRequest so operators see protocol-correct failure modes
-        // (reject vs accept-without-client-TLS) once a server is available.
         var conn = try connectBare(allocator, io, config.host, config.port);
-        defer conn.deinitTransportOnly();
+        errdefer conn.deinitTransportOnly();
         const ssl = conn.negotiateSslRequest() catch return error.TlsFailed;
-        _ = ssl;
-        return error.TlsFailed;
+        if (ssl != .accepts_tls) return error.TlsFailed;
+        try conn.upgradeTls(.{ .verify_host = false });
+        try conn.startup(config);
+        return conn;
+    }
+
+    const TlsUpgrade = struct {
+        verify_host: bool,
+    };
+
+    fn upgradeTls(self: *Conn, opts: TlsUpgrade) !void {
+        if (self.tls != null) return error.ProtocolError;
+        if (self.read_buf.len < stream_buf_len or self.write_buf.len < stream_buf_len) {
+            return error.TlsFailed;
+        }
+
+        const tls_read_buf = try self.allocator.alloc(u8, app_buf_len);
+        errdefer self.allocator.free(tls_read_buf);
+        const tls_write_buf = try self.allocator.alloc(u8, stream_buf_len);
+        errdefer self.allocator.free(tls_write_buf);
+
+        var entropy: [TlsClient.Options.entropy_len]u8 = undefined;
+        self.io.randomSecure(&entropy) catch self.io.random(&entropy);
+
+        // realtime clock for certificate validity when verification is enabled.
+        const now = std.Io.Timestamp.now(self.io, .real);
+
+        // Certificate/CA verification for verify-* modes lands with system CA
+        // loading; require/prefer use encryption without host verification.
+        _ = opts;
+        self.tls = TlsClient.init(
+            &self.reader.interface,
+            &self.writer.interface,
+            .{
+                .host = .no_verification,
+                .ca = .no_verification,
+                .read_buffer = tls_read_buf,
+                .write_buffer = tls_write_buf,
+                .entropy = &entropy,
+                .realtime_now = now,
+                .allow_truncation_attacks = false,
+            },
+        ) catch return error.TlsFailed;
+
+        self.tls_read_buf = tls_read_buf;
+        self.tls_write_buf = tls_write_buf;
     }
 
     fn connectBare(allocator: std.mem.Allocator, io: Io, host: []const u8, port: u16) !Conn {
         const stream = try connectStream(io, host, port);
         errdefer stream.close(io);
 
-        const read_buf = try allocator.alloc(u8, 16 * 1024);
+        const read_buf = try allocator.alloc(u8, stream_buf_len);
         errdefer allocator.free(read_buf);
-        const write_buf = try allocator.alloc(u8, 16 * 1024);
+        const write_buf = try allocator.alloc(u8, stream_buf_len);
         errdefer allocator.free(write_buf);
 
         return .{
@@ -128,19 +178,36 @@ pub const Conn = struct {
         self.stream.close(self.io);
         self.allocator.free(self.read_buf);
         self.allocator.free(self.write_buf);
+        if (self.tls_read_buf) |buf| self.allocator.free(buf);
+        if (self.tls_write_buf) |buf| self.allocator.free(buf);
+        self.tls = null;
+        self.tls_read_buf = null;
+        self.tls_write_buf = null;
         self.clearLastError();
         self.closed = true;
     }
 
-    /// Send SSLRequest and read the single-byte server reply.
+    /// Send SSLRequest and read the single-byte server reply (always plain TCP).
     fn negotiateSslRequest(self: *Conn) !protocol.SslResponse {
+        if (self.tls != null) return error.ProtocolError;
         const packet = try protocol.buildSslRequest(self.allocator);
         defer self.allocator.free(packet);
-        try self.writeAll(packet);
+        self.writer.interface.writeAll(packet) catch return mapWriteError(self.writer.err);
+        self.writer.interface.flush() catch return mapWriteError(self.writer.err);
 
         var byte: [1]u8 = undefined;
         self.reader.interface.readSliceAll(&byte) catch return mapReadError(self.reader.err);
         return protocol.SslResponse.fromByte(byte[0]);
+    }
+
+    fn appReader(self: *Conn) *std.Io.Reader {
+        if (self.tls) |*t| return &t.reader;
+        return &self.reader.interface;
+    }
+
+    fn appWriter(self: *Conn) *std.Io.Writer {
+        if (self.tls) |*t| return &t.writer;
+        return &self.writer.interface;
     }
 
     pub fn deinit(self: *Conn) void {
@@ -151,6 +218,11 @@ pub const Conn = struct {
         self.stream.close(self.io);
         self.allocator.free(self.read_buf);
         self.allocator.free(self.write_buf);
+        if (self.tls_read_buf) |buf| self.allocator.free(buf);
+        if (self.tls_write_buf) |buf| self.allocator.free(buf);
+        self.tls = null;
+        self.tls_read_buf = null;
+        self.tls_write_buf = null;
         self.clearLastError();
         self.closed = true;
     }
@@ -872,13 +944,14 @@ pub const Conn = struct {
 
     fn readMessage(self: *Conn) !Message {
         var header_bytes: [5]u8 = undefined;
-        self.reader.interface.readSliceAll(&header_bytes) catch return mapReadError(self.reader.err);
+        const reader = self.appReader();
+        reader.readSliceAll(&header_bytes) catch return self.mapAppReadError();
         const header = try protocol.parseMessageHeader(&header_bytes);
         const body_len = header.bodyLen();
         const body = try self.allocator.alloc(u8, body_len);
         errdefer self.allocator.free(body);
         if (body_len > 0) {
-            self.reader.interface.readSliceAll(body) catch return mapReadError(self.reader.err);
+            reader.readSliceAll(body) catch return self.mapAppReadError();
         }
         return .{
             .tag = header.tag,
@@ -887,8 +960,21 @@ pub const Conn = struct {
     }
 
     fn writeAll(self: *Conn, bytes: []const u8) !void {
-        self.writer.interface.writeAll(bytes) catch return mapWriteError(self.writer.err);
-        self.writer.interface.flush() catch return mapWriteError(self.writer.err);
+        const writer = self.appWriter();
+        writer.writeAll(bytes) catch return self.mapAppWriteError();
+        writer.flush() catch return self.mapAppWriteError();
+    }
+
+    fn mapAppReadError(self: *Conn) anyerror {
+        if (self.tls) |*t| {
+            if (t.read_err) |_| return error.ProtocolError;
+        }
+        return mapReadError(self.reader.err);
+    }
+
+    fn mapAppWriteError(self: *Conn) anyerror {
+        if (self.tls != null) return error.ProtocolError;
+        return mapWriteError(self.writer.err);
     }
 };
 
@@ -1096,6 +1182,16 @@ test "Conn require TLS fails when host is unreachable or after SSLRequest" {
     // Port 1 is almost never a Postgres server; connection or TLS path must fail.
     const result = Conn.open(std.testing.allocator, std.testing.io, config);
     try std.testing.expect(result == error.TlsFailed or result == error.ConnectionClosed or result == error.ConnectionTimeout or result == error.DriverError);
+}
+
+test "Conn verify modes fail until CA bundle is wired" {
+    var ca = try url.parse(std.testing.allocator, "postgres://u@127.0.0.1:1/db?sslmode=verify-ca");
+    defer ca.deinit();
+    try std.testing.expectError(error.TlsFailed, Conn.open(std.testing.allocator, std.testing.io, ca));
+
+    var full = try url.parse(std.testing.allocator, "postgres://u@127.0.0.1:1/db?sslmode=verify-full");
+    defer full.deinit();
+    try std.testing.expectError(error.TlsFailed, Conn.open(std.testing.allocator, std.testing.io, full));
 }
 
 test "SslResponse parser is used by negotiation path" {

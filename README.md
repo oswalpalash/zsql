@@ -56,13 +56,14 @@ var rows = try conn.queryParams("select id, email from users where id = $1", &.{
 defer rows.deinit();
 ```
 
-TLS wire encryption is not implemented yet. Behavior by `sslmode`:
+TLS uses Zig's `std.crypto.tls.Client` (no OpenSSL). Behavior by `sslmode`:
 
 - `disable` / `allow`: plain connection
-- `prefer`: SSLRequest; plain if server rejects; plain reconnect fallback if server accepts (no TLS stack yet)
-- `require` / `verify-*`: SSLRequest then `error.TlsFailed`
+- `prefer`: SSLRequest; plain if rejected; TLS upgrade if accepted (no cert verification)
+- `require`: SSLRequest + TLS encryption (no CA verification yet)
+- `verify-ca` / `verify-full`: `error.TlsFailed` until system CA bundle loading is wired
 
-Use `sslmode=disable` on trusted networks until client TLS lands.
+Prefer `sslmode=require` on untrusted networks when the server has TLS enabled.
 
 Auth: trust, cleartext, MD5, **SCRAM-SHA-256**.
 
