@@ -141,7 +141,12 @@ zig build -Denable-sqlite=true
 ./zig-out/bin/zsql migrate status --database app.db --dir migrations
 ./zig-out/bin/zsql inspect --database app.db --out schema.zon
 
+# Postgres migrate (native driver; no -Denable-sqlite required):
+./zig-out/bin/zsql migrate up --url 'postgres://user:pass@127.0.0.1:5432/db?sslmode=disable'
+./zig-out/bin/zsql migrate status --url 'postgres://user:pass@127.0.0.1:5432/db?sslmode=disable'
+
 zig build checked-queries-example
+zig build postgres-pool-example   # skips cleanly if ZSQL_PG_URL unset
 ```
 
 ## Development

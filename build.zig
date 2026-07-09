@@ -93,6 +93,21 @@ pub fn build(b: *std.Build) void {
     const test_postgres_step = b.step("test-postgres", "Run live PostgreSQL integration tests (requires ZSQL_PG_URL)");
     test_postgres_step.dependOn(&run_pg_live.step);
 
+    // Postgres pool example: skips cleanly when ZSQL_PG_URL is unset.
+    const pg_pool_example_mod = b.createModule(.{
+        .root_source_file = b.path("examples/postgres_pool.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pg_pool_example_mod.addImport("zsql", zsql_mod);
+    const pg_pool_example = b.addExecutable(.{
+        .name = "postgres-pool",
+        .root_module = pg_pool_example_mod,
+    });
+    const run_pg_pool_example = b.addRunArtifact(pg_pool_example);
+    const pg_pool_example_step = b.step("postgres-pool-example", "Run postgres pool example (skips if ZSQL_PG_URL unset)");
+    pg_pool_example_step.dependOn(&run_pg_pool_example.step);
+
     const sqlite_example_step = b.step("sqlite-example", "Run the SQLite GPA leak-checked example");
     const sqlite_migrate_example_step = b.step("sqlite-migrate-example", "Run the SQLite migration GPA leak-checked example");
     if (enable_sqlite) {

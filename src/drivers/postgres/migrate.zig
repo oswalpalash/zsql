@@ -1,0 +1,186 @@
+const std = @import("std");
+const core = @import("../../zsql.zig");
+const conn_mod = @import("conn.zig");
+
+pub const MigrationRecord = struct {
+    version: u64,
+    name: []u8,
+    checksum: core.migrate.Checksum,
+    applied_at: []u8,
+    dirty: bool,
+
+    pub fn deinit(self: *MigrationRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.applied_at);
+        self.* = undefined;
+    }
+};
+
+pub const MigrationStatus = struct {
+    allocator: std.mem.Allocator,
+    records: []MigrationRecord,
+
+    pub fn deinit(self: *MigrationStatus) void {
+        for (self.records) |*record| record.deinit(self.allocator);
+        self.allocator.free(self.records);
+        self.* = undefined;
+    }
+};
+
+pub const ApplyResult = struct {
+    applied: usize,
+};
+
+/// PostgreSQL migrator bound to an open connection.
+///
+/// Uses the same Flyway-style files and checksum rules as SQLite. Schema
+/// locking is via a single transaction around pending applies.
+pub const Migrator = struct {
+    conn: *conn_mod.Conn,
+
+    pub fn init(conn: *conn_mod.Conn) Migrator {
+        return .{ .conn = conn };
+    }
+
+    pub fn ensureTable(self: Migrator) !void {
+        _ = try self.conn.exec(
+            \\create table if not exists zsql_migrations (
+            \\  version bigint primary key,
+            \\  name text not null,
+            \\  checksum text not null,
+            \\  applied_at timestamptz not null default now(),
+            \\  execution_ms integer not null default 0,
+            \\  dirty boolean not null default false
+            \\)
+        );
+    }
+
+    pub fn status(self: Migrator, allocator: std.mem.Allocator) !MigrationStatus {
+        var rows = try self.conn.query(
+            \\select version, name, checksum, applied_at::text as applied_at, dirty
+            \\from zsql_migrations
+            \\order by version
+        );
+        defer rows.deinit();
+
+        var records: std.ArrayListUnmanaged(MigrationRecord) = .empty;
+        errdefer {
+            for (records.items) |*r| r.deinit(allocator);
+            records.deinit(allocator);
+        }
+
+        while (rows.next()) |row| {
+            const version = try unsignedVersion(try (try row.value("version")).asInt());
+            const name = try allocator.dupe(u8, try (try row.value("name")).asText());
+            errdefer allocator.free(name);
+            const checksum = try parseChecksum(try (try row.value("checksum")).asText());
+            const applied_at = try allocator.dupe(u8, try (try row.value("applied_at")).asText());
+            errdefer allocator.free(applied_at);
+            const dirty = try (try row.value("dirty")).asBool();
+            try records.append(allocator, .{
+                .version = version,
+                .name = name,
+                .checksum = checksum,
+                .applied_at = applied_at,
+                .dirty = dirty,
+            });
+        }
+
+        return .{
+            .allocator = allocator,
+            .records = try records.toOwnedSlice(allocator),
+        };
+    }
+
+    pub fn validate(self: Migrator, migrations: []const core.migrate.MigrationFile) !void {
+        var st = try self.status(self.conn.allocator);
+        defer st.deinit();
+        for (st.records) |record| {
+            if (record.dirty) return error.DirtyMigration;
+            const migration = findMigration(migrations, record.version) orelse continue;
+            if (!std.mem.eql(u8, &record.checksum, &migration.checksum)) {
+                return error.MigrationChecksumMismatch;
+            }
+        }
+    }
+
+    pub fn apply(self: Migrator, migrations: []const core.migrate.MigrationFile) !ApplyResult {
+        try self.ensureTable();
+        try self.validate(migrations);
+
+        var st = try self.status(self.conn.allocator);
+        defer st.deinit();
+
+        try self.conn.begin();
+        errdefer self.conn.rollbackIfOpen();
+
+        var applied: usize = 0;
+        for (migrations) |migration| {
+            if (findRecord(st.records, migration.id.version) != null) continue;
+            if (std.mem.trim(u8, migration.sql, " \t\r\n").len == 0) return error.InvalidSql;
+
+            // Mark dirty before executing migration SQL.
+            _ = try self.conn.execParams(
+                \\insert into zsql_migrations (version, name, checksum, dirty)
+                \\values ($1, $2, $3, true)
+            ,
+                &.{
+                    .{ .integer = try toI64(migration.id.version) },
+                    .{ .text = migration.id.name },
+                    .{ .text = &migration.checksum },
+                },
+            );
+
+            // Migration SQL is trusted file content (not user values).
+            _ = try self.conn.exec(migration.sql);
+
+            _ = try self.conn.execParams(
+                \\update zsql_migrations
+                \\set dirty = false, applied_at = now()
+                \\where version = $1
+            ,
+                &.{.{ .integer = try toI64(migration.id.version) }},
+            );
+            applied += 1;
+        }
+
+        try self.conn.commit();
+        return .{ .applied = applied };
+    }
+};
+
+fn findMigration(migrations: []const core.migrate.MigrationFile, version: u64) ?core.migrate.MigrationFile {
+    for (migrations) |m| {
+        if (m.id.version == version) return m;
+    }
+    return null;
+}
+
+fn findRecord(records: []const MigrationRecord, version: u64) ?MigrationRecord {
+    for (records) |r| {
+        if (r.version == version) return r;
+    }
+    return null;
+}
+
+fn unsignedVersion(value: i64) !u64 {
+    return std.math.cast(u64, value) orelse error.InvalidColumnType;
+}
+
+fn toI64(version: u64) !i64 {
+    return std.math.cast(i64, version) orelse error.InvalidBindValue;
+}
+
+fn parseChecksum(value: []const u8) !core.migrate.Checksum {
+    if (value.len != @sizeOf(core.migrate.Checksum)) return error.InvalidColumnType;
+    var checksum: core.migrate.Checksum = undefined;
+    @memcpy(&checksum, value);
+    return checksum;
+}
+
+test "postgres migrate checksum parse length" {
+    const sql = "create table t (id int);\n";
+    const checksum = core.migrate.checksumSql(sql);
+    const parsed = try parseChecksum(&checksum);
+    try std.testing.expectEqual(checksum, parsed);
+}

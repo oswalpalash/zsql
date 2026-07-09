@@ -70,10 +70,13 @@ fn printHelp(io: std.Io) !void {
         \\  zsql migrate new <name>
         \\  zsql migrate status --database <path> [--dir migrations]
         \\  zsql migrate up --database <path> [--dir migrations]
+        \\  zsql migrate status --url <postgres-url> [--dir migrations]
+        \\  zsql migrate up --url <postgres-url> [--dir migrations]
         \\  zsql inspect --database <path> [--out schema.zon]
         \\  zsql --help
         \\
-        \\SQLite migrate/inspect require a build with -Denable-sqlite=true.
+        \\SQLite migrate/inspect require -Denable-sqlite=true.
+        \\Postgres migrate uses --url (native driver, no libpq).
         \\zsql is not an ORM. Prefer prepared statements and bind parameters.
         \\
     );
@@ -85,6 +88,8 @@ fn printMigrateHelp(io: std.Io) !void {
         \\  zsql migrate new <name>
         \\  zsql migrate status --database <path> [--dir migrations]
         \\  zsql migrate up --database <path> [--dir migrations]
+        \\  zsql migrate status --url <postgres-url> [--dir migrations]
+        \\  zsql migrate up --url <postgres-url> [--dir migrations]
         \\
     );
 }
@@ -136,27 +141,40 @@ fn cmdMigrateNew(init: std.process.Init, name: []const u8) !void {
 }
 
 fn cmdMigrateDb(init: std.process.Init, sub: []const u8, args: *std.process.Args.Iterator) !void {
-    if (!zsql.enable_sqlite) {
-        try writeOut(init.io, .stderr, "sqlite migrate commands require -Denable-sqlite=true\n");
-        return error.Unsupported;
-    }
-
     var database_path: ?[]const u8 = null;
+    var url: ?[]const u8 = null;
     var dir_path: []const u8 = "migrations";
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--database")) {
             database_path = args.next() orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--url")) {
+            url = args.next() orelse return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--dir")) {
             dir_path = args.next() orelse return error.InvalidArguments;
         } else {
-            try writeOut(init.io, .stderr, "unknown flag; use --database and optional --dir\n");
+            try writeOut(init.io, .stderr, "unknown flag; use --database or --url and optional --dir\n");
             return error.InvalidArguments;
         }
     }
+
+    if (database_path != null and url != null) {
+        try writeOut(init.io, .stderr, "use either --database (sqlite) or --url (postgres), not both\n");
+        return error.InvalidArguments;
+    }
+
+    if (url) |pg_url| {
+        return cmdMigratePostgres(init, sub, pg_url, dir_path);
+    }
+
     const db_path = database_path orelse {
-        try writeOut(init.io, .stderr, "missing --database <path>\n");
+        try writeOut(init.io, .stderr, "missing --database <path> or --url <postgres-url>\n");
         return error.InvalidArguments;
     };
+
+    if (!zsql.enable_sqlite) {
+        try writeOut(init.io, .stderr, "sqlite migrate commands require -Denable-sqlite=true\n");
+        return error.Unsupported;
+    }
 
     const allocator = init.gpa;
     const io = init.io;
@@ -188,10 +206,47 @@ fn cmdMigrateDb(init: std.process.Init, sub: []const u8, args: *std.process.Args
 
     var status = try migrator.status(allocator);
     defer status.deinit();
-    const header = try std.fmt.allocPrint(allocator, "status: {d} recorded migration(s)\n", .{status.records.len});
+    try printMigrationStatus(io, allocator, status.records);
+}
+
+fn cmdMigratePostgres(init: std.process.Init, sub: []const u8, pg_url: []const u8, dir_path: []const u8) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const pg = zsql.drivers.postgres;
+
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var migrations = try zsql.migrate.scanDir(allocator, io, dir);
+    defer migrations.deinit();
+
+    var config = try pg.parseUrl(allocator, pg_url);
+    defer config.deinit();
+
+    var conn = try pg.Conn.open(allocator, io, config);
+    defer conn.deinit();
+
+    const migrator = pg.Migrator.init(&conn);
+    try migrator.ensureTable();
+    try migrator.validate(migrations.files);
+
+    if (std.mem.eql(u8, sub, "up")) {
+        const result = try migrator.apply(migrations.files);
+        const msg = try std.fmt.allocPrint(allocator, "applied {d} migration(s)\n", .{result.applied});
+        defer allocator.free(msg);
+        try writeOut(io, .stdout, msg);
+    }
+
+    var status = try migrator.status(allocator);
+    defer status.deinit();
+    try printMigrationStatus(io, allocator, status.records);
+}
+
+fn printMigrationStatus(io: std.Io, allocator: std.mem.Allocator, records: anytype) !void {
+    const header = try std.fmt.allocPrint(allocator, "status: {d} recorded migration(s)\n", .{records.len});
     defer allocator.free(header);
     try writeOut(io, .stdout, header);
-    for (status.records) |rec| {
+    for (records) |rec| {
         const line = try std.fmt.allocPrint(
             allocator,
             "  V{d} {s} dirty={s}\n",

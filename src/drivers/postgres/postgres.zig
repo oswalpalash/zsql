@@ -13,6 +13,7 @@ pub const scram = @import("scram.zig");
 pub const types = @import("types.zig");
 pub const conn = @import("conn.zig");
 pub const pool = @import("pool.zig");
+pub const migrate = @import("migrate.zig");
 
 pub const Config = url.Config;
 pub const SslMode = url.SslMode;
@@ -27,6 +28,10 @@ pub const Lease = pool.Lease;
 pub const PooledRows = pool.PooledRows;
 pub const PoolConfig = pool.PoolConfig;
 pub const PoolStats = pool.PoolStats;
+pub const Migrator = migrate.Migrator;
+pub const MigrationStatus = migrate.MigrationStatus;
+pub const MigrationRecord = migrate.MigrationRecord;
+pub const ApplyResult = migrate.ApplyResult;
 
 pub const enabled = true;
 
@@ -38,4 +43,5 @@ test {
     _ = types;
     _ = conn;
     _ = pool;
+    _ = migrate;
 }
