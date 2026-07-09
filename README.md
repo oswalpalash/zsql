@@ -73,9 +73,13 @@ defer rows.deinit();
 // Exactly one row (OwnedRow); NoRows / TooManyRows otherwise:
 var one = try conn.queryOneParams("select id, email from users where id = $1", &.{.{ .integer = 1 }});
 defer one.deinit();
+
+// All rows as []OwnedRow (free with zsql.freeOwnedRows):
+const all = try conn.queryAllParams("select id, email from users", &.{});
+defer zsql.freeOwnedRows(allocator, all);
 ```
 
-SQLite has the same idea as `Conn.queryOne(sql, binds)`. Pools expose `Pool.queryOne` / `Pool.queryOneParams` (lease held only for the fetch).
+SQLite mirrors this with `Conn.queryOne` / `Conn.queryAll`. Pools expose `Pool.queryOne` / `Pool.queryOneParams` (lease held only for the fetch).
 
 Scoped transactions via `withTx` (commit on success, rollback on error):
 

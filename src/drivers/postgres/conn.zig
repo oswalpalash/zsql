@@ -447,18 +447,26 @@ pub const Conn = struct {
         var rows = try self.queryParams(sql, binds);
         defer rows.deinit();
         const first = rows.next() orelse return error.NoRows;
-        // Build a core.Row view for OwnedRow.init.
-        var names = try self.allocator.alloc([]const u8, first.column_names.len);
-        defer self.allocator.free(names);
-        var values = try self.allocator.alloc(core.Value, first.values.len);
-        defer self.allocator.free(values);
-        for (first.column_names, 0..) |n, i| names[i] = n;
-        for (first.values, 0..) |owned_val, i| values[i] = owned_val.borrowed();
-        const view = try core.Row.init(names, values);
-        var owned = try core.OwnedRow.init(self.allocator, view);
+        var owned = try simpleRowToOwned(self.allocator, first);
         errdefer owned.deinit();
         if (rows.next() != null) return error.TooManyRows;
         return owned;
+    }
+
+    /// Collect all parameterized query rows into owned storage.
+    /// Free with `core.OwnedRow.freeSlice` / `zsql.freeOwnedRows`.
+    pub fn queryAllParams(self: *Conn, sql: []const u8, binds: []const core.Value) ![]core.OwnedRow {
+        var rows = try self.queryParams(sql, binds);
+        defer rows.deinit();
+        var list: std.ArrayListUnmanaged(core.OwnedRow) = .empty;
+        errdefer {
+            for (list.items) |*item| item.deinit();
+            list.deinit(self.allocator);
+        }
+        while (rows.next()) |row| {
+            try list.append(self.allocator, try simpleRowToOwned(self.allocator, row));
+        }
+        return try list.toOwnedSlice(self.allocator);
     }
 
     pub fn begin(self: *Conn) !void {
@@ -1272,6 +1280,17 @@ pub const SimpleRow = struct {
         return self.values[index].borrowed();
     }
 };
+
+fn simpleRowToOwned(allocator: std.mem.Allocator, row: SimpleRow) !core.OwnedRow {
+    var names = try allocator.alloc([]const u8, row.column_names.len);
+    defer allocator.free(names);
+    var values = try allocator.alloc(core.Value, row.values.len);
+    defer allocator.free(values);
+    for (row.column_names, 0..) |n, i| names[i] = n;
+    for (row.values, 0..) |owned_val, i| values[i] = owned_val.borrowed();
+    const view = try core.Row.init(names, values);
+    return core.OwnedRow.init(allocator, view);
+}
 
 /// PostgreSQL savepoint bound to an open connection transaction.
 pub const Savepoint = struct {

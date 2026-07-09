@@ -108,6 +108,12 @@ pub const OwnedRow = struct {
         self.columns = &.{};
     }
 
+    /// Free a slice of `OwnedRow` values produced by driver `queryAll` helpers.
+    pub fn freeSlice(allocator: std.mem.Allocator, rows: []OwnedRow) void {
+        for (rows) |*row| row.deinit();
+        allocator.free(rows);
+    }
+
     pub fn len(self: OwnedRow) usize {
         return self.values.len;
     }

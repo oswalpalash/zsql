@@ -547,6 +547,22 @@ pub const Conn = struct {
         return owned;
     }
 
+    /// Collect all result rows into allocator-owned storage. Free with
+    /// `core.OwnedRow.freeSlice` / `zsql.freeOwnedRows`.
+    pub fn queryAll(self: *Conn, sql: []const u8, binds: []const core.Value) ![]core.OwnedRow {
+        var rows = try self.query(sql, binds);
+        defer rows.deinit();
+        var list: std.ArrayListUnmanaged(core.OwnedRow) = .empty;
+        errdefer {
+            for (list.items) |*item| item.deinit();
+            list.deinit(self.allocator);
+        }
+        while (try rows.next()) |row| {
+            try list.append(self.allocator, try core.OwnedRow.init(self.allocator, row));
+        }
+        return try list.toOwnedSlice(self.allocator);
+    }
+
     /// Cheap liveness check.
     pub fn ping(self: *Conn) !void {
         var rows = try self.query("select 1", &.{});
@@ -1478,6 +1494,23 @@ test "SQLite open applies busy_timeout_ms" {
     defer conn.close();
     // Setting busy timeout must not break basic query use.
     try conn.ping();
+}
+
+test "SQLite queryAll collects owned rows" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table all_rows (id integer primary key, name text)", &.{});
+    _ = try conn.exec("insert into all_rows (id, name) values (?, ?)", &.{ .{ .integer = 1 }, .{ .text = "a" } });
+    _ = try conn.exec("insert into all_rows (id, name) values (?, ?)", &.{ .{ .integer = 2 }, .{ .text = "b" } });
+
+    const owned = try conn.queryAll("select id, name from all_rows order by id", &.{});
+    defer core.OwnedRow.freeSlice(std.testing.allocator, owned);
+    try std.testing.expectEqual(@as(usize, 2), owned.len);
+    try std.testing.expectEqual(@as(i64, 1), try (try owned[0].value("id")).asInt());
+    try std.testing.expectEqualStrings("b", try (try owned[1].value("name")).asText());
 }
 
 test "SQLite withTx commits on success and rolls back on error" {
