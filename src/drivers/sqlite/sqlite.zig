@@ -123,6 +123,8 @@ pub const Pool = struct {
     mutex: std.Io.Mutex = .init,
     /// Signaled on release/discard so infinite waiters (`maxInt` timeout) wake.
     available: std.Io.Condition = .init,
+    /// Sticky signal for finite timed waiters (reset under the mutex when consumed).
+    slot_event: std.Io.Event = .unset,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: PoolConfig) !Pool {
         if (config.max_open == 0) return error.InvalidBindValue;
@@ -210,20 +212,47 @@ pub const Pool = struct {
                 // Infinite wait: condition wait re-locks the mutex on wake.
                 self.available.waitUncancelable(self.io, &self.mutex);
             } else if (deadline) |dl| {
-                const remaining = dl.durationFromNow(self.io);
-                if (remaining.raw.nanoseconds <= 0) return error.PoolTimeout;
-                const slice_ns: i96 = @min(remaining.raw.nanoseconds, @as(i96, std.time.ns_per_ms));
-                self.mutex.unlock(self.io);
-                self.io.sleep(.{ .nanoseconds = slice_ns }, .awake) catch {};
-                self.mutex.lockUncancelable(self.io);
+                try self.waitForSlotTimed(dl);
             } else {
                 return error.PoolExhausted;
             }
         }
     }
 
+    /// Wait until a release signals capacity or the deadline passes.
+    /// Assumes `mutex` is held; re-locks before returning.
+    fn waitForSlotTimed(self: *Pool, deadline: std.Io.Clock.Timestamp) !void {
+        while (true) {
+            if (self.idle.items.len > 0 or self.open_count < self.config.max_open) return;
+            const remaining = deadline.durationFromNow(self.io);
+            if (remaining.raw.nanoseconds <= 0) return error.PoolTimeout;
+
+            // Consume a pending signal under the lock so we do not spin on is_set.
+            if (self.slot_event.isSet()) {
+                self.slot_event.reset();
+                continue;
+            }
+
+            self.mutex.unlock(self.io);
+            self.slot_event.waitTimeout(self.io, .{
+                .duration = .{
+                    .raw = .{ .nanoseconds = remaining.raw.nanoseconds },
+                    .clock = .awake,
+                },
+            }) catch {
+                self.mutex.lockUncancelable(self.io);
+                // Timeout: one last capacity check for races with release.
+                if (self.idle.items.len > 0 or self.open_count < self.config.max_open) return;
+                if (deadline.durationFromNow(self.io).raw.nanoseconds <= 0) return error.PoolTimeout;
+                continue;
+            };
+            self.mutex.lockUncancelable(self.io);
+        }
+    }
+
     fn notifyAvailable(self: *Pool) void {
         self.available.signal(self.io);
+        self.slot_event.set(self.io);
     }
 
     /// Execute a statement under a short-lived lease that is released on success
@@ -248,6 +277,15 @@ pub const Pool = struct {
             .lease = lease,
             .rows = rows,
         };
+    }
+
+    /// Acquire a short lease, fetch exactly one owned row, then release.
+    pub fn queryOne(self: *Pool, sql: []const u8, binds: []const core.Value) !core.OwnedRow {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        const owned = try (try lease.conn()).queryOne(sql, binds);
+        try lease.release();
+        return owned;
     }
 
     pub fn stats(self: *Pool) PoolStats {
@@ -1996,6 +2034,19 @@ test "SQLite pool timed acquire unblocks after concurrent release" {
 
     try std.testing.expect(ctx.ok.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), ctx.err_len);
+}
+
+test "SQLite pool queryOne returns single owned row" {
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 2 });
+    defer pool.deinit();
+
+    _ = try pool.exec("create table pool_one (id integer primary key, name text)", &.{});
+    _ = try pool.exec("insert into pool_one (id, name) values (1, 'ada')", &.{});
+
+    var owned = try pool.queryOne("select id, name from pool_one where id = ?", &.{.{ .integer = 1 }});
+    defer owned.deinit();
+    try std.testing.expectEqualStrings("ada", try (try owned.getName("name")).asText());
+    try std.testing.expectError(error.NoRows, pool.queryOne("select id from pool_one where id = ?", &.{.{ .integer = 99 }}));
 }
 
 test "SQLite pool infinite wait unblocks via condition signal" {

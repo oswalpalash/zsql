@@ -10,6 +10,8 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption(bool, "enable_sqlite", enable_sqlite);
+    // Keep in sync with build.zig.zon version for `zsql doctor`.
+    options.addOption([]const u8, "package_version", "0.0.2");
 
     const zsql_mod = b.addModule("zsql", .{
         .root_source_file = b.path("src/zsql.zig"),

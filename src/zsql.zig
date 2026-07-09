@@ -26,6 +26,9 @@ const options = @import("zsql_options");
 /// True when this package was built with `-Denable-sqlite=true`.
 pub const enable_sqlite = options.enable_sqlite;
 
+/// Package version string injected from `build.zig` (matches build.zig.zon).
+pub const version = options.package_version;
+
 pub const drivers = struct {
     pub const sqlite = if (options.enable_sqlite) @import("drivers/sqlite/sqlite.zig") else unavailable.sqlite;
     /// Native PostgreSQL driver (no libpq): URL, SCRAM/MD5/cleartext, simple and

@@ -41,6 +41,7 @@ pub const Pool = struct {
     closed: bool = false,
     mutex: Io.Mutex = .init,
     available: Io.Condition = .init,
+    slot_event: Io.Event = .unset,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, config: PoolConfig) !Pool {
         if (config.max_open == 0) return error.InvalidArguments;
@@ -122,20 +123,43 @@ pub const Pool = struct {
             } else if (timeout_ns == std.math.maxInt(u64)) {
                 self.available.waitUncancelable(self.io, &self.mutex);
             } else if (deadline) |dl| {
-                const remaining = dl.durationFromNow(self.io);
-                if (remaining.raw.nanoseconds <= 0) return error.PoolTimeout;
-                const slice_ns: i96 = @min(remaining.raw.nanoseconds, @as(i96, std.time.ns_per_ms));
-                self.mutex.unlock(self.io);
-                self.io.sleep(.{ .nanoseconds = slice_ns }, .awake) catch {};
-                self.mutex.lockUncancelable(self.io);
+                try self.waitForSlotTimed(dl);
             } else {
                 return error.PoolExhausted;
             }
         }
     }
 
+    fn waitForSlotTimed(self: *Pool, deadline: Io.Clock.Timestamp) !void {
+        while (true) {
+            if (self.idle.items.len > 0 or self.open_count < self.config.max_open) return;
+            const remaining = deadline.durationFromNow(self.io);
+            if (remaining.raw.nanoseconds <= 0) return error.PoolTimeout;
+
+            if (self.slot_event.isSet()) {
+                self.slot_event.reset();
+                continue;
+            }
+
+            self.mutex.unlock(self.io);
+            self.slot_event.waitTimeout(self.io, .{
+                .duration = .{
+                    .raw = .{ .nanoseconds = remaining.raw.nanoseconds },
+                    .clock = .awake,
+                },
+            }) catch {
+                self.mutex.lockUncancelable(self.io);
+                if (self.idle.items.len > 0 or self.open_count < self.config.max_open) return;
+                if (deadline.durationFromNow(self.io).raw.nanoseconds <= 0) return error.PoolTimeout;
+                continue;
+            };
+            self.mutex.lockUncancelable(self.io);
+        }
+    }
+
     fn notifyAvailable(self: *Pool) void {
         self.available.signal(self.io);
+        self.slot_event.set(self.io);
     }
 
     pub fn exec(self: *Pool, sql: []const u8) !core.ExecResult {
@@ -163,6 +187,15 @@ pub const Pool = struct {
             .lease = lease,
             .rows = rows,
         };
+    }
+
+    /// Acquire a short lease, fetch exactly one owned row, then release.
+    pub fn queryOneParams(self: *Pool, sql: []const u8, binds: []const core.Value) !core.OwnedRow {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        const owned = try (try lease.conn()).queryOneParams(sql, binds);
+        try lease.release();
+        return owned;
     }
 
     pub fn stats(self: *Pool) PoolStats {

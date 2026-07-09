@@ -98,6 +98,9 @@ fn printMigrateHelp(io: std.Io) !void {
 fn cmdDoctor(io: std.Io) !void {
     try writeOut(io, .stdout, "zsql doctor\n");
     try writeOut(io, .stdout, "  package: zsql\n");
+    try writeOut(io, .stdout, "  version: ");
+    try writeOut(io, .stdout, zsql.version);
+    try writeOut(io, .stdout, "\n");
     try writeOut(io, .stdout, "  sqlite driver: ");
     if (zsql.enable_sqlite) {
         try writeOut(io, .stdout, "enabled\n");
@@ -105,6 +108,7 @@ fn cmdDoctor(io: std.Io) !void {
         try writeOut(io, .stdout, "available behind -Denable-sqlite=true\n");
     }
     try writeOut(io, .stdout, "  postgres driver: enabled (native protocol, no libpq)\n");
+    try writeOut(io, .stdout, "  tls: std.crypto.tls (require/prefer/verify-*)\n");
     try writeOut(io, .stdout, "  migrate helpers: yes\n");
     try writeOut(io, .stdout, "  query builder: yes\n");
     try writeOut(io, .stdout, "  offline check helpers: yes\n");

@@ -60,7 +60,9 @@ var one = try conn.queryOneParams("select id, email from users where id = $1", &
 defer one.deinit();
 ```
 
-SQLite has the same idea as `Conn.queryOne(sql, binds)`.
+SQLite has the same idea as `Conn.queryOne(sql, binds)`. Pools expose `Pool.queryOne` / `Pool.queryOneParams` (lease held only for the fetch).
+
+Pool acquire timeout: `0` = non-blocking, `std.math.maxInt(u64)` = wait forever (condition), any other value = timed wait (event signal on release).
 
 TLS uses Zig's `std.crypto.tls.Client` (no OpenSSL). Behavior by `sslmode`:
 
