@@ -67,9 +67,10 @@ pub fn checkQuery(options: struct {
     /// When true, parse a simple SELECT list and ensure each bare/qualified
     /// projection resolves against the table scope (and schema).
     check_projections: bool = false,
-    /// When true, parse simple WHERE column references and resolve them against
-    /// the table scope. Function calls, SQL keywords, casts, and bind markers
-    /// are skipped. Opt-in so complex expressions do not surprise callers.
+    /// When true, parse simple WHERE (and HAVING) column references and resolve
+    /// them against the table scope. Function calls, SQL keywords, casts, and
+    /// bind markers are skipped. Opt-in so complex expressions do not surprise
+    /// callers.
     check_where: bool = false,
     /// When true, parse simple JOIN ON column references the same way as WHERE.
     check_join_on: bool = false,
@@ -160,8 +161,12 @@ pub fn checkQuery(options: struct {
 
     if (options.check_where) {
         var where_buf: [max_projections]Projection = undefined;
-        const refs = try parseWhereColumnRefs(options.sql, &where_buf);
-        try resolveProjectionRefs(options.schema, resolve_scope, refs);
+        const where_refs = try parseWhereColumnRefs(options.sql, &where_buf);
+        try resolveProjectionRefs(options.schema, resolve_scope, where_refs);
+
+        var having_buf: [max_projections]Projection = undefined;
+        const having_refs = try parseHavingColumnRefs(options.sql, &having_buf);
+        try resolveProjectionRefs(options.schema, resolve_scope, having_refs);
     }
 
     if (options.check_join_on) {
@@ -992,6 +997,22 @@ fn parseJoinOnColumnRefs(sql: []const u8, buf: *[max_projections]Projection) Che
     return buf[0..count];
 }
 
+/// Collect bare/qualified column references from a HAVING clause.
+/// Returns empty when no HAVING is present. Best-effort.
+fn parseHavingColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
+    var sc = Scanner.init(sql);
+    while (sc.index < sc.sql.len) {
+        try sc.skipTrivia();
+        if (sc.index >= sc.sql.len) break;
+        if (try sc.matchKeyword("having")) break;
+        if ((try sc.readIdentOrStar()) == null and sc.index < sc.sql.len) sc.advance();
+    } else return buf[0..0];
+
+    // HAVING uses the same terminators as WHERE (ORDER/LIMIT/…).
+    const count = try collectColumnRefs(&sc, buf, 0, isWhereTerminator);
+    return buf[0..count];
+}
+
 /// Build a checked-query type from options. Prefer this for stable embed sites:
 ///
 /// ```zig
@@ -1470,6 +1491,45 @@ test "checkQuery where column refs resolve against scope" {
         .from_table = "users",
         .check_where = false,
     });
+}
+
+test "checkQuery where flag also validates HAVING columns" {
+    const schema = inspect.Schema{
+        .tables = &.{
+            .{
+                .name = "users",
+                .columns = &.{
+                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+                    .{ .name = "email", .type_name = "TEXT", .nullable = false },
+                    .{ .name = "active", .type_name = "INTEGER", .nullable = false },
+                },
+            },
+        },
+    };
+
+    try checkQuery(.{
+        .sql =
+        \\select active, count(*) as n
+        \\from users
+        \\group by active
+        \\having active = 1 and count(*) > 0
+        ,
+        .schema = schema,
+        .from_table = "users",
+        .check_where = true,
+    });
+
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql =
+        \\select active, count(*) as n
+        \\from users
+        \\group by active
+        \\having missing_col = 1
+        ,
+        .schema = schema,
+        .from_table = "users",
+        .check_where = true,
+    }));
 }
 
 test "checkedQuery supports check_where" {
