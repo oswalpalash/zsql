@@ -37,9 +37,35 @@ pub const Row = struct {
         return self.value(column);
     }
 
+    /// Typed ordinal decode using the same conversion rules as `to`.
+    ///
+    /// ```zig
+    /// const id = try row.as(i64, 0);
+    /// const email = try row.as([]const u8, 1); // borrowed until next row/deinit
+    /// ```
+    pub fn as(self: Row, comptime T: type, index: usize) !T {
+        return decode(T, try self.valueAt(index));
+    }
+
+    /// Typed named-column decode using the same conversion rules as `to`.
+    pub fn asName(self: Row, comptime T: type, column: []const u8) !T {
+        return decode(T, try self.value(column));
+    }
+
     /// Copy this borrowed row into an allocator-owned `OwnedRow`.
     pub fn getOwned(self: Row, allocator: std.mem.Allocator) !OwnedRow {
         return OwnedRow.init(allocator, self);
+    }
+
+    /// Copy one text/blob column into an allocator-owned buffer.
+    /// Caller must free with `allocator.free`. Non-text/blob values error.
+    pub fn asOwned(self: Row, allocator: std.mem.Allocator, index: usize) ![]u8 {
+        return ownedBytes(allocator, try self.valueAt(index));
+    }
+
+    /// Named-column variant of `asOwned`.
+    pub fn asNameOwned(self: Row, allocator: std.mem.Allocator, column: []const u8) ![]u8 {
+        return ownedBytes(allocator, try self.value(column));
     }
 
     pub fn indexOf(self: Row, column: []const u8) ?usize {
@@ -135,6 +161,26 @@ pub const OwnedRow = struct {
         return self.value(column);
     }
 
+    /// Typed ordinal decode (same rules as `Row.as` / `to`).
+    pub fn as(self: OwnedRow, comptime T: type, index: usize) !T {
+        return decode(T, try self.valueAt(index));
+    }
+
+    /// Typed named-column decode (same rules as `Row.asName` / `to`).
+    pub fn asName(self: OwnedRow, comptime T: type, column: []const u8) !T {
+        return decode(T, try self.value(column));
+    }
+
+    /// Duplicate a text/blob column. Caller frees with `self.allocator.free`.
+    pub fn asOwned(self: OwnedRow, index: usize) ![]u8 {
+        return ownedBytes(self.allocator, try self.valueAt(index));
+    }
+
+    /// Named-column variant of `asOwned`.
+    pub fn asNameOwned(self: OwnedRow, column: []const u8) ![]u8 {
+        return ownedBytes(self.allocator, try self.value(column));
+    }
+
     pub fn indexOf(self: OwnedRow, column: []const u8) ?usize {
         for (self.columns, 0..) |candidate, index| {
             if (std.mem.eql(u8, candidate, column)) return index;
@@ -146,6 +192,23 @@ pub const OwnedRow = struct {
         return mapOwnedRow(T, self);
     }
 };
+
+/// Decode a single SQL `Value` into Zig type `T`.
+///
+/// Same conversion rules as `Row.to` field mapping: nullability, overflow-safe
+/// integers, bool mapping (including text forms), enums, and borrowed `[]const u8`.
+pub fn decode(comptime T: type, value: Value) !T {
+    return convertValue(T, value);
+}
+
+fn ownedBytes(allocator: std.mem.Allocator, value: Value) ![]u8 {
+    return switch (value) {
+        .text => |t| try allocator.dupe(u8, t),
+        .blob => |b| try allocator.dupe(u8, b),
+        .null => error.UnexpectedNull,
+        else => error.InvalidColumnType,
+    };
+}
 
 fn mapRow(comptime T: type, row: Row) !T {
     const info = @typeInfo(T);
@@ -387,4 +450,41 @@ test "Row.to rejects UnexpectedNull and accepts text bools" {
     try std.testing.expect((try text_true.to(Flag)).active);
     const text_false = try Row.init(&.{"active"}, &.{.{ .text = "f" }});
     try std.testing.expect(!(try text_false.to(Flag)).active);
+}
+
+test "Row.as and asName decode typed columns" {
+    const row = try Row.init(&.{ "id", "name", "active" }, &.{
+        .{ .integer = 42 },
+        .{ .text = "ada" },
+        .{ .boolean = true },
+    });
+
+    try std.testing.expectEqual(@as(i64, 42), try row.as(i64, 0));
+    try std.testing.expectEqual(@as(u32, 42), try row.asName(u32, "id"));
+    try std.testing.expectEqualStrings("ada", try row.as([]const u8, 1));
+    try std.testing.expectEqualStrings("ada", try row.asName([]const u8, "name"));
+    try std.testing.expect(try row.as(bool, 2));
+    try std.testing.expectEqual(@as(u8, 42), try row.as(u8, 0));
+    try std.testing.expectError(error.InvalidColumn, row.as(i64, 9));
+    // Overflow: 300 into u8
+    const big = try Row.init(&.{"n"}, &.{.{ .integer = 300 }});
+    try std.testing.expectError(error.IntegerOverflow, big.as(u8, 0));
+
+    const owned_name = try row.asOwned(std.testing.allocator, 1);
+    defer std.testing.allocator.free(owned_name);
+    try std.testing.expectEqualStrings("ada", owned_name);
+
+    const owned_by_name = try row.asNameOwned(std.testing.allocator, "name");
+    defer std.testing.allocator.free(owned_by_name);
+    try std.testing.expectEqualStrings("ada", owned_by_name);
+
+    try std.testing.expectError(error.InvalidColumnType, row.asOwned(std.testing.allocator, 0));
+
+    var owned_row = try row.getOwned(std.testing.allocator);
+    defer owned_row.deinit();
+    try std.testing.expectEqual(@as(i64, 42), try owned_row.as(i64, 0));
+    try std.testing.expectEqualStrings("ada", try owned_row.asName([]const u8, "name"));
+    const copy = try owned_row.asNameOwned("name");
+    defer owned_row.allocator.free(copy);
+    try std.testing.expectEqualStrings("ada", copy);
 }
