@@ -26,7 +26,11 @@ jobs:
         run: zig build test
 
       - name: Install system SQLite
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev pkg-config
+          pkg-config --modversion sqlite3
+          pkg-config --libs --cflags sqlite3
 
       - name: Test with SQLite
         run: zig build test -Denable-sqlite=true

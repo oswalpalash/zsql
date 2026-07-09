@@ -15,7 +15,13 @@ pub fn build(b: *std.Build) void {
     });
     zsql_mod.addOptions("zsql_options", options);
     if (enable_sqlite) {
-        zsql_mod.linkSystemLibrary("sqlite3", .{});
+        // Explicit libc + sqlite3 linkage is required for reliable Linux CI.
+        // `@cImport` is avoided in the driver; symbols come from c.zig externs.
+        zsql_mod.link_libc = true;
+        zsql_mod.linkSystemLibrary("sqlite3", .{
+            .needed = true,
+            .use_pkg_config = .yes,
+        });
     }
 
     const lib = b.addLibrary(.{
@@ -42,7 +48,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         sqlite_example_mod.addImport("zsql", zsql_mod);
-        sqlite_example_mod.linkSystemLibrary("sqlite3", .{});
+        sqlite_example_mod.link_libc = true;
+        sqlite_example_mod.linkSystemLibrary("sqlite3", .{
+            .needed = true,
+            .use_pkg_config = .yes,
+        });
 
         const sqlite_example = b.addExecutable(.{
             .name = "sqlite-basic",
@@ -58,7 +68,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         sqlite_migrate_example_mod.addImport("zsql", zsql_mod);
-        sqlite_migrate_example_mod.linkSystemLibrary("sqlite3", .{});
+        sqlite_migrate_example_mod.link_libc = true;
+        sqlite_migrate_example_mod.linkSystemLibrary("sqlite3", .{
+            .needed = true,
+            .use_pkg_config = .yes,
+        });
 
         const sqlite_migrate_example = b.addExecutable(.{
             .name = "sqlite-migrate",

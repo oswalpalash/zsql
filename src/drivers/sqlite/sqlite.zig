@@ -1,8 +1,6 @@
 const std = @import("std");
 const core = @import("../../zsql.zig");
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
+const c = @import("c.zig");
 
 pub const OpenMode = enum {
     memory,
@@ -799,8 +797,7 @@ pub const Rows = struct {
         errdefer stmt.allocator.free(values);
 
         for (columns, 0..) |*column, index| {
-            const name = c.sqlite3_column_name(stmt.handle, try sqliteIndex(index));
-            if (name == null) return error.DriverError;
+            const name = c.sqlite3_column_name(stmt.handle, try sqliteIndex(index)) orelse return error.DriverError;
             column.* = std.mem.span(name);
         }
 
