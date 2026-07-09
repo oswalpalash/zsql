@@ -1,6 +1,7 @@
 .zig-cache/
 zig-out/
 *.o
+VISION.md
 ROADMAP.md
 LOOP_STATE.md
 QUALITY_BACKLOG.md

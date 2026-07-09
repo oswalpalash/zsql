@@ -78,6 +78,15 @@ pub const PoolConfig = struct {
     database: Config = .{},
     max_open: usize = 4,
     max_idle: usize = 4,
+    /// Nanoseconds to wait when the pool is exhausted before returning
+    /// `error.PoolTimeout`. Zero means non-blocking exhaustion failure via
+    /// `error.PoolExhausted`.
+    ///
+    /// The current pool is single-threaded and cannot wait for another
+    /// lease to release. A non-zero timeout therefore fails immediately with
+    /// `error.PoolTimeout` so callers can wire the API now; true timed waits
+    /// land when multi-threaded pool support is added.
+    acquire_timeout_ns: u64 = 0,
 };
 
 pub const PoolStats = struct {
@@ -86,6 +95,7 @@ pub const PoolStats = struct {
     leased: usize,
     max_open: usize,
     max_idle: usize,
+    acquire_timeout_ns: u64,
 };
 
 pub const Pool = struct {
@@ -115,13 +125,23 @@ pub const Pool = struct {
         self.closed = true;
     }
 
+    /// Acquire a lease using `PoolConfig.acquire_timeout_ns`.
     pub fn acquire(self: *Pool) !Lease {
+        return self.acquireWithTimeout(self.config.acquire_timeout_ns);
+    }
+
+    /// Acquire a lease with an explicit timeout override.
+    ///
+    /// See `PoolConfig.acquire_timeout_ns` for single-threaded semantics.
+    pub fn acquireWithTimeout(self: *Pool, timeout_ns: u64) !Lease {
         if (self.closed) return error.PoolClosed;
 
         var db = if (self.idle.pop()) |idle_db|
             idle_db
         else blk: {
-            if (self.open_count >= self.config.max_open) return error.PoolExhausted;
+            if (self.open_count >= self.config.max_open) {
+                return if (timeout_ns == 0) error.PoolExhausted else error.PoolTimeout;
+            }
             const opened = try Database.open(self.allocator, self.config.database);
             self.open_count += 1;
             break :blk opened;
@@ -147,6 +167,7 @@ pub const Pool = struct {
             .leased = self.open_count - idle_count,
             .max_open = self.config.max_open,
             .max_idle = self.effectiveMaxIdle(),
+            .acquire_timeout_ns = self.config.acquire_timeout_ns,
         };
     }
 
@@ -1265,6 +1286,7 @@ test "SQLite pool releases and reuses leases" {
         .leased = 0,
         .max_open = 1,
         .max_idle = 1,
+        .acquire_timeout_ns = 0,
     }, pool.stats());
 
     var first = try pool.acquire();
@@ -1274,6 +1296,7 @@ test "SQLite pool releases and reuses leases" {
         .leased = 1,
         .max_open = 1,
         .max_idle = 1,
+        .acquire_timeout_ns = 0,
     }, pool.stats());
 
     var first_conn = try first.conn();
@@ -1287,6 +1310,7 @@ test "SQLite pool releases and reuses leases" {
         .leased = 0,
         .max_open = 1,
         .max_idle = 1,
+        .acquire_timeout_ns = 0,
     }, pool.stats());
 
     var second = try pool.acquire();
@@ -1297,6 +1321,7 @@ test "SQLite pool releases and reuses leases" {
         .leased = 1,
         .max_open = 1,
         .max_idle = 1,
+        .acquire_timeout_ns = 0,
     }, pool.stats());
 
     var rows = try (try second.conn()).query("select id from pooled_reuse", &.{});
@@ -1317,6 +1342,7 @@ test "SQLite pool max idle closes excess released leases" {
         .leased = 2,
         .max_open = 2,
         .max_idle = 1,
+        .acquire_timeout_ns = 0,
     }, pool.stats());
 
     try first.release();
@@ -1326,6 +1352,7 @@ test "SQLite pool max idle closes excess released leases" {
         .leased = 1,
         .max_open = 2,
         .max_idle = 1,
+        .acquire_timeout_ns = 0,
     }, pool.stats());
 
     try second.release();
@@ -1335,6 +1362,7 @@ test "SQLite pool max idle closes excess released leases" {
         .leased = 0,
         .max_open = 2,
         .max_idle = 1,
+        .acquire_timeout_ns = 0,
     }, pool.stats());
 }
 
@@ -1351,6 +1379,7 @@ test "SQLite pool zero max idle closes releases immediately" {
         .leased = 0,
         .max_open = 1,
         .max_idle = 0,
+        .acquire_timeout_ns = 0,
     }, pool.stats());
 }
 
@@ -1361,6 +1390,27 @@ test "SQLite pool enforces max open leases" {
     var lease = try pool.acquire();
     try std.testing.expectError(error.PoolExhausted, pool.acquire());
     try lease.release();
+}
+
+test "SQLite pool exhausted acquire with timeout returns PoolTimeout" {
+    var pool = try Pool.init(std.testing.allocator, .{
+        .max_open = 1,
+        .acquire_timeout_ns = 5 * std.time.ns_per_ms,
+    });
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_ms), pool.stats().acquire_timeout_ns);
+
+    var lease = try pool.acquire();
+    // Single-threaded scaffolding cannot wait for release; non-zero timeout
+    // surfaces PoolTimeout immediately so callers can depend on the API now.
+    try std.testing.expectError(error.PoolTimeout, pool.acquire());
+    try std.testing.expectError(error.PoolTimeout, pool.acquireWithTimeout(1));
+    try std.testing.expectError(error.PoolExhausted, pool.acquireWithTimeout(0));
+    try lease.release();
+
+    var recovered = try pool.acquireWithTimeout(0);
+    try recovered.release();
 }
 
 test "SQLite pool discard closes lease and allows replacement" {

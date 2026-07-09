@@ -16,6 +16,7 @@ pub const Error = error{
     SavepointClosed,
     PoolClosed,
     PoolExhausted,
+    PoolTimeout,
     LeaseClosed,
     OutOfMemory,
 };
