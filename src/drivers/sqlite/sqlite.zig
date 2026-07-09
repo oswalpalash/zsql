@@ -830,6 +830,7 @@ pub fn applyMigrations(conn: *Conn, migrations: []const core.migrate.MigrationFi
         const started_ms = nowMs();
         try tx.execScript(migration.sql);
         const elapsed_ms: i64 = @max(0, nowMs() - started_ms);
+        // elapsed is best-effort; clocks may report 0 under constrained hosts.
         _ = try tx.exec(
             \\update zsql_migrations
             \\set dirty = 0, execution_ms = ?
@@ -1324,10 +1325,14 @@ fn sqliteBool(value: i64) !bool {
     };
 }
 
+/// Best-effort millisecond clock without requiring libc linkage.
 fn nowMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+    // Prefer a process-local mono clock through the single-threaded Io instance
+    // when the host provides one; never pull in libc solely for timing.
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    const ts = std.Io.Timestamp.now(io, .awake);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
 }
 
 fn parseChecksum(value: []const u8) !core.migrate.Checksum {

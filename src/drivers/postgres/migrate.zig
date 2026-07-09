@@ -175,9 +175,9 @@ pub const Migrator = struct {
             );
 
             // Migration SQL is trusted file content (not user values).
-            const started_ms = nowMs();
+            const started_ms = nowMs(self.conn.io);
             _ = try self.conn.exec(migration.sql);
-            const elapsed_ms: i64 = @max(0, nowMs() - started_ms);
+            const elapsed_ms: i64 = @max(0, nowMs(self.conn.io) - started_ms);
 
             _ = try self.conn.execParams(
                 \\update zsql_migrations
@@ -224,10 +224,9 @@ fn toI64(version: u64) !i64 {
     return std.math.cast(i64, version) orelse error.InvalidBindValue;
 }
 
-fn nowMs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+fn nowMs(io: std.Io) i64 {
+    const ts = std.Io.Timestamp.now(io, .awake);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
 }
 
 fn parseChecksum(value: []const u8) !core.migrate.Checksum {
