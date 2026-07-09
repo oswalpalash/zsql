@@ -783,21 +783,31 @@ fn isJoinOnTerminator(sc: Scanner) bool {
 /// Keywords / pseudo-columns that appear in WHERE but are not schema columns.
 fn isSqlNoiseIdent(name: []const u8) bool {
     const keywords = [_][]const u8{
-        "and",       "or",        "not",       "in",        "is",        "null",
-        "true",      "false",     "unknown",   "between",   "like",      "ilike",
-        "similar",   "escape",    "exists",    "case",      "when",      "then",
-        "else",      "end",       "any",       "all",       "some",      "distinct",
-        "cast",      "as",        "on",        "using",     "join",      "inner",
-        "left",      "right",     "full",      "cross",     "outer",     "select",
-        "from",      "where",     "group",     "order",     "by",        "limit",
-        "offset",    "having",    "union",     "intersect", "except",    "returning",
-        "window",    "over",      "partition", "asc",       "desc",      "nulls",
-        "first",     "last",      "current",   "row",       "rows",      "unbounded",
-        "preceding", "following", "filter",    "collate",   "symmetric", "asymmetric",
-        "interval",  "date",      "time",      "timestamp", "at",        "zone",
-        "both",      "leading",   "trailing",  "trim",      "extract",   "substring",
-        "position",  "overlay",   "placing",   "values",    "default",   "new",
-        "old",       "array",     "row",       "only",
+        "and",          "or",        "not",       "in",        "is",         "null",
+        "true",         "false",     "unknown",   "between",   "like",       "ilike",
+        "similar",      "escape",    "exists",    "case",      "when",       "then",
+        "else",         "end",       "any",       "all",       "some",       "distinct",
+        "cast",         "as",        "on",        "using",     "join",       "inner",
+        "left",         "right",     "full",      "cross",     "outer",      "select",
+        "from",         "where",     "group",     "order",     "by",         "limit",
+        "offset",       "having",    "union",     "intersect", "except",     "returning",
+        "window",       "over",      "partition", "asc",       "desc",       "nulls",
+        "first",        "last",      "current",   "row",       "rows",       "unbounded",
+        "preceding",    "following", "filter",    "collate",   "symmetric",  "asymmetric",
+        "interval",     "date",      "time",      "timestamp", "at",         "zone",
+        "both",         "leading",   "trailing",  "trim",      "extract",    "substring",
+        "position",     "overlay",   "placing",   "values",    "default",    "new",
+        "old",          "array",     "only",
+        // EXTRACT field names / common type names (avoid false UnknownColumn)
+             "year",      "month",      "day",
+        "hour",         "minute",    "second",    "epoch",     "dow",        "doy",
+        "week",         "quarter",   "decade",    "century",   "millennium", "microseconds",
+        "milliseconds", "timezone",  "integer",   "int",       "int2",       "int4",
+        "int8",         "bigint",    "smallint",  "text",      "varchar",    "char",
+        "character",    "boolean",   "bool",      "real",      "float",      "float4",
+        "float8",       "double",    "numeric",   "decimal",   "blob",       "bytea",
+        "json",         "jsonb",     "uuid",      "serial",    "bigserial",  "money",
+        "xml",
     };
     for (keywords) |kw| {
         if (std.ascii.eqlIgnoreCase(name, kw)) return true;
@@ -857,8 +867,26 @@ fn skipParenGroup(sc: *Scanner) CheckError!void {
 
 const TerminatorFn = *const fn (Scanner) bool;
 
+fn isCloseParen(sc: Scanner) bool {
+    return sc.peek() == ')';
+}
+
+/// Consume a `(…)` group and collect column refs inside it (including nested calls).
+fn collectParenExpr(sc: *Scanner, buf: *[max_projections]Projection, start_count: usize) CheckError!usize {
+    try sc.skipTrivia();
+    if (sc.peek() != '(') return start_count;
+    sc.advance();
+    const count = try collectColumnRefs(sc, buf, start_count, isCloseParen);
+    try sc.skipTrivia();
+    if (sc.peek() == ')') sc.advance();
+    return count;
+}
+
 /// Collect bare/qualified column refs from the current scanner position until
 /// `is_terminator` returns true. Best-effort; not a full SQL expression parser.
+///
+/// Function calls and grouping parens recurse so argument columns are checked
+/// (e.g. `lower(email)`, `coalesce(u.name, p.title)`).
 fn collectColumnRefs(sc: *Scanner, buf: *[max_projections]Projection, start_count: usize, is_terminator: TerminatorFn) CheckError!usize {
     var count = start_count;
     while (sc.index < sc.sql.len and count < max_projections) {
@@ -875,7 +903,13 @@ fn collectColumnRefs(sc: *Scanner, buf: *[max_projections]Projection, start_coun
             sc.advance();
             _ = try sc.readIdentOrStar();
             try sc.skipTrivia();
-            if (sc.peek() == '(') try skipParenGroup(sc);
+            if (sc.peek() == '(') _ = try collectParenExpr(sc, buf, count);
+            continue;
+        }
+
+        // Grouping / nested expression
+        if (sc.peek() == '(') {
+            count = try collectParenExpr(sc, buf, count);
             continue;
         }
 
@@ -885,30 +919,43 @@ fn collectColumnRefs(sc: *Scanner, buf: *[max_projections]Projection, start_coun
             continue;
         }
         if (std.mem.eql(u8, first.?, "*")) continue;
-        if (isSqlNoiseIdent(first.?)) continue;
 
         try sc.skipTrivia();
-        // Function call: skip name + argument list (keeps false positives low).
-        if (sc.peek() == '(') {
-            try skipParenGroup(sc);
+
+        // CAST(x AS type) / AS type-name: skip the type token after AS.
+        if (std.ascii.eqlIgnoreCase(first.?, "as")) {
+            _ = try sc.readIdentOrStar();
+            try sc.skipTrivia();
+            if (sc.peek() == '(') try skipParenGroup(sc); // varchar(255)
             continue;
         }
 
+        // Qualified name: qual.col or schema.func(...)
         if (sc.peek() == '.') {
             sc.advance();
             const second = try sc.readIdentOrStar() orelse return error.InvalidSql;
-            if (std.mem.eql(u8, second, "*") or isSqlNoiseIdent(second)) continue;
             try sc.skipTrivia();
             if (sc.peek() == '(') {
-                try skipParenGroup(sc);
+                // schema.func(...) — do not treat func as a column; scan args.
+                count = try collectParenExpr(sc, buf, count);
                 continue;
             }
+            if (std.mem.eql(u8, second, "*") or isSqlNoiseIdent(second)) continue;
+            if (isSqlNoiseIdent(first.?)) continue;
             buf[count] = .{ .column = second, .qualifier = first.? };
             count += 1;
-        } else {
-            buf[count] = .{ .column = first.? };
-            count += 1;
+            continue;
         }
+
+        // Function call: do not treat the function name as a column; scan args.
+        if (sc.peek() == '(') {
+            count = try collectParenExpr(sc, buf, count);
+            continue;
+        }
+
+        if (isSqlNoiseIdent(first.?)) continue;
+        buf[count] = .{ .column = first.? };
+        count += 1;
     }
     return count;
 }
@@ -1381,11 +1428,37 @@ test "checkQuery where column refs resolve against scope" {
         .check_where = true,
     }));
 
-    // Casts and functions should not be treated as unknown columns.
+    // Casts should not be treated as unknown columns; function *names* are not columns.
     try checkQuery(.{
         .sql = "select id from users where id::text = :s and lower(email) = :e",
         .schema = schema,
         .args = &.{ .{ .name = "s" }, .{ .name = "e" } },
+        .from_table = "users",
+        .check_where = true,
+    });
+
+    // Function *arguments* are checked (email is valid).
+    try checkQuery(.{
+        .sql = "select id from users where lower(email) = :e and coalesce(active, 0) = 1",
+        .schema = schema,
+        .args = &.{.{ .name = "e" }},
+        .from_table = "users",
+        .check_where = true,
+    });
+
+    // Unknown column inside a function argument is rejected.
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select id from users where lower(missing_col) = :e",
+        .schema = schema,
+        .args = &.{.{ .name = "e" }},
+        .from_table = "users",
+        .check_where = true,
+    }));
+
+    // Nested / multi-arg functions and CAST … AS type.
+    try checkQuery(.{
+        .sql = "select id from users where cast(id as integer) > 0 and coalesce(lower(email), '') <> ''",
+        .schema = schema,
         .from_table = "users",
         .check_where = true,
     });

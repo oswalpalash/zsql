@@ -208,9 +208,10 @@ try get_user.validate(schema);
 
 When `from_table` / `from_tables` are omitted, `checkQuery` best-effort extracts
 `FROM` / `JOIN` table names and aliases from the SQL. `check_where` and
-`check_join_on` are opt-in: they resolve simple column refs (skipping keywords,
-binds, casts, and function calls). SQLite and PostgreSQL can build a schema
-graph with `Conn.inspectSchema` and render ZON via `zsql.inspect.writeSchemaZon`.
+`check_join_on` are opt-in: they resolve simple column refs (including those
+inside function arguments like `lower(email)`), while skipping keywords, binds,
+casts, and function *names*. SQLite and PostgreSQL can build a schema graph with
+`Conn.inspectSchema` and render ZON via `zsql.inspect.writeSchemaZon`.
 
 ### CLI
 
