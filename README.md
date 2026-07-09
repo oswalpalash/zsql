@@ -79,7 +79,9 @@ const all = try conn.queryAllParams("select id, email from users", &.{});
 defer zsql.freeOwnedRows(allocator, all);
 ```
 
-SQLite mirrors this with `Conn.queryOne` / `Conn.queryAll`. Pools expose `Pool.queryOne` / `Pool.queryOneParams` (lease held only for the fetch).
+SQLite mirrors this with `Conn.queryOne` / `Conn.queryAll`. Pools expose
+`Pool.queryOne` / `Pool.queryOneParams` and `Pool.queryAll` / `Pool.queryAllParams`
+(lease held only for the fetch; free multi-row results with `zsql.freeOwnedRows`).
 
 Scoped transactions via `withTx` (commit on success, rollback on error):
 

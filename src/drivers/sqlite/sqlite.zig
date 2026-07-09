@@ -292,6 +292,16 @@ pub const Pool = struct {
         return owned;
     }
 
+    /// Acquire a short lease, collect all rows into owned storage, then release.
+    /// Free with `core.OwnedRow.freeSlice` / `zsql.freeOwnedRows`.
+    pub fn queryAll(self: *Pool, sql: []const u8, binds: []const core.Value) ![]core.OwnedRow {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        const owned = try (try lease.conn()).queryAll(sql, binds);
+        try lease.release();
+        return owned;
+    }
+
     /// Liveness check under a short-lived lease.
     pub fn ping(self: *Pool) !void {
         var lease = try self.acquire();
@@ -2194,6 +2204,24 @@ test "SQLite pool queryOne returns single owned row" {
     defer owned.deinit();
     try std.testing.expectEqualStrings("ada", try (try owned.getName("name")).asText());
     try std.testing.expectError(error.NoRows, pool.queryOne("select id from pool_one where id = ?", &.{.{ .integer = 99 }}));
+    try pool.ping();
+}
+
+test "SQLite pool queryAll collects owned rows and releases lease" {
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 2 });
+    defer pool.deinit();
+
+    _ = try pool.exec("create table pool_all (id integer primary key, name text)", &.{});
+    _ = try pool.exec("insert into pool_all (id, name) values (1, 'a'), (2, 'b')", &.{});
+
+    const owned = try pool.queryAll("select id, name from pool_all order by id", &.{});
+    defer core.OwnedRow.freeSlice(std.testing.allocator, owned);
+    try std.testing.expectEqual(@as(usize, 2), owned.len);
+    try std.testing.expectEqual(@as(i64, 1), try (try owned[0].getName("id")).asInt());
+    try std.testing.expectEqualStrings("b", try (try owned[1].getName("name")).asText());
+
+    // Lease must be free again after queryAll returns.
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().leased);
     try pool.ping();
 }
 

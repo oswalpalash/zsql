@@ -148,6 +148,47 @@ test "postgres live: queryOneParams enforces cardinality" {
     try std.testing.expectEqualStrings("a", try (try owned.getName("name")).asText());
 }
 
+test "postgres live: pool queryAllParams collects owned rows" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var pool = try pg.Pool.init(allocator, io, .{
+        .database = config,
+        .max_open = 2,
+        .max_idle = 1,
+    });
+    defer pool.deinit();
+
+    // Use a real table (not TEMP): pool may hand out different connections.
+    _ = try pool.exec("drop table if exists zsql_pool_all");
+    _ = try pool.exec(
+        \\create table zsql_pool_all (
+        \\  id int primary key,
+        \\  name text not null
+        \\)
+    );
+    defer _ = pool.exec("drop table if exists zsql_pool_all") catch {};
+
+    _ = try pool.execParams(
+        "insert into zsql_pool_all (id, name) values ($1, $2), ($3, $4)",
+        &.{ .{ .integer = 1 }, .{ .text = "a" }, .{ .integer = 2 }, .{ .text = "b" } },
+    );
+
+    const owned = try pool.queryAllParams("select id, name from zsql_pool_all order by id", &.{});
+    defer zsql.freeOwnedRows(allocator, owned);
+    try std.testing.expectEqual(@as(usize, 2), owned.len);
+    try std.testing.expectEqual(@as(i64, 1), try (try owned[0].getName("id")).asInt());
+    try std.testing.expectEqualStrings("b", try (try owned[1].getName("name")).asText());
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().leased);
+    try pool.ping();
+}
+
 test "postgres live: inspectSchema exports user tables" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

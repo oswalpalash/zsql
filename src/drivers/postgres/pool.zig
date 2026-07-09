@@ -198,6 +198,16 @@ pub const Pool = struct {
         return owned;
     }
 
+    /// Acquire a short lease, collect all parameterized rows into owned storage,
+    /// then release. Free with `core.OwnedRow.freeSlice` / `zsql.freeOwnedRows`.
+    pub fn queryAllParams(self: *Pool, sql: []const u8, binds: []const core.Value) ![]core.OwnedRow {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        const owned = try (try lease.conn()).queryAllParams(sql, binds);
+        try lease.release();
+        return owned;
+    }
+
     /// Liveness check under a short-lived lease.
     pub fn ping(self: *Pool) !void {
         var lease = try self.acquire();
