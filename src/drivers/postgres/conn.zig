@@ -63,18 +63,18 @@ pub const Conn = struct {
 
     fn openPrefer(allocator: std.mem.Allocator, io: Io, config: url.Config) !Conn {
         var conn = try connectBare(allocator, io, config.host, config.port);
-        errdefer conn.deinitTransportOnly();
 
         const ssl = conn.negotiateSslRequest() catch {
             // Negotiation failed (offline host, etc.): fall back to plain
-            // reconnect so prefer stays best-effort when the server is up
-            // without SSLRequest support mid-flight.
+            // reconnect so prefer stays best-effort.
             conn.deinitTransportOnly();
             return openPlain(allocator, io, config);
         };
 
         switch (ssl) {
             .rejects_tls => {
+                // Ownership transfers to caller only after successful startup.
+                errdefer conn.deinitTransportOnly();
                 try conn.startup(config);
                 return conn;
             },
