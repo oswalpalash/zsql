@@ -159,6 +159,30 @@ pub const Pool = struct {
         };
     }
 
+    /// Execute a statement under a short-lived lease that is released on success
+    /// or discarded on failure.
+    pub fn exec(self: *Pool, sql: []const u8, binds: []const core.Value) !core.ExecResult {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        const result = try (try lease.conn()).exec(sql, binds);
+        try lease.release();
+        return result;
+    }
+
+    /// Run a query under a lease held until `PooledRows.deinit`.
+    ///
+    /// Borrowed row values remain valid only while the pooled rows (and thus
+    /// the lease) stay open. On query setup failure the lease is discarded.
+    pub fn query(self: *Pool, sql: []const u8, binds: []const core.Value) !PooledRows {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        const rows = try (try lease.conn()).query(sql, binds);
+        return .{
+            .lease = lease,
+            .rows = rows,
+        };
+    }
+
     pub fn stats(self: *const Pool) PoolStats {
         const idle_count = self.idle.items.len;
         return .{
@@ -209,6 +233,28 @@ pub const Lease = struct {
         self.db.deinit();
         self.pool.open_count -= 1;
         self.open = false;
+    }
+};
+
+/// Rows owned by a pool lease. `deinit` finalizes the statement and releases
+/// the lease back to the pool (or discards it if release fails).
+pub const PooledRows = struct {
+    lease: Lease,
+    rows: Rows,
+    closed: bool = false,
+
+    pub fn next(self: *PooledRows) !?core.Row {
+        if (self.closed) return error.LeaseClosed;
+        return self.rows.next();
+    }
+
+    pub fn deinit(self: *PooledRows) void {
+        if (self.closed) return;
+        self.rows.deinit();
+        self.lease.release() catch {
+            self.lease.discard() catch {};
+        };
+        self.closed = true;
     }
 };
 
@@ -1411,6 +1457,55 @@ test "SQLite pool exhausted acquire with timeout returns PoolTimeout" {
 
     var recovered = try pool.acquireWithTimeout(0);
     try recovered.release();
+}
+
+test "SQLite pool query holds lease until rows deinit" {
+    var pool = try Pool.init(std.testing.allocator, .{ .max_open = 1 });
+    defer pool.deinit();
+
+    _ = try pool.exec("create table pooled_query (id integer primary key, name text)", &.{});
+    _ = try pool.exec(
+        "insert into pooled_query (id, name) values (?, ?)",
+        &.{ .{ .integer = 1 }, .{ .text = "ada" } },
+    );
+
+    try std.testing.expectEqualDeep(PoolStats{
+        .open = 1,
+        .idle = 1,
+        .leased = 0,
+        .max_open = 1,
+        .max_idle = 1,
+        .acquire_timeout_ns = 0,
+    }, pool.stats());
+
+    var rows = try pool.query("select id, name from pooled_query where id = ?", &.{.{ .integer = 1 }});
+    try std.testing.expectEqualDeep(PoolStats{
+        .open = 1,
+        .idle = 0,
+        .leased = 1,
+        .max_open = 1,
+        .max_idle = 1,
+        .acquire_timeout_ns = 0,
+    }, pool.stats());
+    try std.testing.expectError(error.PoolExhausted, pool.acquire());
+
+    const row = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 1), try (try row.value("id")).asInt());
+    try std.testing.expectEqualStrings("ada", try (try row.value("name")).asText());
+    try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
+
+    rows.deinit();
+    try std.testing.expectEqualDeep(PoolStats{
+        .open = 1,
+        .idle = 1,
+        .leased = 0,
+        .max_open = 1,
+        .max_idle = 1,
+        .acquire_timeout_ns = 0,
+    }, pool.stats());
+
+    var lease = try pool.acquire();
+    try lease.release();
 }
 
 test "SQLite pool discard closes lease and allows replacement" {
