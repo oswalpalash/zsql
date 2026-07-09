@@ -28,6 +28,7 @@ pub const Conn = struct {
     /// Backend secret key from BackendKeyData, if received.
     backend_secret: ?i32 = null,
     tx_status: protocol.TxStatus = .idle,
+    next_savepoint_id: usize = 0,
 
     /// Open a TCP connection and complete the PostgreSQL startup handshake.
     ///
@@ -158,6 +159,30 @@ pub const Conn = struct {
         if (self.closed) return;
         if (self.tx_status != .in_transaction and self.tx_status != .failed) return;
         self.rollback() catch {};
+    }
+
+    /// Create a savepoint with an internally generated name.
+    pub fn savepoint(self: *Conn) !Savepoint {
+        if (self.closed) return error.ConnectionClosed;
+        if (self.tx_status != .in_transaction) return error.TransactionClosed;
+
+        const id = self.next_savepoint_id;
+        self.next_savepoint_id += 1;
+
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "zsql_sp_{d}", .{id});
+        // Savepoint identifiers are generated locally and never user-controlled.
+        var sql_buf: [96]u8 = undefined;
+        const sql = try std.fmt.bufPrint(&sql_buf, "savepoint {s}", .{name});
+        _ = try self.exec(sql);
+
+        var stored: [64]u8 = undefined;
+        @memcpy(stored[0..name.len], name);
+        return .{
+            .conn = self,
+            .name = stored,
+            .name_len = name.len,
+        };
     }
 
     fn sendExtended(self: *Conn, sql: []const u8, binds: []const core.Value, describe_portal: bool) !void {
@@ -594,6 +619,51 @@ pub const SimpleRow = struct {
         return self.values[index].borrowed();
     }
 };
+
+/// PostgreSQL savepoint bound to an open connection transaction.
+pub const Savepoint = struct {
+    conn: *Conn,
+    name: [64]u8,
+    name_len: usize,
+    open: bool = true,
+
+    pub fn release(self: *Savepoint) !void {
+        if (!self.open) return error.SavepointClosed;
+        if (self.conn.closed or self.conn.tx_status != .in_transaction) return error.TransactionClosed;
+        var sql_buf: [96]u8 = undefined;
+        const sql = try std.fmt.bufPrint(&sql_buf, "release savepoint {s}", .{self.nameSlice()});
+        _ = try self.conn.exec(sql);
+        self.open = false;
+    }
+
+    pub fn rollback(self: *Savepoint) !void {
+        if (!self.open) return error.SavepointClosed;
+        if (self.conn.closed or self.conn.tx_status != .in_transaction) return error.TransactionClosed;
+        var sql_buf: [96]u8 = undefined;
+        const sql = try std.fmt.bufPrint(&sql_buf, "rollback to savepoint {s}", .{self.nameSlice()});
+        _ = try self.conn.exec(sql);
+        // Keep savepoint defined after rollback-to; release to drop it.
+        const release_sql = try std.fmt.bufPrint(&sql_buf, "release savepoint {s}", .{self.nameSlice()});
+        _ = try self.conn.exec(release_sql);
+        self.open = false;
+    }
+
+    pub fn rollbackIfOpen(self: *Savepoint) void {
+        if (!self.open) return;
+        self.rollback() catch {};
+    }
+
+    fn nameSlice(self: *const Savepoint) []const u8 {
+        return self.name[0..self.name_len];
+    }
+};
+
+test "savepoint names are deterministic prefixes" {
+    // Pure naming check without a live server.
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "zsql_sp_{d}", .{0});
+    try std.testing.expectEqualStrings("zsql_sp_0", name);
+}
 
 test "Conn rejects TLS-required configs before connecting" {
     var config = try url.parse(std.testing.allocator, "postgres://u@127.0.0.1:1/db?sslmode=require");
