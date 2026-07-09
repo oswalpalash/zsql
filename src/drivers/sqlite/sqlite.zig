@@ -318,6 +318,14 @@ pub const Pool = struct {
         try lease.release();
     }
 
+    /// Same as `withTx` but uses `BEGIN IMMEDIATE` on the leased connection.
+    pub fn withTxImmediate(self: *Pool, ctx: anytype, comptime body: *const fn (@TypeOf(ctx), *Tx) anyerror!void) !void {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        try (try lease.conn()).withTxImmediate(ctx, body);
+        try lease.release();
+    }
+
     pub fn stats(self: *Pool) PoolStats {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -2223,6 +2231,23 @@ test "SQLite pool queryAll collects owned rows and releases lease" {
     // Lease must be free again after queryAll returns.
     try std.testing.expectEqual(@as(usize, 0), pool.stats().leased);
     try pool.ping();
+}
+
+test "SQLite pool withTxImmediate commits and releases lease" {
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 2 });
+    defer pool.deinit();
+
+    _ = try pool.exec("create table pool_tx (id integer primary key)", &.{});
+    try pool.withTxImmediate({}, struct {
+        fn run(_: void, tx: *Tx) !void {
+            _ = try tx.exec("insert into pool_tx (id) values (?)", &.{.{ .integer = 7 }});
+        }
+    }.run);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().leased);
+
+    var owned = try pool.queryOne("select id from pool_tx where id = ?", &.{.{ .integer = 7 }});
+    defer owned.deinit();
+    try std.testing.expectEqual(@as(i64, 7), try (try owned.getName("id")).asInt());
 }
 
 test "SQLite pool infinite wait unblocks via condition signal" {
