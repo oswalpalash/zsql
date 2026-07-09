@@ -423,6 +423,14 @@ pub const Conn = struct {
         }
     }
 
+    /// Cheap liveness check (simple query). Does not change transaction state
+    /// when already idle.
+    pub fn ping(self: *Conn) !void {
+        var rows = try self.query("select 1");
+        defer rows.deinit();
+        _ = rows.next();
+    }
+
     /// Parameterized query via extended protocol; returns owned simple rows.
     pub fn queryParams(self: *Conn, sql: []const u8, binds: []const core.Value) !SimpleRows {
         if (self.closed) return error.ConnectionClosed;

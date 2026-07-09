@@ -109,6 +109,19 @@ test "postgres live: handshake, params, tx, errors, inspect" {
     _ = try conn.exec("drop table if exists zsql_live_users");
 }
 
+test "postgres live: ping succeeds" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, std.testing.io, config);
+    defer conn.deinit();
+    try conn.ping();
+}
+
 test "postgres live: queryOneParams enforces cardinality" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

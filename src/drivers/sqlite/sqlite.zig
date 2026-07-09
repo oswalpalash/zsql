@@ -514,6 +514,13 @@ pub const Conn = struct {
         return owned;
     }
 
+    /// Cheap liveness check.
+    pub fn ping(self: *Conn) !void {
+        var rows = try self.query("select 1", &.{});
+        defer rows.deinit();
+        _ = try rows.next();
+    }
+
     pub fn execNamed(self: *Conn, sql: []const u8, binds: []const NamedValue) !core.ExecResult {
         var prepared = try self.prepareCached(sql);
         defer prepared.release();
@@ -1396,6 +1403,14 @@ fn findMigrationRecord(records: []const MigrationRecord, version: u64) ?Migratio
         if (record.version == version) return record;
     }
     return null;
+}
+
+test "SQLite ping succeeds on open connection" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+    try conn.ping();
 }
 
 test "SQLite queryOne enforces single-row cardinality" {
