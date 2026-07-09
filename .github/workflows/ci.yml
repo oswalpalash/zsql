@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Format check
+        run: zig fmt --check .
+
+      - name: Build
+        run: zig build
+
+      - name: Test (default)
+        run: zig build test
+
+      - name: Install system SQLite
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Test with SQLite
+        run: zig build test -Denable-sqlite=true
+
+      - name: SQLite example
+        run: zig build sqlite-example -Denable-sqlite=true
+
+      - name: SQLite migration example
+        run: zig build sqlite-migrate-example -Denable-sqlite=true
