@@ -448,6 +448,18 @@ pub const Conn = struct {
         return Rows.initOwned(prepared.stmt, binds, !prepared.from_cache);
     }
 
+    /// Query exactly one row into an owned row. Returns `error.NoRows` or
+    /// `error.TooManyRows` when the result cardinality is wrong.
+    pub fn queryOne(self: *Conn, sql: []const u8, binds: []const core.Value) !core.OwnedRow {
+        var rows = try self.query(sql, binds);
+        defer rows.deinit();
+        const first = (try rows.next()) orelse return error.NoRows;
+        var owned = try core.OwnedRow.init(self.allocator, first);
+        errdefer owned.deinit();
+        if ((try rows.next()) != null) return error.TooManyRows;
+        return owned;
+    }
+
     pub fn execNamed(self: *Conn, sql: []const u8, binds: []const NamedValue) !core.ExecResult {
         var prepared = try self.prepareCached(sql);
         defer prepared.release();
@@ -710,9 +722,12 @@ pub fn ensureMigrationTable(conn: *Conn) !void {
         \\  name text not null,
         \\  checksum text not null,
         \\  applied_at text not null default current_timestamp,
+        \\  execution_ms integer not null default 0,
         \\  dirty integer not null default 0 check (dirty in (0, 1))
         \\)
     , &.{});
+    // Best-effort upgrade for databases created before execution_ms existed.
+    _ = conn.exec("alter table zsql_migrations add column execution_ms integer not null default 0", &.{}) catch {};
 }
 
 pub fn migrationStatus(allocator: std.mem.Allocator, conn: *Conn) !MigrationStatus {
@@ -793,12 +808,17 @@ pub fn applyMigrations(conn: *Conn, migrations: []const core.migrate.MigrationFi
             .{ .text = &migration.checksum },
             .{ .integer = 1 },
         });
+        const started_ms = nowMs();
         try tx.execScript(migration.sql);
+        const elapsed_ms: i64 = @max(0, nowMs() - started_ms);
         _ = try tx.exec(
             \\update zsql_migrations
-            \\set dirty = 0
+            \\set dirty = 0, execution_ms = ?
             \\where version = ?
-        , &.{.{ .integer = try sqliteVersion(migration.id.version) }});
+        , &.{
+            .{ .integer = elapsed_ms },
+            .{ .integer = try sqliteVersion(migration.id.version) },
+        });
         applied += 1;
     }
 
@@ -1285,6 +1305,12 @@ fn sqliteBool(value: i64) !bool {
     };
 }
 
+fn nowMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
 fn parseChecksum(value: []const u8) !core.migrate.Checksum {
     if (value.len != 64) return error.InvalidColumnType;
     for (value) |c_| {
@@ -1308,6 +1334,24 @@ fn findMigrationRecord(records: []const MigrationRecord, version: u64) ?Migratio
         if (record.version == version) return record;
     }
     return null;
+}
+
+test "SQLite queryOne enforces single-row cardinality" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table one_row (id integer primary key, name text)", &.{});
+    try std.testing.expectError(error.NoRows, conn.queryOne("select id from one_row", &.{}));
+
+    _ = try conn.exec("insert into one_row (id, name) values (1, 'a'), (2, 'b')", &.{});
+    try std.testing.expectError(error.TooManyRows, conn.queryOne("select id from one_row", &.{}));
+
+    var owned = try conn.queryOne("select id, name from one_row where id = ?", &.{.{ .integer = 1 }});
+    defer owned.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try (try owned.getName("id")).asInt());
+    try std.testing.expectEqualStrings("a", try (try owned.getName("name")).asText());
 }
 
 test "SQLite prepared statement cache reuses handles" {

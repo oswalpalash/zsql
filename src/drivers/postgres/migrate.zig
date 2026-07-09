@@ -171,14 +171,19 @@ pub const Migrator = struct {
             );
 
             // Migration SQL is trusted file content (not user values).
+            const started_ms = nowMs();
             _ = try self.conn.exec(migration.sql);
+            const elapsed_ms: i64 = @max(0, nowMs() - started_ms);
 
             _ = try self.conn.execParams(
                 \\update zsql_migrations
-                \\set dirty = false, applied_at = now()
-                \\where version = $1
+                \\set dirty = false, applied_at = now(), execution_ms = $1
+                \\where version = $2
             ,
-                &.{.{ .integer = try toI64(migration.id.version) }},
+                &.{
+                    .{ .integer = elapsed_ms },
+                    .{ .integer = try toI64(migration.id.version) },
+                },
             );
             applied += 1;
         }
@@ -213,6 +218,12 @@ fn unsignedVersion(value: i64) !u64 {
 
 fn toI64(version: u64) !i64 {
     return std.math.cast(i64, version) orelse error.InvalidBindValue;
+}
+
+fn nowMs() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
 }
 
 fn parseChecksum(value: []const u8) !core.migrate.Checksum {
