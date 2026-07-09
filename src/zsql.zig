@@ -18,6 +18,8 @@ pub const params = @import("core/params.zig");
 pub const migrate = @import("migrate/migrate.zig");
 pub const inspect = @import("check/inspect.zig");
 pub const check = @import("check/checker.zig");
+pub const StmtCache = @import("pool/stmt_cache.zig").StmtCache;
+pub const formatStmtName = @import("pool/stmt_cache.zig").formatStmtName;
 const options = @import("zsql_options");
 
 /// True when this package was built with `-Denable-sqlite=true`.
@@ -50,6 +52,7 @@ test {
     _ = @import("migrate/migrate.zig");
     _ = @import("check/inspect.zig");
     _ = @import("check/checker.zig");
+    _ = @import("pool/stmt_cache.zig");
     _ = @import("drivers/postgres/postgres.zig");
     if (options.enable_sqlite) {
         _ = @import("drivers/sqlite/sqlite.zig");
