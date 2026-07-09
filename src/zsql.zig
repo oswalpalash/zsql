@@ -14,6 +14,9 @@ const options = @import("zsql_options");
 
 pub const drivers = struct {
     pub const sqlite = if (options.enable_sqlite) @import("drivers/sqlite/sqlite.zig") else unavailable.sqlite;
+    /// Pure-Zig PostgreSQL driver surface. URL and protocol helpers are always
+    /// available; live network I/O is added in later slices.
+    pub const postgres = @import("drivers/postgres/postgres.zig");
 };
 
 pub const unavailable = struct {
@@ -32,6 +35,7 @@ test {
     _ = @import("core/database.zig");
     _ = @import("core/params.zig");
     _ = @import("migrate/migrate.zig");
+    _ = @import("drivers/postgres/postgres.zig");
     if (options.enable_sqlite) {
         _ = @import("drivers/sqlite/sqlite.zig");
     }
