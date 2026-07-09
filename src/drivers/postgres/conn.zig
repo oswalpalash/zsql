@@ -35,6 +35,9 @@ pub const Conn = struct {
     tls_read_buf: ?[]u8 = null,
     tls_write_buf: ?[]u8 = null,
     tls: ?TlsClient = null,
+    /// System CA bundle when verify-ca / verify-full is used.
+    ca_bundle: ?std.crypto.Certificate.Bundle = null,
+    ca_bundle_lock: Io.RwLock = .init,
     closed: bool = false,
     /// Backend process id from BackendKeyData, if received.
     backend_pid: ?i32 = null,
@@ -56,17 +59,18 @@ pub const Conn = struct {
     /// - `disable` / `allow`: plain StartupMessage (no SSLRequest).
     /// - `prefer`: SSLRequest; plain if rejected; TLS upgrade if accepted
     ///   (encryption without certificate verification for prefer).
-    /// - `require`: SSLRequest + TLS (encryption, no CA verification yet).
-    /// - `verify-ca` / `verify-full`: return `error.TlsFailed` until CA bundle
-    ///   loading is wired (hostname/CA verification not available yet).
+    /// - `require`: SSLRequest + TLS encryption without certificate verification.
+    /// - `verify-ca`: TLS + system CA verification (no hostname check).
+    /// - `verify-full`: TLS + system CA verification + hostname check.
     pub fn open(allocator: std.mem.Allocator, io: Io, config: url.Config) !Conn {
         if (config.user.len == 0) return error.InvalidArguments;
 
         return switch (config.ssl_mode) {
             .disable, .allow => try openPlain(allocator, io, config),
             .prefer => try openPrefer(allocator, io, config),
-            .require => try openRequireTls(allocator, io, config),
-            .verify_ca, .verify_full => error.TlsFailed,
+            .require => try openRequireTls(allocator, io, config, .none),
+            .verify_ca => try openRequireTls(allocator, io, config, .ca),
+            .verify_full => try openRequireTls(allocator, io, config, .full),
         };
     }
 
@@ -93,28 +97,26 @@ pub const Conn = struct {
             },
             .accepts_tls => {
                 errdefer conn.deinitTransportOnly();
-                try conn.upgradeTls(.{ .verify_host = false });
+                try conn.upgradeTls(config.host, .none);
                 try conn.startup(config);
                 return conn;
             },
         }
     }
 
-    fn openRequireTls(allocator: std.mem.Allocator, io: Io, config: url.Config) !Conn {
+    const VerifyMode = enum { none, ca, full };
+
+    fn openRequireTls(allocator: std.mem.Allocator, io: Io, config: url.Config, verify: VerifyMode) !Conn {
         var conn = try connectBare(allocator, io, config.host, config.port);
         errdefer conn.deinitTransportOnly();
         const ssl = conn.negotiateSslRequest() catch return error.TlsFailed;
         if (ssl != .accepts_tls) return error.TlsFailed;
-        try conn.upgradeTls(.{ .verify_host = false });
+        try conn.upgradeTls(config.host, verify);
         try conn.startup(config);
         return conn;
     }
 
-    const TlsUpgrade = struct {
-        verify_host: bool,
-    };
-
-    fn upgradeTls(self: *Conn, opts: TlsUpgrade) !void {
+    fn upgradeTls(self: *Conn, host: []const u8, verify: VerifyMode) !void {
         if (self.tls != null) return error.ProtocolError;
         if (self.read_buf.len < stream_buf_len or self.write_buf.len < stream_buf_len) {
             return error.TlsFailed;
@@ -128,25 +130,66 @@ pub const Conn = struct {
         var entropy: [TlsClient.Options.entropy_len]u8 = undefined;
         self.io.randomSecure(&entropy) catch self.io.random(&entropy);
 
-        // realtime clock for certificate validity when verification is enabled.
         const now = std.Io.Timestamp.now(self.io, .real);
 
-        // Certificate/CA verification for verify-* modes lands with system CA
-        // loading; require/prefer use encryption without host verification.
-        _ = opts;
-        self.tls = TlsClient.init(
-            &self.reader.interface,
-            &self.writer.interface,
-            .{
-                .host = .no_verification,
-                .ca = .no_verification,
-                .read_buffer = tls_read_buf,
-                .write_buffer = tls_write_buf,
-                .entropy = &entropy,
-                .realtime_now = now,
-                .allow_truncation_attacks = false,
-            },
-        ) catch return error.TlsFailed;
+        if (verify != .none) {
+            var bundle: std.crypto.Certificate.Bundle = .empty;
+            errdefer bundle.deinit(self.allocator);
+            bundle.rescan(self.allocator, self.io, now) catch return error.TlsFailed;
+            self.ca_bundle = bundle;
+        }
+
+        self.tls = switch (verify) {
+            .none => TlsClient.init(
+                &self.reader.interface,
+                &self.writer.interface,
+                .{
+                    .host = .no_verification,
+                    .ca = .no_verification,
+                    .read_buffer = tls_read_buf,
+                    .write_buffer = tls_write_buf,
+                    .entropy = &entropy,
+                    .realtime_now = now,
+                    .allow_truncation_attacks = false,
+                },
+            ),
+            .ca => TlsClient.init(
+                &self.reader.interface,
+                &self.writer.interface,
+                .{
+                    .host = .no_verification,
+                    .ca = .{ .bundle = .{
+                        .gpa = self.allocator,
+                        .io = self.io,
+                        .lock = &self.ca_bundle_lock,
+                        .bundle = &self.ca_bundle.?,
+                    } },
+                    .read_buffer = tls_read_buf,
+                    .write_buffer = tls_write_buf,
+                    .entropy = &entropy,
+                    .realtime_now = now,
+                    .allow_truncation_attacks = false,
+                },
+            ),
+            .full => TlsClient.init(
+                &self.reader.interface,
+                &self.writer.interface,
+                .{
+                    .host = .{ .explicit = host },
+                    .ca = .{ .bundle = .{
+                        .gpa = self.allocator,
+                        .io = self.io,
+                        .lock = &self.ca_bundle_lock,
+                        .bundle = &self.ca_bundle.?,
+                    } },
+                    .read_buffer = tls_read_buf,
+                    .write_buffer = tls_write_buf,
+                    .entropy = &entropy,
+                    .realtime_now = now,
+                    .allow_truncation_attacks = false,
+                },
+            ),
+        } catch return error.TlsFailed;
 
         self.tls_read_buf = tls_read_buf;
         self.tls_write_buf = tls_write_buf;
@@ -180,9 +223,11 @@ pub const Conn = struct {
         self.allocator.free(self.write_buf);
         if (self.tls_read_buf) |buf| self.allocator.free(buf);
         if (self.tls_write_buf) |buf| self.allocator.free(buf);
+        if (self.ca_bundle) |*bundle| bundle.deinit(self.allocator);
         self.tls = null;
         self.tls_read_buf = null;
         self.tls_write_buf = null;
+        self.ca_bundle = null;
         self.clearLastError();
         self.closed = true;
     }
@@ -220,9 +265,11 @@ pub const Conn = struct {
         self.allocator.free(self.write_buf);
         if (self.tls_read_buf) |buf| self.allocator.free(buf);
         if (self.tls_write_buf) |buf| self.allocator.free(buf);
+        if (self.ca_bundle) |*bundle| bundle.deinit(self.allocator);
         self.tls = null;
         self.tls_read_buf = null;
         self.tls_write_buf = null;
+        self.ca_bundle = null;
         self.clearLastError();
         self.closed = true;
     }
@@ -1184,14 +1231,17 @@ test "Conn require TLS fails when host is unreachable or after SSLRequest" {
     try std.testing.expect(result == error.TlsFailed or result == error.ConnectionClosed or result == error.ConnectionTimeout or result == error.DriverError);
 }
 
-test "Conn verify modes fail until CA bundle is wired" {
+test "Conn verify modes fail on unreachable host after TLS attempt" {
+    // Port 1 should not complete a verified TLS handshake.
     var ca = try url.parse(std.testing.allocator, "postgres://u@127.0.0.1:1/db?sslmode=verify-ca");
     defer ca.deinit();
-    try std.testing.expectError(error.TlsFailed, Conn.open(std.testing.allocator, std.testing.io, ca));
+    const ca_result = Conn.open(std.testing.allocator, std.testing.io, ca);
+    try std.testing.expect(ca_result == error.TlsFailed or ca_result == error.ConnectionClosed or ca_result == error.ConnectionTimeout or ca_result == error.DriverError);
 
     var full = try url.parse(std.testing.allocator, "postgres://u@127.0.0.1:1/db?sslmode=verify-full");
     defer full.deinit();
-    try std.testing.expectError(error.TlsFailed, Conn.open(std.testing.allocator, std.testing.io, full));
+    const full_result = Conn.open(std.testing.allocator, std.testing.io, full);
+    try std.testing.expect(full_result == error.TlsFailed or full_result == error.ConnectionClosed or full_result == error.ConnectionTimeout or full_result == error.DriverError);
 }
 
 test "SslResponse parser is used by negotiation path" {

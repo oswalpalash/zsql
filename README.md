@@ -59,11 +59,12 @@ defer rows.deinit();
 TLS uses Zig's `std.crypto.tls.Client` (no OpenSSL). Behavior by `sslmode`:
 
 - `disable` / `allow`: plain connection
-- `prefer`: SSLRequest; plain if rejected; TLS upgrade if accepted (no cert verification)
-- `require`: SSLRequest + TLS encryption (no CA verification yet)
-- `verify-ca` / `verify-full`: `error.TlsFailed` until system CA bundle loading is wired
+- `prefer`: SSLRequest; plain if rejected; TLS if accepted (no cert verification)
+- `require`: TLS encryption without certificate verification
+- `verify-ca`: TLS + system CA verification
+- `verify-full`: TLS + system CA + hostname verification
 
-Prefer `sslmode=require` on untrusted networks when the server has TLS enabled.
+Use `sslmode=verify-full` when you need full certificate checks against OS trust stores.
 
 Auth: trust, cleartext, MD5, **SCRAM-SHA-256**.
 
