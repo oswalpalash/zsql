@@ -134,6 +134,10 @@ zig fmt --check .
 zig build
 zig build test
 zig build test -Denable-sqlite=true
+
+# Optional live PostgreSQL (skipped when ZSQL_PG_URL is unset):
+# export ZSQL_PG_URL='postgres://zsql:zsql@127.0.0.1:5432/zsql?sslmode=disable'
+# zig build test-postgres
 ```
 
-CI runs the same gates on Ubuntu with system SQLite.
+CI runs the same gates on Ubuntu with system SQLite and a Postgres service for `zig build test-postgres`.

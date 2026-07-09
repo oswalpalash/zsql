@@ -9,6 +9,20 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: zsql
+          POSTGRES_PASSWORD: zsql
+          POSTGRES_DB: zsql
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zsql -d zsql"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -46,3 +60,8 @@ jobs:
 
       - name: SQLite migration example
         run: zig build sqlite-migrate-example -Denable-sqlite=true
+
+      - name: Live PostgreSQL integration tests
+        env:
+          ZSQL_PG_URL: postgres://zsql:zsql@127.0.0.1:5432/zsql?sslmode=disable
+        run: zig build test-postgres

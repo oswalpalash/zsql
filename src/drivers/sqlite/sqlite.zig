@@ -82,10 +82,8 @@ pub const PoolConfig = struct {
     /// `error.PoolTimeout`. Zero means non-blocking exhaustion failure via
     /// `error.PoolExhausted`.
     ///
-    /// The current pool is single-threaded and cannot wait for another
-    /// lease to release. A non-zero timeout therefore fails immediately with
-    /// `error.PoolTimeout` so callers can wire the API now; true timed waits
-    /// land when multi-threaded pool support is added.
+    /// Multi-threaded: waiters sleep in short slices (≤1ms) and recheck, so a
+    /// concurrent `release` unblocks them within about one poll interval.
     acquire_timeout_ns: u64 = 0,
 };
 
@@ -98,22 +96,32 @@ pub const PoolStats = struct {
     acquire_timeout_ns: u64,
 };
 
+/// Thread-safe SQLite connection pool.
+///
+/// State is protected by an `std.Io.Mutex`. Timed acquire uses deadline polling
+/// (≤1ms) so waiters wake promptly after a concurrent release without requiring
+/// a dedicated condition-variable timeout API.
 pub const Pool = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     config: PoolConfig,
     idle: std.ArrayListUnmanaged(Database) = .empty,
     open_count: usize = 0,
     closed: bool = false,
+    mutex: std.Io.Mutex = .init,
 
-    pub fn init(allocator: std.mem.Allocator, config: PoolConfig) !Pool {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: PoolConfig) !Pool {
         if (config.max_open == 0) return error.InvalidBindValue;
         return .{
             .allocator = allocator,
+            .io = io,
             .config = config,
         };
     }
 
     pub fn deinit(self: *Pool) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.closed) return;
         std.debug.assert(self.open_count == self.idle.items.len);
 
@@ -132,31 +140,65 @@ pub const Pool = struct {
 
     /// Acquire a lease with an explicit timeout override.
     ///
-    /// See `PoolConfig.acquire_timeout_ns` for single-threaded semantics.
+    /// - `timeout_ns == 0`: fail immediately with `PoolExhausted` when full.
+    /// - `timeout_ns > 0`: wait up to that many nanoseconds for a release or
+    ///   for capacity to open a new connection; then `PoolTimeout`.
     pub fn acquireWithTimeout(self: *Pool, timeout_ns: u64) !Lease {
-        if (self.closed) return error.PoolClosed;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
-        var db = if (self.idle.pop()) |idle_db|
-            idle_db
-        else blk: {
-            if (self.open_count >= self.config.max_open) {
-                return if (timeout_ns == 0) error.PoolExhausted else error.PoolTimeout;
+        const deadline: ?std.Io.Clock.Timestamp = if (timeout_ns == 0)
+            null
+        else
+            std.Io.Clock.Timestamp.fromNow(self.io, .{ .raw = .{ .nanoseconds = @intCast(timeout_ns) }, .clock = .awake });
+
+        while (true) {
+            if (self.closed) return error.PoolClosed;
+
+            if (self.idle.pop()) |idle_db| {
+                var db = idle_db;
+                errdefer {
+                    // Return the handle to idle on connect failure after unlock
+                    // is unsafe here; close it and drop open_count instead.
+                    db.deinit();
+                    self.open_count -|= 1;
+                }
+                const conn = try db.connect();
+                return .{
+                    .pool = self,
+                    .db = db,
+                    .conn_value = conn,
+                };
             }
-            const opened = try Database.open(self.allocator, self.config.database);
-            self.open_count += 1;
-            break :blk opened;
-        };
-        errdefer {
-            db.deinit();
-            self.open_count -= 1;
-        }
 
-        const conn = try db.connect();
-        return .{
-            .pool = self,
-            .db = db,
-            .conn_value = conn,
-        };
+            if (self.open_count < self.config.max_open) {
+                var opened = try Database.open(self.allocator, self.config.database);
+                self.open_count += 1;
+                errdefer {
+                    opened.deinit();
+                    self.open_count -|= 1;
+                }
+                const conn = try opened.connect();
+                return .{
+                    .pool = self,
+                    .db = opened,
+                    .conn_value = conn,
+                };
+            }
+
+            // Pool is full: wait or fail.
+            if (deadline) |dl| {
+                const remaining = dl.durationFromNow(self.io);
+                if (remaining.raw.nanoseconds <= 0) return error.PoolTimeout;
+                const slice_ns: i96 = @min(remaining.raw.nanoseconds, @as(i96, std.time.ns_per_ms));
+                self.mutex.unlock(self.io);
+                // Best-effort sleep; cancellation maps to recheck + timeout.
+                self.io.sleep(.{ .nanoseconds = slice_ns }, .awake) catch {};
+                self.mutex.lockUncancelable(self.io);
+            } else {
+                return error.PoolExhausted;
+            }
+        }
     }
 
     /// Execute a statement under a short-lived lease that is released on success
@@ -183,7 +225,9 @@ pub const Pool = struct {
         };
     }
 
-    pub fn stats(self: *const Pool) PoolStats {
+    pub fn stats(self: *Pool) PoolStats {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const idle_count = self.idle.items.len;
         return .{
             .open = self.open_count,
@@ -213,7 +257,17 @@ pub const Lease = struct {
 
     pub fn release(self: *Lease) !void {
         if (!self.open) return error.LeaseClosed;
-        if (self.pool.closed) return error.PoolClosed;
+
+        self.pool.mutex.lockUncancelable(self.pool.io);
+        defer self.pool.mutex.unlock(self.pool.io);
+
+        if (self.pool.closed) {
+            self.conn_value.close();
+            self.db.deinit();
+            self.pool.open_count -|= 1;
+            self.open = false;
+            return error.PoolClosed;
+        }
 
         if (self.pool.idle.items.len < self.pool.effectiveMaxIdle()) {
             try self.pool.idle.append(self.pool.allocator, self.db);
@@ -221,7 +275,7 @@ pub const Lease = struct {
         } else {
             self.conn_value.close();
             self.db.deinit();
-            self.pool.open_count -= 1;
+            self.pool.open_count -|= 1;
         }
         self.open = false;
     }
@@ -229,9 +283,12 @@ pub const Lease = struct {
     pub fn discard(self: *Lease) !void {
         if (!self.open) return error.LeaseClosed;
 
+        self.pool.mutex.lockUncancelable(self.pool.io);
+        defer self.pool.mutex.unlock(self.pool.io);
+
         self.conn_value.close();
         self.db.deinit();
-        self.pool.open_count -= 1;
+        self.pool.open_count -|= 1;
         self.open = false;
     }
 };
@@ -1423,7 +1480,7 @@ test "SQLite savepoint rollbackIfOpen rolls back once" {
 }
 
 test "SQLite pool releases and reuses leases" {
-    var pool = try Pool.init(std.testing.allocator, .{ .max_open = 1 });
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
     defer pool.deinit();
 
     try std.testing.expectEqualDeep(PoolStats{
@@ -1477,7 +1534,7 @@ test "SQLite pool releases and reuses leases" {
 }
 
 test "SQLite pool max idle closes excess released leases" {
-    var pool = try Pool.init(std.testing.allocator, .{ .max_open = 2, .max_idle = 1 });
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 2, .max_idle = 1 });
     defer pool.deinit();
 
     var first = try pool.acquire();
@@ -1513,7 +1570,7 @@ test "SQLite pool max idle closes excess released leases" {
 }
 
 test "SQLite pool zero max idle closes releases immediately" {
-    var pool = try Pool.init(std.testing.allocator, .{ .max_open = 1, .max_idle = 0 });
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1, .max_idle = 0 });
     defer pool.deinit();
 
     var lease = try pool.acquire();
@@ -1530,7 +1587,7 @@ test "SQLite pool zero max idle closes releases immediately" {
 }
 
 test "SQLite pool enforces max open leases" {
-    var pool = try Pool.init(std.testing.allocator, .{ .max_open = 1 });
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
     defer pool.deinit();
 
     var lease = try pool.acquire();
@@ -1539,7 +1596,7 @@ test "SQLite pool enforces max open leases" {
 }
 
 test "SQLite pool exhausted acquire with timeout returns PoolTimeout" {
-    var pool = try Pool.init(std.testing.allocator, .{
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{
         .max_open = 1,
         .acquire_timeout_ns = 5 * std.time.ns_per_ms,
     });
@@ -1548,10 +1605,9 @@ test "SQLite pool exhausted acquire with timeout returns PoolTimeout" {
     try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_ms), pool.stats().acquire_timeout_ns);
 
     var lease = try pool.acquire();
-    // Single-threaded scaffolding cannot wait for release; non-zero timeout
-    // surfaces PoolTimeout immediately so callers can depend on the API now.
+    // Full pool with a short timeout should wait then fail with PoolTimeout.
     try std.testing.expectError(error.PoolTimeout, pool.acquire());
-    try std.testing.expectError(error.PoolTimeout, pool.acquireWithTimeout(1));
+    try std.testing.expectError(error.PoolTimeout, pool.acquireWithTimeout(1 * std.time.ns_per_ms));
     try std.testing.expectError(error.PoolExhausted, pool.acquireWithTimeout(0));
     try lease.release();
 
@@ -1559,8 +1615,50 @@ test "SQLite pool exhausted acquire with timeout returns PoolTimeout" {
     try recovered.release();
 }
 
+test "SQLite pool timed acquire unblocks after concurrent release" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{
+        .max_open = 1,
+        .acquire_timeout_ns = 2 * std.time.ns_per_s,
+    });
+    defer pool.deinit();
+
+    var holder = try pool.acquire();
+
+    const Ctx = struct {
+        pool: *Pool,
+        ok: std.atomic.Value(bool) = .init(false),
+        err_name: [64]u8 = undefined,
+        err_len: usize = 0,
+
+        fn worker(ctx: *@This()) void {
+            var lease = ctx.pool.acquireWithTimeout(2 * std.time.ns_per_s) catch |err| {
+                const name = @errorName(err);
+                const n = @min(name.len, ctx.err_name.len);
+                @memcpy(ctx.err_name[0..n], name[0..n]);
+                ctx.err_len = n;
+                return;
+            };
+            lease.release() catch {};
+            ctx.ok.store(true, .release);
+        }
+    };
+
+    var ctx = Ctx{ .pool = &pool };
+    const thread = try std.Thread.spawn(.{}, Ctx.worker, .{&ctx});
+
+    // Give the waiter time to enter the poll loop, then release capacity.
+    std.testing.io.sleep(.{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    try holder.release();
+    thread.join();
+
+    try std.testing.expect(ctx.ok.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), ctx.err_len);
+}
+
 test "SQLite pool query holds lease until rows deinit" {
-    var pool = try Pool.init(std.testing.allocator, .{ .max_open = 1 });
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
     defer pool.deinit();
 
     _ = try pool.exec("create table pooled_query (id integer primary key, name text)", &.{});
@@ -1609,7 +1707,7 @@ test "SQLite pool query holds lease until rows deinit" {
 }
 
 test "SQLite pool discard closes lease and allows replacement" {
-    var pool = try Pool.init(std.testing.allocator, .{ .max_open = 1 });
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
     defer pool.deinit();
 
     var first = try pool.acquire();
@@ -1625,9 +1723,9 @@ test "SQLite pool discard closes lease and allows replacement" {
 }
 
 test "SQLite pool validates closed lifetime" {
-    try std.testing.expectError(error.InvalidBindValue, Pool.init(std.testing.allocator, .{ .max_open = 0 }));
+    try std.testing.expectError(error.InvalidBindValue, Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 0 }));
 
-    var pool = try Pool.init(std.testing.allocator, .{});
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{});
     var lease = try pool.acquire();
     try lease.release();
     try std.testing.expectError(error.LeaseClosed, lease.conn());

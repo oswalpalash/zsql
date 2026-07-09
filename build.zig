@@ -78,6 +78,21 @@ pub fn build(b: *std.Build) void {
     const checked_example_step = b.step("checked-queries-example", "Run offline checked-query example");
     checked_example_step.dependOn(&run_checked_example.step);
 
+    // Optional live PostgreSQL tests (skipped unless ZSQL_PG_URL is set at runtime).
+    const pg_live_mod = b.createModule(.{
+        .root_source_file = b.path("tests/postgres_live.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pg_live_mod.addImport("zsql", zsql_mod);
+    const pg_live_tests = b.addTest(.{
+        .root_module = pg_live_mod,
+    });
+    const run_pg_live = b.addRunArtifact(pg_live_tests);
+    // Inherits process env (including ZSQL_PG_URL when set by CI or the shell).
+    const test_postgres_step = b.step("test-postgres", "Run live PostgreSQL integration tests (requires ZSQL_PG_URL)");
+    test_postgres_step.dependOn(&run_pg_live.step);
+
     const sqlite_example_step = b.step("sqlite-example", "Run the SQLite GPA leak-checked example");
     const sqlite_migrate_example_step = b.step("sqlite-migrate-example", "Run the SQLite migration GPA leak-checked example");
     if (enable_sqlite) {

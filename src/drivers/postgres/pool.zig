@@ -9,8 +9,9 @@ pub const PoolConfig = struct {
     database: url.Config,
     max_open: usize = 4,
     max_idle: usize = 4,
-    /// See SQLite pool notes: single-threaded waits are not implemented.
-    /// Non-zero timeout returns `error.PoolTimeout` immediately when exhausted.
+    /// Nanoseconds to wait when the pool is exhausted before `PoolTimeout`.
+    /// Zero means non-blocking `PoolExhausted`. Waiters poll in ≤1ms slices so
+    /// a concurrent release unblocks them promptly.
     acquire_timeout_ns: u64 = 0,
 };
 
@@ -23,7 +24,7 @@ pub const PoolStats = struct {
     acquire_timeout_ns: u64,
 };
 
-/// Single-threaded PostgreSQL connection pool.
+/// Thread-safe PostgreSQL connection pool.
 ///
 /// Connections are established with `Conn.open` using the pool's `Io` and
 /// config. Leases must be released or discarded before `Pool.deinit`.
@@ -34,6 +35,7 @@ pub const Pool = struct {
     idle: std.ArrayListUnmanaged(conn_mod.Conn) = .empty,
     open_count: usize = 0,
     closed: bool = false,
+    mutex: Io.Mutex = .init,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, config: PoolConfig) !Pool {
         if (config.max_open == 0) return error.InvalidArguments;
@@ -45,6 +47,8 @@ pub const Pool = struct {
     }
 
     pub fn deinit(self: *Pool) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.closed) return;
         std.debug.assert(self.open_count == self.idle.items.len);
         for (self.idle.items) |*c| c.deinit();
@@ -58,29 +62,66 @@ pub const Pool = struct {
     }
 
     pub fn acquireWithTimeout(self: *Pool, timeout_ns: u64) !Lease {
-        if (self.closed) return error.PoolClosed;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
-        const connection = if (self.idle.pop()) |idle_conn|
-            idle_conn
-        else blk: {
-            if (self.open_count >= self.config.max_open) {
-                return if (timeout_ns == 0) error.PoolExhausted else error.PoolTimeout;
+        const deadline: ?Io.Clock.Timestamp = if (timeout_ns == 0)
+            null
+        else
+            Io.Clock.Timestamp.fromNow(self.io, .{
+                .raw = .{ .nanoseconds = @intCast(timeout_ns) },
+                .clock = .awake,
+            });
+
+        while (true) {
+            if (self.closed) return error.PoolClosed;
+
+            if (self.idle.pop()) |idle_conn| {
+                return .{
+                    .pool = self,
+                    .conn_value = idle_conn,
+                };
             }
-            const opened = try conn_mod.Conn.open(self.allocator, self.io, self.config.database);
-            self.open_count += 1;
-            break :blk opened;
-        };
 
-        return .{
-            .pool = self,
-            .conn_value = connection,
-        };
+            if (self.open_count < self.config.max_open) {
+                // Unlock around TCP handshake so other waiters are not stalled.
+                self.open_count += 1;
+                self.mutex.unlock(self.io);
+                const opened = conn_mod.Conn.open(self.allocator, self.io, self.config.database) catch |err| {
+                    self.mutex.lockUncancelable(self.io);
+                    self.open_count -|= 1;
+                    return err;
+                };
+                self.mutex.lockUncancelable(self.io);
+                if (self.closed) {
+                    var doomed = opened;
+                    doomed.deinit();
+                    self.open_count -|= 1;
+                    return error.PoolClosed;
+                }
+                return .{
+                    .pool = self,
+                    .conn_value = opened,
+                };
+            }
+
+            if (deadline) |dl| {
+                const remaining = dl.durationFromNow(self.io);
+                if (remaining.raw.nanoseconds <= 0) return error.PoolTimeout;
+                const slice_ns: i96 = @min(remaining.raw.nanoseconds, @as(i96, std.time.ns_per_ms));
+                self.mutex.unlock(self.io);
+                self.io.sleep(.{ .nanoseconds = slice_ns }, .awake) catch {};
+                self.mutex.lockUncancelable(self.io);
+            } else {
+                return error.PoolExhausted;
+            }
+        }
     }
 
     pub fn exec(self: *Pool, sql: []const u8) !core.ExecResult {
         var lease = try self.acquire();
         errdefer lease.discard() catch {};
-        const result = try lease.conn().exec(sql);
+        const result = try (try lease.conn()).exec(sql);
         try lease.release();
         return result;
     }
@@ -88,7 +129,7 @@ pub const Pool = struct {
     pub fn execParams(self: *Pool, sql: []const u8, binds: []const core.Value) !core.ExecResult {
         var lease = try self.acquire();
         errdefer lease.discard() catch {};
-        const result = try lease.conn().execParams(sql, binds);
+        const result = try (try lease.conn()).execParams(sql, binds);
         try lease.release();
         return result;
     }
@@ -97,14 +138,16 @@ pub const Pool = struct {
     pub fn queryParams(self: *Pool, sql: []const u8, binds: []const core.Value) !PooledRows {
         var lease = try self.acquire();
         errdefer lease.discard() catch {};
-        const rows = try lease.conn().queryParams(sql, binds);
+        const rows = try (try lease.conn()).queryParams(sql, binds);
         return .{
             .lease = lease,
             .rows = rows,
         };
     }
 
-    pub fn stats(self: *const Pool) PoolStats {
+    pub fn stats(self: *Pool) PoolStats {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const idle_count = self.idle.items.len;
         return .{
             .open = self.open_count,
@@ -133,21 +176,34 @@ pub const Lease = struct {
 
     pub fn release(self: *Lease) !void {
         if (!self.open) return error.LeaseClosed;
-        if (self.pool.closed) return error.PoolClosed;
+
+        self.pool.mutex.lockUncancelable(self.pool.io);
+        defer self.pool.mutex.unlock(self.pool.io);
+
+        if (self.pool.closed) {
+            self.conn_value.deinit();
+            self.pool.open_count -|= 1;
+            self.open = false;
+            return error.PoolClosed;
+        }
 
         if (self.pool.idle.items.len < self.pool.effectiveMaxIdle()) {
             try self.pool.idle.append(self.pool.allocator, self.conn_value);
         } else {
             self.conn_value.deinit();
-            self.pool.open_count -= 1;
+            self.pool.open_count -|= 1;
         }
         self.open = false;
     }
 
     pub fn discard(self: *Lease) !void {
         if (!self.open) return error.LeaseClosed;
+
+        self.pool.mutex.lockUncancelable(self.pool.io);
+        defer self.pool.mutex.unlock(self.pool.io);
+
         self.conn_value.deinit();
-        self.pool.open_count -= 1;
+        self.pool.open_count -|= 1;
         self.open = false;
     }
 };
