@@ -25,6 +25,8 @@ const app_buf_len = 16 * 1024;
 pub const Conn = struct {
     allocator: std.mem.Allocator,
     io: Io,
+    /// Connection-local observability hooks (no global registry).
+    hooks: core.Hooks = .{},
     stream: net.Stream,
     /// Encrypted (or plain TCP) stream buffers.
     read_buf: []u8,
@@ -302,6 +304,11 @@ pub const Conn = struct {
         return null;
     }
 
+    /// Replace connection-local query hooks. Pass `.{}` to clear.
+    pub fn setHooks(self: *Conn, hooks: core.Hooks) void {
+        self.hooks = hooks;
+    }
+
     fn clearLastError(self: *Conn) void {
         if (self.last_error) |*owned| {
             owned.deinit(self.allocator);
@@ -375,6 +382,14 @@ pub const Conn = struct {
     /// Prefer extended/parameterized APIs once available for any user values.
     /// This path is intended for DDL, transaction control, and trusted SQL.
     pub fn exec(self: *Conn, sql: []const u8) !core.ExecResult {
+        return self.execObserved(sql, 0, struct {
+            fn run(c: *Conn, s: []const u8) !core.ExecResult {
+                return c.execUnobserved(s);
+            }
+        }.run);
+    }
+
+    fn execUnobserved(self: *Conn, sql: []const u8) !core.ExecResult {
         if (self.closed) return error.ConnectionClosed;
         const packet = try protocol.buildQueryMessage(self.allocator, sql);
         defer self.allocator.free(packet);
@@ -413,6 +428,38 @@ pub const Conn = struct {
     /// Placeholders must use PostgreSQL `$1` style. Values are bound in text
     /// format and never concatenated into the SQL string.
     pub fn execParams(self: *Conn, sql: []const u8, binds: []const core.Value) !core.ExecResult {
+        const observe = !self.hooks.isEmpty();
+        const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
+        if (observe) {
+            self.hooks.emitBefore(.{
+                .driver = .postgres,
+                .sql = sql,
+                .bind_count = binds.len,
+            });
+        }
+        const result = self.execParamsUnobserved(sql, binds) catch |err| {
+            if (observe) {
+                self.hooks.emitAfter(.{
+                    .driver = .postgres,
+                    .sql = sql,
+                    .duration_ns = core.hooks.durationSince(start_ns),
+                    .err = core.hooks.categoryOfErr(err),
+                });
+            }
+            return err;
+        };
+        if (observe) {
+            self.hooks.emitAfter(.{
+                .driver = .postgres,
+                .sql = sql,
+                .duration_ns = core.hooks.durationSince(start_ns),
+                .rows_affected = result.rows_affected,
+            });
+        }
+        return result;
+    }
+
+    fn execParamsUnobserved(self: *Conn, sql: []const u8, binds: []const core.Value) !core.ExecResult {
         if (self.closed) return error.ConnectionClosed;
         try self.sendExtended(sql, binds, false);
 
@@ -444,6 +491,43 @@ pub const Conn = struct {
         }
     }
 
+    fn execObserved(
+        self: *Conn,
+        sql: []const u8,
+        bind_count: usize,
+        comptime run: *const fn (*Conn, []const u8) anyerror!core.ExecResult,
+    ) !core.ExecResult {
+        const observe = !self.hooks.isEmpty();
+        const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
+        if (observe) {
+            self.hooks.emitBefore(.{
+                .driver = .postgres,
+                .sql = sql,
+                .bind_count = bind_count,
+            });
+        }
+        const result = run(self, sql) catch |err| {
+            if (observe) {
+                self.hooks.emitAfter(.{
+                    .driver = .postgres,
+                    .sql = sql,
+                    .duration_ns = core.hooks.durationSince(start_ns),
+                    .err = core.hooks.categoryOfErr(err),
+                });
+            }
+            return err;
+        };
+        if (observe) {
+            self.hooks.emitAfter(.{
+                .driver = .postgres,
+                .sql = sql,
+                .duration_ns = core.hooks.durationSince(start_ns),
+                .rows_affected = result.rows_affected,
+            });
+        }
+        return result;
+    }
+
     /// Cheap liveness check (simple query). Does not change transaction state
     /// when already idle.
     pub fn ping(self: *Conn) !void {
@@ -454,9 +538,57 @@ pub const Conn = struct {
 
     /// Parameterized query via extended protocol; returns owned simple rows.
     pub fn queryParams(self: *Conn, sql: []const u8, binds: []const core.Value) !SimpleRows {
-        if (self.closed) return error.ConnectionClosed;
-        try self.sendExtended(sql, binds, true);
-        return self.collectExtendedRows();
+        const observe = !self.hooks.isEmpty();
+        const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
+        if (observe) {
+            self.hooks.emitBefore(.{
+                .driver = .postgres,
+                .sql = sql,
+                .bind_count = binds.len,
+            });
+        }
+        if (self.closed) {
+            if (observe) {
+                self.hooks.emitAfter(.{
+                    .driver = .postgres,
+                    .sql = sql,
+                    .duration_ns = core.hooks.durationSince(start_ns),
+                    .err = .connection,
+                });
+            }
+            return error.ConnectionClosed;
+        }
+        self.sendExtended(sql, binds, true) catch |err| {
+            if (observe) {
+                self.hooks.emitAfter(.{
+                    .driver = .postgres,
+                    .sql = sql,
+                    .duration_ns = core.hooks.durationSince(start_ns),
+                    .err = core.hooks.categoryOfErr(err),
+                });
+            }
+            return err;
+        };
+        const rows = self.collectExtendedRows() catch |err| {
+            if (observe) {
+                self.hooks.emitAfter(.{
+                    .driver = .postgres,
+                    .sql = sql,
+                    .duration_ns = core.hooks.durationSince(start_ns),
+                    .err = core.hooks.categoryOfErr(err),
+                });
+            }
+            return err;
+        };
+        if (observe) {
+            self.hooks.emitAfter(.{
+                .driver = .postgres,
+                .sql = sql,
+                .duration_ns = core.hooks.durationSince(start_ns),
+                .rows_affected = rows.rows_affected,
+            });
+        }
+        return rows;
     }
 
     /// Query exactly one row. Returns `error.NoRows` / `error.TooManyRows` on
@@ -855,6 +987,38 @@ pub const Conn = struct {
     /// Column text is copied so values outlive the network buffer. Call
     /// `SimpleRows.deinit` when finished.
     pub fn query(self: *Conn, sql: []const u8) !SimpleRows {
+        const observe = !self.hooks.isEmpty();
+        const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
+        if (observe) {
+            self.hooks.emitBefore(.{
+                .driver = .postgres,
+                .sql = sql,
+                .bind_count = 0,
+            });
+        }
+        const rows = self.queryUnobserved(sql) catch |err| {
+            if (observe) {
+                self.hooks.emitAfter(.{
+                    .driver = .postgres,
+                    .sql = sql,
+                    .duration_ns = core.hooks.durationSince(start_ns),
+                    .err = core.hooks.categoryOfErr(err),
+                });
+            }
+            return err;
+        };
+        if (observe) {
+            self.hooks.emitAfter(.{
+                .driver = .postgres,
+                .sql = sql,
+                .duration_ns = core.hooks.durationSince(start_ns),
+                .rows_affected = rows.rows_affected,
+            });
+        }
+        return rows;
+    }
+
+    fn queryUnobserved(self: *Conn, sql: []const u8) !SimpleRows {
         if (self.closed) return error.ConnectionClosed;
         const packet = try protocol.buildQueryMessage(self.allocator, sql);
         defer self.allocator.free(packet);

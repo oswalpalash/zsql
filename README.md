@@ -30,6 +30,7 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 - `zsql.Rows`, `zsql.Row`, `zsql.OwnedRow`, `zsql.Value`, `zsql.OwnedValue`, `zsql.decode`
 - `zsql.ExecResult`, `zsql.Error`, `zsql.DbError`, `zsql.OwnedDbError`
 - `zsql.QueryBuilder`, `zsql.params`, `zsql.migrate`
+- `zsql.Hooks`, `zsql.QueryStart`, `zsql.QueryEnd` (connection-local observability)
 - `zsql.StmtCache` (connection-local prepared-statement name LRU)
 - `zsql.inspect`, `zsql.check`
 - `zsql.drivers.sqlite` (`-Denable-sqlite=true`): full open/exec/query/bind/tx/savepoint/pool/migrator/schema inspect
@@ -185,6 +186,33 @@ try qb.bind(@as(i64, 1)); // Zig scalars OK
 ```
 
 Unsafe raw append is named `rawUnsafe` on purpose.
+
+### Query hooks
+
+Connection-local observability (no global registry). Hooks receive statement text
+and duration — never bind parameter values.
+
+```zig
+var state: Counter = .{};
+conn.setHooks(.{
+    .ctx = &state,
+    .before_query = struct {
+        fn f(ctx: ?*anyopaque, start: zsql.QueryStart) void {
+            _ = ctx;
+            _ = start.sql; // statement only; binds are never included
+        }
+    }.f,
+    .after_query = struct {
+        fn f(ctx: ?*anyopaque, end: zsql.QueryEnd) void {
+            _ = ctx;
+            _ = end.duration_ns;
+            _ = end.rows_affected;
+            _ = end.err; // optional ErrorCategory on failure
+        }
+    }.f,
+});
+// clear: conn.setHooks(.{});
+```
 
 ### Typed row decoding
 

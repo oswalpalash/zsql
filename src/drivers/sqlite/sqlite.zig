@@ -485,10 +485,17 @@ pub const Conn = struct {
     closed: bool = false,
     /// Optional prepared-statement handle cache for this connection.
     prepared_cache: ?PreparedCache = null,
+    /// Connection-local observability hooks (no global registry).
+    hooks: core.Hooks = .{},
 
     pub fn close(self: *Conn) void {
         self.disableStmtCache();
         self.closed = true;
+    }
+
+    /// Replace connection-local query hooks. Pass `.{}` to clear.
+    pub fn setHooks(self: *Conn, hooks: core.Hooks) void {
+        self.hooks = hooks;
     }
 
     /// Enable a connection-local prepared statement handle cache.
@@ -537,9 +544,37 @@ pub const Conn = struct {
     }
 
     pub fn exec(self: *Conn, sql: []const u8, binds: []const core.Value) !core.ExecResult {
+        const observe = !self.hooks.isEmpty();
+        const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
+        if (observe) {
+            self.hooks.emitBefore(.{
+                .driver = .sqlite,
+                .sql = sql,
+                .bind_count = binds.len,
+            });
+        }
         var prepared = try self.prepareCached(sql);
         defer prepared.release();
-        return prepared.stmt.exec(binds);
+        const result = prepared.stmt.exec(binds) catch |err| {
+            if (observe) {
+                self.hooks.emitAfter(.{
+                    .driver = .sqlite,
+                    .sql = sql,
+                    .duration_ns = core.hooks.durationSince(start_ns),
+                    .err = core.hooks.categoryOfErr(err),
+                });
+            }
+            return err;
+        };
+        if (observe) {
+            self.hooks.emitAfter(.{
+                .driver = .sqlite,
+                .sql = sql,
+                .duration_ns = core.hooks.durationSince(start_ns),
+                .rows_affected = result.rows_affected,
+            });
+        }
+        return result;
     }
 
     pub fn execScript(self: *Conn, sql: []const u8) !void {
@@ -548,9 +583,47 @@ pub const Conn = struct {
     }
 
     pub fn query(self: *Conn, sql: []const u8, binds: []const core.Value) !Rows {
-        var prepared = try self.prepareCached(sql);
+        // Hooks fire for prepare/bind start; row iteration is not instrumented.
+        const observe = !self.hooks.isEmpty();
+        const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
+        if (observe) {
+            self.hooks.emitBefore(.{
+                .driver = .sqlite,
+                .sql = sql,
+                .bind_count = binds.len,
+            });
+        }
+        var prepared = self.prepareCached(sql) catch |err| {
+            if (observe) {
+                self.hooks.emitAfter(.{
+                    .driver = .sqlite,
+                    .sql = sql,
+                    .duration_ns = core.hooks.durationSince(start_ns),
+                    .err = core.hooks.categoryOfErr(err),
+                });
+            }
+            return err;
+        };
         errdefer prepared.release();
-        return Rows.initOwned(prepared.stmt, binds, !prepared.from_cache);
+        const rows = Rows.initOwned(prepared.stmt, binds, !prepared.from_cache) catch |err| {
+            if (observe) {
+                self.hooks.emitAfter(.{
+                    .driver = .sqlite,
+                    .sql = sql,
+                    .duration_ns = core.hooks.durationSince(start_ns),
+                    .err = core.hooks.categoryOfErr(err),
+                });
+            }
+            return err;
+        };
+        if (observe) {
+            self.hooks.emitAfter(.{
+                .driver = .sqlite,
+                .sql = sql,
+                .duration_ns = core.hooks.durationSince(start_ns),
+            });
+        }
+        return rows;
     }
 
     /// Query exactly one row into an owned row. Returns `error.NoRows` or
@@ -1652,6 +1725,61 @@ test "SQLite opens memory database and rejects row-returning exec" {
     defer conn.close();
 
     try std.testing.expectError(error.UnexpectedRow, conn.exec("select ?", &.{.{ .integer = 1 }}));
+}
+
+test "SQLite query hooks fire without bind values" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    const State = struct {
+        before: usize = 0,
+        after: usize = 0,
+        last_sql: []const u8 = "",
+        last_binds: usize = 0,
+        last_rows: ?u64 = null,
+        saw_secret: bool = false,
+    };
+    var state: State = .{};
+    conn.setHooks(.{
+        .ctx = &state,
+        .before_query = struct {
+            fn f(ctx: ?*anyopaque, start: core.QueryStart) void {
+                const s: *State = @ptrCast(@alignCast(ctx.?));
+                s.before += 1;
+                s.last_sql = start.sql;
+                s.last_binds = start.bind_count;
+                if (std.mem.indexOf(u8, start.sql, "secret") != null) s.saw_secret = true;
+            }
+        }.f,
+        .after_query = struct {
+            fn f(ctx: ?*anyopaque, end: core.QueryEnd) void {
+                const s: *State = @ptrCast(@alignCast(ctx.?));
+                s.after += 1;
+                s.last_rows = end.rows_affected;
+            }
+        }.f,
+    });
+
+    _ = try conn.exec(
+        "create table hooks_t (id integer primary key, name text)",
+        &.{},
+    );
+    _ = try conn.exec(
+        "insert into hooks_t (name) values (?)",
+        &.{.{ .text = "secret-value-never-in-sql" }},
+    );
+
+    try std.testing.expect(state.before >= 2);
+    try std.testing.expect(state.after >= 2);
+    try std.testing.expectEqual(@as(usize, 1), state.last_binds);
+    try std.testing.expect(state.last_rows != null);
+    try std.testing.expect(!state.saw_secret);
+    try std.testing.expect(std.mem.indexOf(u8, state.last_sql, "insert into hooks_t") != null);
+    // Bound secret must never appear in hook SQL.
+    try std.testing.expect(std.mem.indexOf(u8, state.last_sql, "secret-value") == null);
 }
 
 test "SQLite prepares and finalizes statements" {
