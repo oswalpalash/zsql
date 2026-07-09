@@ -105,11 +105,11 @@ test "category mapping covers core errors" {
 }
 
 test "sqlstate mapping" {
-    try std.testing.expectError(error.ConstraintViolation, DbError.errorFromSqlState("23505"));
-    try std.testing.expectError(error.AuthFailed, DbError.errorFromSqlState("28P01"));
-    try std.testing.expectError(error.InvalidSql, DbError.errorFromSqlState("42601"));
-    try std.testing.expectError(error.TypeMismatch, DbError.errorFromSqlState("22003"));
-    try std.testing.expectError(error.ConnectionClosed, DbError.errorFromSqlState("08006"));
+    try std.testing.expect(DbError.errorFromSqlState("23505") == error.ConstraintViolation);
+    try std.testing.expect(DbError.errorFromSqlState("28P01") == error.AuthFailed);
+    try std.testing.expect(DbError.errorFromSqlState("42601") == error.InvalidSql);
+    try std.testing.expect(DbError.errorFromSqlState("22003") == error.TypeMismatch);
+    try std.testing.expect(DbError.errorFromSqlState("08006") == error.ConnectionClosed);
 }
 
 // Keep Error import used for documentation of the dual error surface.
