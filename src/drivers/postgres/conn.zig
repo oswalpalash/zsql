@@ -182,12 +182,12 @@ pub const Conn = struct {
                     rows_affected = types.parseCommandTag(tag).rows_affected;
                 },
                 .empty_query_response => {},
+                .parameter_status, .notice_response, .notification_response => {},
                 .ready_for_query => {
                     self.tx_status = try protocol.parseReadyForQuery(msg.body);
                     return .{ .rows_affected = rows_affected };
                 },
                 .error_response => return self.failFromErrorResponse(msg.body, true),
-                .notice_response => {},
                 .row_description, .data_row => {
                     self.drainUntilReady();
                     return error.UnexpectedRow;
@@ -214,6 +214,7 @@ pub const Conn = struct {
             defer self.allocator.free(msg.body);
             switch (msg.tag) {
                 .parse_complete, .bind_complete, .no_data => {},
+                .parameter_status, .notice_response, .notification_response => {},
                 .command_complete => {
                     const tag = try protocol.parseCommandComplete(msg.body);
                     rows_affected = types.parseCommandTag(tag).rows_affected;
@@ -223,7 +224,6 @@ pub const Conn = struct {
                     return .{ .rows_affected = rows_affected };
                 },
                 .error_response => return self.failFromErrorResponse(msg.body, true),
-                .notice_response => {},
                 .row_description, .data_row => {
                     self.drainUntilReady();
                     return error.UnexpectedRow;
@@ -474,7 +474,7 @@ pub const Conn = struct {
                     };
                 },
                 .error_response => return self.failFromErrorResponse(msg.body, true),
-                .notice_response => {},
+                .parameter_status, .notice_response, .notification_response => {},
                 else => {
                     self.drainUntilReady();
                     return error.ProtocolError;
@@ -563,7 +563,7 @@ pub const Conn = struct {
                     };
                 },
                 .error_response => return self.failFromErrorResponse(msg.body, true),
-                .notice_response => {},
+                .parameter_status, .notice_response, .notification_response => {},
                 else => {
                     self.drainUntilReady();
                     return error.ProtocolError;
