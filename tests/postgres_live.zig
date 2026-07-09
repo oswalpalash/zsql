@@ -409,8 +409,12 @@ test "postgres live: statement_timeout maps to QueryTimeout" {
     defer conn.deinit();
 
     try conn.setStatementTimeoutMs(50);
-    // pg_sleep is in seconds; 1s exceeds 50ms statement_timeout.
-    try std.testing.expectError(error.QueryTimeout, conn.exec("select pg_sleep(1)"));
+    // Use a non-row DO block so exec does not see RowDescription first.
+    // pg_sleep is in seconds; 1s exceeds 50ms statement_timeout → SQLSTATE 57014.
+    try std.testing.expectError(
+        error.QueryTimeout,
+        conn.exec("do $$ begin perform pg_sleep(1); end $$"),
+    );
     // Connection remains usable after timeout cancel.
     try conn.setStatementTimeoutMs(0);
     var rows = try conn.query("select 1::int as n");
