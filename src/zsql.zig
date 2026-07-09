@@ -11,14 +11,17 @@ pub const ExecResult = @import("core/exec_result.zig").ExecResult;
 pub const Stmt = @import("core/stmt.zig").Stmt;
 pub const Conn = @import("core/conn.zig").Conn;
 pub const Database = @import("core/database.zig").Database;
+pub const QueryBuilder = @import("core/query.zig").QueryBuilder;
 pub const params = @import("core/params.zig");
 pub const migrate = @import("migrate/migrate.zig");
+pub const inspect = @import("check/inspect.zig");
+pub const check = @import("check/checker.zig");
 const options = @import("zsql_options");
 
 pub const drivers = struct {
     pub const sqlite = if (options.enable_sqlite) @import("drivers/sqlite/sqlite.zig") else unavailable.sqlite;
-    /// Pure-Zig PostgreSQL driver surface. URL and protocol helpers are always
-    /// available; live network I/O is added in later slices.
+    /// Native PostgreSQL driver (no libpq): URL, SCRAM/MD5/cleartext, simple and
+    /// extended query, transactions, savepoints, and connection pooling.
     pub const postgres = @import("drivers/postgres/postgres.zig");
 };
 
@@ -38,7 +41,10 @@ test {
     _ = @import("core/conn.zig");
     _ = @import("core/database.zig");
     _ = @import("core/params.zig");
+    _ = @import("core/query.zig");
     _ = @import("migrate/migrate.zig");
+    _ = @import("check/inspect.zig");
+    _ = @import("check/checker.zig");
     _ = @import("drivers/postgres/postgres.zig");
     if (options.enable_sqlite) {
         _ = @import("drivers/sqlite/sqlite.zig");
