@@ -393,3 +393,56 @@ test "postgres live: pool acquire release" {
     try std.testing.expect(stats.open >= 1);
     try std.testing.expectEqual(@as(usize, 0), stats.leased);
 }
+
+test "postgres live: statement_timeout maps to QueryTimeout" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+
+    var conn = try pg.Conn.open(allocator, io, config);
+    defer conn.deinit();
+
+    try conn.setStatementTimeoutMs(50);
+    // pg_sleep is in seconds; 1s exceeds 50ms statement_timeout.
+    try std.testing.expectError(error.QueryTimeout, conn.exec("select pg_sleep(1)"));
+    // Connection remains usable after timeout cancel.
+    try conn.setStatementTimeoutMs(0);
+    var rows = try conn.query("select 1::int as n");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try rows.next().?.as(i64, 0));
+}
+
+test "postgres live: SimpleRow as/to decode" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+
+    var conn = try pg.Conn.open(allocator, io, config);
+    defer conn.deinit();
+
+    var rows = try conn.queryParams(
+        "select $1::bigint as id, $2::text as name, $3::boolean as active",
+        &.{ .{ .integer = 9 }, .{ .text = "grace" }, .{ .boolean = true } },
+    );
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRows;
+    try std.testing.expectEqual(@as(i64, 9), try row.as(i64, 0));
+    try std.testing.expectEqualStrings("grace", try row.asName([]const u8, "name"));
+    const User = struct { id: i64, name: []const u8, active: bool };
+    const user = try row.to(User);
+    try std.testing.expectEqual(@as(i64, 9), user.id);
+    try std.testing.expectEqualStrings("grace", user.name);
+    try std.testing.expect(user.active);
+}

@@ -94,6 +94,7 @@ pub const Conn = struct {
         errdefer conn.deinitTransportOnly();
         try conn.attachPeerCert(config);
         try conn.startup(config);
+        try conn.applySessionSettings(config);
         return conn;
     }
 
@@ -110,6 +111,7 @@ pub const Conn = struct {
                 errdefer conn.deinitTransportOnly();
                 try conn.attachPeerCert(config);
                 try conn.startup(config);
+                try conn.applySessionSettings(config);
                 return conn;
             },
             .accepts_tls => {
@@ -117,6 +119,7 @@ pub const Conn = struct {
                 try conn.upgradeTls(config.host, .none);
                 try conn.attachPeerCert(config);
                 try conn.startup(config);
+                try conn.applySessionSettings(config);
                 return conn;
             },
         }
@@ -132,7 +135,26 @@ pub const Conn = struct {
         try conn.upgradeTls(config.host, verify);
         try conn.attachPeerCert(config);
         try conn.startup(config);
+        try conn.applySessionSettings(config);
         return conn;
+    }
+
+    /// Apply post-startup session settings from config (statement_timeout, …).
+    /// Uses the unobserved simple-query path so connect-time setup does not
+    /// fire user query hooks.
+    fn applySessionSettings(self: *Conn, config: url.Config) !void {
+        if (config.statement_timeout_ms) |ms| {
+            try self.setStatementTimeoutMs(ms);
+        }
+    }
+
+    /// Set PostgreSQL `statement_timeout` in milliseconds (`0` disables).
+    /// Server cancellations map to `error.QueryTimeout` (SQLSTATE 57014).
+    pub fn setStatementTimeoutMs(self: *Conn, ms: u32) !void {
+        var buf: [64]u8 = undefined;
+        // Bare integer means milliseconds in PostgreSQL.
+        const sql = try std.fmt.bufPrint(&buf, "set statement_timeout to {d}", .{ms});
+        _ = try self.execUnobserved(sql);
     }
 
     fn upgradeTls(self: *Conn, host: []const u8, verify: VerifyMode) !void {

@@ -139,6 +139,11 @@ var conn = try zsql.drivers.postgres.Conn.open(allocator, io, config);
 
 URL query: `channel_binding=disable|prefer|require` (libpq-compatible).
 
+Optional `statement_timeout=<ms>` sets PostgreSQL `statement_timeout` after
+startup (integer milliseconds; `0` disables). Server cancellations map to
+`error.QueryTimeout`. You can also call `conn.setStatementTimeoutMs(ms)` at
+runtime.
+
 Failed commands map SQLSTATE into fine-grained errors (`UniqueViolation`, `ForeignKeyViolation`, …) and store rich metadata on the connection:
 
 ```zig

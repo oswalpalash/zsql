@@ -77,6 +77,10 @@ pub const Config = struct {
     application_name: []u8,
     /// Optional connect timeout in seconds from `connect_timeout=`.
     connect_timeout_secs: ?u32 = null,
+    /// Optional statement timeout in milliseconds from `statement_timeout=`.
+    /// Applied after startup via `SET statement_timeout`. `0` disables.
+    /// Timed-out queries surface as `error.QueryTimeout` (SQLSTATE 57014).
+    statement_timeout_ms: ?u32 = null,
     /// Optional borrowed leaf certificate DER for SCRAM-SHA-256-PLUS
     /// `tls-server-end-point` when the TLS stack cannot expose the peer cert
     /// (TLS 1.3 via `std.crypto.tls.Client`). Not freed by `deinit`.
@@ -148,6 +152,7 @@ pub fn parse(allocator: std.mem.Allocator, url: []const u8) !Config {
     var channel_binding: ChannelBindingMode = .prefer;
     var application_name: []const u8 = "zsql";
     var connect_timeout_secs: ?u32 = null;
+    var statement_timeout_ms: ?u32 = null;
 
     if (uri.query) |query_component| {
         const query_raw = try componentToOwned(arena, query_component);
@@ -165,6 +170,8 @@ pub fn parse(allocator: std.mem.Allocator, url: []const u8) !Config {
                 application_name = value;
             } else if (std.ascii.eqlIgnoreCase(key, "connect_timeout")) {
                 connect_timeout_secs = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidUrl;
+            } else if (std.ascii.eqlIgnoreCase(key, "statement_timeout")) {
+                statement_timeout_ms = std.fmt.parseUnsigned(u32, value, 10) catch return error.InvalidUrl;
             } else {
                 // Unknown query keys are ignored so drivers can grow support
                 // without breaking existing URLs.
@@ -200,6 +207,7 @@ pub fn parse(allocator: std.mem.Allocator, url: []const u8) !Config {
         .channel_binding = channel_binding,
         .application_name = application,
         .connect_timeout_secs = connect_timeout_secs,
+        .statement_timeout_ms = statement_timeout_ms,
         .peer_cert_der = null,
     };
 }
@@ -219,7 +227,7 @@ fn componentToOwned(allocator: std.mem.Allocator, component: std.Uri.Component) 
 test "parse postgres URL with auth host port database and params" {
     var config = try parse(
         std.testing.allocator,
-        "postgres://ada:s3cret%21@db.example:6543/appdb?sslmode=disable&application_name=zsql-test&connect_timeout=10",
+        "postgres://ada:s3cret%21@db.example:6543/appdb?sslmode=disable&application_name=zsql-test&connect_timeout=10&statement_timeout=2500",
     );
     defer config.deinit();
 
@@ -231,6 +239,7 @@ test "parse postgres URL with auth host port database and params" {
     try std.testing.expect(config.ssl_mode == .disable);
     try std.testing.expectEqualStrings("zsql-test", config.application_name);
     try std.testing.expectEqual(@as(?u32, 10), config.connect_timeout_secs);
+    try std.testing.expectEqual(@as(?u32, 2500), config.statement_timeout_ms);
 }
 
 test "parse postgresql scheme defaults and percent-decoded user" {
