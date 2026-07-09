@@ -77,6 +77,24 @@ defer one.deinit();
 
 SQLite has the same idea as `Conn.queryOne(sql, binds)`. Pools expose `Pool.queryOne` / `Pool.queryOneParams` (lease held only for the fetch).
 
+Scoped transactions via `withTx` (commit on success, rollback on error):
+
+```zig
+// SQLite: body receives *Tx
+try conn.withTx({}, struct {
+    fn run(_: void, tx: *zsql.drivers.sqlite.Tx) !void {
+        _ = try tx.exec("insert into t (id) values (?)", &.{.{ .integer = 1 }});
+    }
+}.run);
+
+// Postgres: body receives *Conn (tx state lives on the connection)
+try pg_conn.withTx({}, struct {
+    fn run(_: void, c: *zsql.drivers.postgres.Conn) !void {
+        _ = try c.execParams("insert into t (n) values ($1)", &.{.{ .integer = 1 }});
+    }
+}.run);
+```
+
 Pool acquire timeout: `0` = non-blocking, `std.math.maxInt(u64)` = wait forever (condition), any other value = timed wait (event signal on release).
 
 TLS uses Zig's `std.crypto.tls.Client` (no OpenSSL). Behavior by `sslmode`:

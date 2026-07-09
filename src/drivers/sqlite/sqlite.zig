@@ -300,6 +300,14 @@ pub const Pool = struct {
         try lease.release();
     }
 
+    /// Acquire a lease, run `body` in a transaction, then release the lease.
+    pub fn withTx(self: *Pool, ctx: anytype, comptime body: *const fn (@TypeOf(ctx), *Tx) anyerror!void) !void {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        try (try lease.conn()).withTx(ctx, body);
+        try lease.release();
+    }
+
     pub fn stats(self: *Pool) PoolStats {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -572,6 +580,31 @@ pub const Conn = struct {
         return .{
             .conn = self,
         };
+    }
+
+    /// Run `body(ctx, tx)` inside a deferred transaction. Commits on success;
+    /// rolls back if `body` returns an error (via `errdefer`).
+    ///
+    /// ```zig
+    /// try conn.withTx({}, struct {
+    ///     fn run(_: void, tx: *Tx) !void {
+    ///         _ = try tx.exec("insert into t (id) values (?)", &.{.{ .integer = 1 }});
+    ///     }
+    /// }.run);
+    /// ```
+    pub fn withTx(self: *Conn, ctx: anytype, comptime body: *const fn (@TypeOf(ctx), *Tx) anyerror!void) !void {
+        var tx = try self.begin();
+        errdefer tx.rollbackIfOpen();
+        try body(ctx, &tx);
+        try tx.commit();
+    }
+
+    /// Same as `withTx` but starts with `BEGIN IMMEDIATE` (writer lock early).
+    pub fn withTxImmediate(self: *Conn, ctx: anytype, comptime body: *const fn (@TypeOf(ctx), *Tx) anyerror!void) !void {
+        var tx = try self.beginImmediate();
+        errdefer tx.rollbackIfOpen();
+        try body(ctx, &tx);
+        try tx.commit();
     }
 
     /// Inspect user tables via `sqlite_master` + `PRAGMA table_info`.
@@ -1445,6 +1478,38 @@ test "SQLite open applies busy_timeout_ms" {
     defer conn.close();
     // Setting busy timeout must not break basic query use.
     try conn.ping();
+}
+
+test "SQLite withTx commits on success and rolls back on error" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table with_tx (id integer primary key)", &.{});
+
+    try conn.withTx({}, struct {
+        fn run(_: void, tx: *Tx) !void {
+            _ = try tx.exec("insert into with_tx (id) values (?)", &.{.{ .integer = 1 }});
+        }
+    }.run);
+
+    var rows = try conn.query("select id from with_tx", &.{});
+    defer rows.deinit();
+    try std.testing.expect((try rows.next()) != null);
+
+    const failed = conn.withTx({}, struct {
+        fn run(_: void, tx: *Tx) !void {
+            _ = try tx.exec("insert into with_tx (id) values (?)", &.{.{ .integer = 2 }});
+            return error.DriverError;
+        }
+    }.run);
+    try std.testing.expectError(error.DriverError, failed);
+
+    var count_rows = try conn.query("select count(*) as n from with_tx", &.{});
+    defer count_rows.deinit();
+    const count_row = (try count_rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 1), try (try count_row.value("n")).asInt());
 }
 
 test "SQLite queryOne enforces single-row cardinality" {

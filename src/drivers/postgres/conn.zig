@@ -480,6 +480,24 @@ pub const Conn = struct {
         self.rollback() catch {};
     }
 
+    /// Run `body(ctx, conn)` inside a transaction. Commits on success; rolls
+    /// back if `body` returns an error. Postgres keeps transaction state on
+    /// the connection (no separate Tx object).
+    ///
+    /// ```zig
+    /// try conn.withTx({}, struct {
+    ///     fn run(_: void, c: *Conn) !void {
+    ///         _ = try c.execParams("insert into t (n) values ($1)", &.{.{ .integer = 1 }});
+    ///     }
+    /// }.run);
+    /// ```
+    pub fn withTx(self: *Conn, ctx: anytype, comptime body: *const fn (@TypeOf(ctx), *Conn) anyerror!void) !void {
+        try self.begin();
+        errdefer self.rollbackIfOpen();
+        try body(ctx, self);
+        try self.commit();
+    }
+
     /// Inspect base tables via `information_schema` for offline query checks.
     ///
     /// Caller owns the returned schema; free with `freeInspectedSchema`.
