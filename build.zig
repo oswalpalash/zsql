@@ -39,6 +39,30 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run zsql tests");
     test_step.dependOn(&run_tests.step);
 
+    // CLI
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("cli/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_mod.addImport("zsql", zsql_mod);
+    if (enable_sqlite) {
+        cli_mod.link_libc = true;
+        cli_mod.linkSystemLibrary("sqlite3", .{
+            .needed = true,
+            .use_pkg_config = .yes,
+        });
+    }
+    const cli_exe = b.addExecutable(.{
+        .name = "zsql",
+        .root_module = cli_mod,
+    });
+    b.installArtifact(cli_exe);
+    const run_cli = b.addRunArtifact(cli_exe);
+    if (b.args) |args| run_cli.addArgs(args);
+    const run_step = b.step("run", "Run the zsql CLI");
+    run_step.dependOn(&run_cli.step);
+
     const sqlite_example_step = b.step("sqlite-example", "Run the SQLite GPA leak-checked example");
     const sqlite_migrate_example_step = b.step("sqlite-migrate-example", "Run the SQLite migration GPA leak-checked example");
     if (enable_sqlite) {

@@ -2,6 +2,8 @@ const std = @import("std");
 const core = @import("../../zsql.zig");
 const c = @import("c.zig");
 
+pub const enabled = true;
+
 pub const OpenMode = enum {
     memory,
     file,
@@ -362,7 +364,83 @@ pub const Conn = struct {
             .conn = self,
         };
     }
+
+    /// Inspect user tables via `sqlite_master` + `PRAGMA table_info`.
+    /// Caller owns the returned schema graph; free with `freeInspectedSchema`.
+    pub fn inspectSchema(self: *Conn, allocator: std.mem.Allocator) !core.inspect.Schema {
+        var tables_list: std.ArrayListUnmanaged(core.inspect.Table) = .empty;
+        errdefer freeInspectedTables(allocator, tables_list.items);
+
+        var table_rows = try self.query(
+            \\select name from sqlite_master
+            \\where type = 'table' and name not like 'sqlite_%'
+            \\order by name
+        , &.{});
+        defer table_rows.deinit();
+
+        while (try table_rows.next()) |row| {
+            const table_name = try (try row.value("name")).asText();
+            const owned_name = try allocator.dupe(u8, table_name);
+            errdefer allocator.free(owned_name);
+
+            var pragma_sql_buf: [256]u8 = undefined;
+            // table name comes from sqlite_master, not user input.
+            const pragma_sql = try std.fmt.bufPrint(&pragma_sql_buf, "pragma table_info({s})", .{table_name});
+            var col_rows = try self.query(pragma_sql, &.{});
+            defer col_rows.deinit();
+
+            var cols: std.ArrayListUnmanaged(core.inspect.Column) = .empty;
+            errdefer {
+                for (cols.items) |c_| {
+                    allocator.free(c_.name);
+                    allocator.free(c_.type_name);
+                }
+                cols.deinit(allocator);
+            }
+
+            while (try col_rows.next()) |col_row| {
+                const cname = try allocator.dupe(u8, try (try col_row.value("name")).asText());
+                errdefer allocator.free(cname);
+                const ctype = try allocator.dupe(u8, try (try col_row.value("type")).asText());
+                errdefer allocator.free(ctype);
+                const notnull = (try (try col_row.value("notnull")).asInt()) != 0;
+                const pk = (try (try col_row.value("pk")).asInt()) != 0;
+                try cols.append(allocator, .{
+                    .name = cname,
+                    .type_name = ctype,
+                    .nullable = !notnull and !pk,
+                    .primary_key = pk,
+                });
+            }
+
+            const columns = try cols.toOwnedSlice(allocator);
+            try tables_list.append(allocator, .{
+                .name = owned_name,
+                .columns = columns,
+            });
+        }
+
+        return .{
+            .tables = try tables_list.toOwnedSlice(allocator),
+        };
+    }
 };
+
+pub fn freeInspectedSchema(allocator: std.mem.Allocator, schema: core.inspect.Schema) void {
+    freeInspectedTables(allocator, @constCast(schema.tables));
+}
+
+fn freeInspectedTables(allocator: std.mem.Allocator, tables: []core.inspect.Table) void {
+    for (tables) |table| {
+        allocator.free(table.name);
+        for (table.columns) |col| {
+            allocator.free(col.name);
+            allocator.free(col.type_name);
+        }
+        allocator.free(table.columns);
+    }
+    allocator.free(tables);
+}
 
 pub fn ensureMigrationTable(conn: *Conn) !void {
     _ = try conn.exec(
@@ -938,6 +1016,31 @@ fn findMigrationRecord(records: []const MigrationRecord, version: u64) ?Migratio
         if (record.version == version) return record;
     }
     return null;
+}
+
+test "SQLite inspectSchema exports tables and columns" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec(
+        \\create table inspect_users (
+        \\  id integer primary key,
+        \\  email text not null,
+        \\  bio text
+        \\)
+    , &.{});
+
+    const schema = try conn.inspectSchema(std.testing.allocator);
+    defer freeInspectedSchema(std.testing.allocator, schema);
+
+    try std.testing.expectEqual(@as(usize, 1), schema.tables.len);
+    try std.testing.expectEqualStrings("inspect_users", schema.tables[0].name);
+    try std.testing.expectEqual(@as(usize, 3), schema.tables[0].columns.len);
+    try std.testing.expect(schema.tables[0].columns[0].primary_key);
+    try std.testing.expect(!schema.tables[0].columns[1].nullable);
+    try std.testing.expect(schema.tables[0].columns[2].nullable);
 }
 
 test "SQLite opens memory database and rejects row-returning exec" {
