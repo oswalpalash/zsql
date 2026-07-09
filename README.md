@@ -219,6 +219,9 @@ conn.setHooks(.{
 // clear: conn.setHooks(.{});
 ```
 
+Pools accept the same hooks on `PoolConfig.hooks` and apply them to every
+acquired connection.
+
 ### Typed row decoding
 
 ```zig

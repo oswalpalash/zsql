@@ -203,6 +203,8 @@ fn valueLiteralToValue(value: anytype) Value {
 
 fn quoteIdent(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, name: []const u8) !void {
     if (name.len == 0) return error.InvalidArguments;
+    // Identifiers must not embed NUL; drivers and protocol frames treat NUL as terminator.
+    if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidArguments;
     try list.append(allocator, '"');
     for (name) |c| {
         if (c == '"') {
@@ -250,6 +252,13 @@ test "QueryBuilder.identSegments quotes each segment" {
     try std.testing.expectEqualStrings("\"public\".\"users\".\"email\"", qb.sqlSlice());
     try std.testing.expectError(error.InvalidArguments, qb.identSegments(&.{}));
     try std.testing.expectError(error.InvalidArguments, qb.identSegments(&.{ "ok", "" }));
+}
+
+test "QueryBuilder.ident rejects embedded NUL" {
+    var qb = QueryBuilder.init(std.testing.allocator, .sqlite);
+    defer qb.deinit();
+    try std.testing.expectError(error.InvalidArguments, qb.ident("bad\x00name"));
+    try std.testing.expectError(error.InvalidArguments, qb.identPath("ok.bad\x00x"));
 }
 
 test "QueryBuilder escapes embedded quotes in identifiers" {

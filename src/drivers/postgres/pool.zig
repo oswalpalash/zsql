@@ -17,6 +17,9 @@ pub const PoolConfig = struct {
     /// When non-zero, each newly opened connection enables a statement cache
     /// of this size via `Conn.enableStmtCache`. Zero leaves caching off.
     stmt_cache_size: usize = 0,
+    /// Applied to every connection handed out by the pool (new or idle).
+    /// Connection-local; no global registry. Bind values are never included.
+    hooks: core.Hooks = .{},
 };
 
 pub const PoolStats = struct {
@@ -83,9 +86,11 @@ pub const Pool = struct {
             if (self.closed) return error.PoolClosed;
 
             if (self.idle.pop()) |idle_conn| {
+                var c = idle_conn;
+                c.setHooks(self.config.hooks);
                 return .{
                     .pool = self,
-                    .conn_value = idle_conn,
+                    .conn_value = c,
                 };
             }
 
@@ -98,6 +103,7 @@ pub const Pool = struct {
                     self.open_count -|= 1;
                     return err;
                 };
+                opened.setHooks(self.config.hooks);
                 if (self.config.stmt_cache_size > 0) {
                     opened.enableStmtCache(self.config.stmt_cache_size) catch |err| {
                         opened.deinit();

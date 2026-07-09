@@ -101,6 +101,9 @@ pub const PoolConfig = struct {
     /// When non-zero, each newly opened connection enables a prepared-statement
     /// handle cache of this size. Zero leaves caching off (default).
     stmt_cache_size: usize = 0,
+    /// Applied to every connection handed out by the pool (new or reconnected
+    /// from idle). Connection-local; no global registry.
+    hooks: core.Hooks = .{},
 };
 
 pub const PoolStats = struct {
@@ -183,7 +186,8 @@ pub const Pool = struct {
                     db.deinit();
                     self.open_count -|= 1;
                 }
-                const conn = try db.connect();
+                var conn = try db.connect();
+                try self.configureConn(&conn);
                 return .{
                     .pool = self,
                     .db = db,
@@ -199,9 +203,7 @@ pub const Pool = struct {
                     self.open_count -|= 1;
                 }
                 var conn = try opened.connect();
-                if (self.config.stmt_cache_size > 0) {
-                    try conn.enableStmtCache(self.config.stmt_cache_size);
-                }
+                try self.configureConn(&conn);
                 return .{
                     .pool = self,
                     .db = opened,
@@ -220,6 +222,13 @@ pub const Pool = struct {
             } else {
                 return error.PoolExhausted;
             }
+        }
+    }
+
+    fn configureConn(self: *Pool, conn: *Conn) !void {
+        conn.setHooks(self.config.hooks);
+        if (self.config.stmt_cache_size > 0) {
+            try conn.enableStmtCache(self.config.stmt_cache_size);
         }
     }
 
@@ -2203,6 +2212,30 @@ test "SQLite pool releases and reuses leases" {
     defer rows.deinit();
     const row = (try rows.next()).?;
     try std.testing.expectEqual(@as(i64, 1), try (try row.value("id")).asInt());
+}
+
+test "SQLite pool applies default hooks on acquire" {
+    const State = struct { after: usize = 0 };
+    var state: State = .{};
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{
+        .max_open = 1,
+        .hooks = .{
+            .ctx = &state,
+            .after_query = struct {
+                fn f(ctx: ?*anyopaque, end: core.QueryEnd) void {
+                    const s: *State = @ptrCast(@alignCast(ctx.?));
+                    s.after += 1;
+                    _ = end;
+                }
+            }.f,
+        },
+    });
+    defer pool.deinit();
+
+    var lease = try pool.acquire();
+    defer lease.release() catch {};
+    _ = try (try lease.conn()).exec("create table pool_hooks (id integer)", &.{});
+    try std.testing.expect(state.after >= 1);
 }
 
 test "SQLite pool max idle closes excess released leases" {
