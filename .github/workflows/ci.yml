@@ -25,6 +25,12 @@ jobs:
       - name: Test (default)
         run: zig build test
 
+      - name: CLI doctor
+        run: zig build run -- doctor
+
+      - name: Offline checked-queries example
+        run: zig build checked-queries-example
+
       - name: Install system SQLite
         run: |
           sudo apt-get update

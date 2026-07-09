@@ -36,23 +36,15 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         if (std.mem.eql(u8, sub, "status") or std.mem.eql(u8, sub, "up")) {
-            try writeOut(io, .stderr,
-                \\zsql migrate status|up requires a database connection.
-                \\Use the library Migrator API (SQLite) for apply/status today.
-                \\
-            );
-            return error.Unsupported;
+            try cmdMigrateDb(init, sub, &args);
+            return;
         }
         try printMigrateHelp(io);
         return error.InvalidArguments;
     }
     if (std.mem.eql(u8, command, "inspect")) {
-        try writeOut(io, .stderr,
-            \\zsql inspect is a placeholder until live schema export is wired to drivers.
-            \\Library helpers: zsql.inspect.writeSchemaZon / columnsFromSqliteTableInfo.
-            \\
-        );
-        return error.Unsupported;
+        try cmdInspect(init, &args);
+        return;
     }
 
     try writeOut(io, .stderr, "unknown command; try `zsql --help`\n");
@@ -76,11 +68,12 @@ fn printHelp(io: std.Io) !void {
         \\Usage:
         \\  zsql doctor
         \\  zsql migrate new <name>
-        \\  zsql migrate status   (requires DB; library API preferred for now)
-        \\  zsql migrate up       (requires DB; library API preferred for now)
-        \\  zsql inspect          (placeholder)
+        \\  zsql migrate status --database <path> [--dir migrations]
+        \\  zsql migrate up --database <path> [--dir migrations]
+        \\  zsql inspect --database <path> [--out schema.zon]
         \\  zsql --help
         \\
+        \\SQLite migrate/inspect require a build with -Denable-sqlite=true.
         \\zsql is not an ORM. Prefer prepared statements and bind parameters.
         \\
     );
@@ -90,8 +83,8 @@ fn printMigrateHelp(io: std.Io) !void {
     try writeOut(io, .stderr,
         \\usage:
         \\  zsql migrate new <name>
-        \\  zsql migrate status
-        \\  zsql migrate up
+        \\  zsql migrate status --database <path> [--dir migrations]
+        \\  zsql migrate up --database <path> [--dir migrations]
         \\
     );
 }
@@ -100,7 +93,7 @@ fn cmdDoctor(io: std.Io) !void {
     try writeOut(io, .stdout, "zsql doctor\n");
     try writeOut(io, .stdout, "  package: zsql\n");
     try writeOut(io, .stdout, "  sqlite driver: ");
-    if (@hasDecl(zsql.drivers.sqlite, "enabled") and zsql.drivers.sqlite.enabled) {
+    if (zsql.enable_sqlite) {
         try writeOut(io, .stdout, "enabled\n");
     } else {
         try writeOut(io, .stdout, "available behind -Denable-sqlite=true\n");
@@ -138,6 +131,122 @@ fn cmdMigrateNew(init: std.process.Init, name: []const u8) !void {
     );
 
     const msg = try std.fmt.allocPrint(allocator, "created {s}\n", .{path});
+    defer allocator.free(msg);
+    try writeOut(io, .stdout, msg);
+}
+
+fn cmdMigrateDb(init: std.process.Init, sub: []const u8, args: *std.process.Args.Iterator) !void {
+    if (!zsql.enable_sqlite) {
+        try writeOut(init.io, .stderr, "sqlite migrate commands require -Denable-sqlite=true\n");
+        return error.Unsupported;
+    }
+
+    var database_path: ?[]const u8 = null;
+    var dir_path: []const u8 = "migrations";
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--database")) {
+            database_path = args.next() orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--dir")) {
+            dir_path = args.next() orelse return error.InvalidArguments;
+        } else {
+            try writeOut(init.io, .stderr, "unknown flag; use --database and optional --dir\n");
+            return error.InvalidArguments;
+        }
+    }
+    const db_path = database_path orelse {
+        try writeOut(init.io, .stderr, "missing --database <path>\n");
+        return error.InvalidArguments;
+    };
+
+    const allocator = init.gpa;
+    const io = init.io;
+
+    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var migrations = try zsql.migrate.scanDir(allocator, io, dir);
+    defer migrations.deinit();
+
+    var db = try zsql.drivers.sqlite.Database.open(allocator, .{
+        .mode = .file,
+        .path = db_path,
+    });
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    const migrator = zsql.drivers.sqlite.Migrator.init(&conn);
+    try migrator.ensureTable();
+    try migrator.validate(migrations.files);
+
+    if (std.mem.eql(u8, sub, "up")) {
+        const result = try migrator.apply(migrations.files);
+        const msg = try std.fmt.allocPrint(allocator, "applied {d} migration(s)\n", .{result.applied});
+        defer allocator.free(msg);
+        try writeOut(io, .stdout, msg);
+    }
+
+    var status = try migrator.status(allocator);
+    defer status.deinit();
+    const header = try std.fmt.allocPrint(allocator, "status: {d} recorded migration(s)\n", .{status.records.len});
+    defer allocator.free(header);
+    try writeOut(io, .stdout, header);
+    for (status.records) |rec| {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "  V{d} {s} dirty={s}\n",
+            .{ rec.version, rec.name, if (rec.dirty) "true" else "false" },
+        );
+        defer allocator.free(line);
+        try writeOut(io, .stdout, line);
+    }
+}
+
+fn cmdInspect(init: std.process.Init, args: *std.process.Args.Iterator) !void {
+    if (!zsql.enable_sqlite) {
+        try writeOut(init.io, .stderr, "inspect currently requires -Denable-sqlite=true\n");
+        return error.Unsupported;
+    }
+
+    var database_path: ?[]const u8 = null;
+    var out_path: []const u8 = "schema.zon";
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--database")) {
+            database_path = args.next() orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--out")) {
+            out_path = args.next() orelse return error.InvalidArguments;
+        } else {
+            return error.InvalidArguments;
+        }
+    }
+    const db_path = database_path orelse {
+        try writeOut(init.io, .stderr, "usage: zsql inspect --database <path> [--out schema.zon]\n");
+        return error.InvalidArguments;
+    };
+
+    const allocator = init.gpa;
+    const io = init.io;
+
+    var db = try zsql.drivers.sqlite.Database.open(allocator, .{
+        .mode = .file,
+        .path = db_path,
+    });
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    const schema = try conn.inspectSchema(allocator);
+    defer zsql.drivers.sqlite.freeInspectedSchema(allocator, schema);
+
+    var growing: std.Io.Writer.Allocating = .init(allocator);
+    defer growing.deinit();
+    try zsql.inspect.writeSchemaZon(&growing.writer, schema);
+
+    const file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, growing.written());
+
+    const msg = try std.fmt.allocPrint(allocator, "wrote {s}\n", .{out_path});
     defer allocator.free(msg);
     try writeOut(io, .stdout, msg);
 }

@@ -96,6 +96,14 @@ SQLite can build a schema graph with `Conn.inspectSchema` and render ZON via `zs
 zig build run -- --help
 zig build run -- doctor
 zig build run -- migrate new create_users
+
+# SQLite apply/status/inspect (build CLI with SQLite enabled):
+zig build -Denable-sqlite=true
+./zig-out/bin/zsql migrate up --database app.db --dir migrations
+./zig-out/bin/zsql migrate status --database app.db --dir migrations
+./zig-out/bin/zsql inspect --database app.db --out schema.zon
+
+zig build checked-queries-example
 ```
 
 ## Development
