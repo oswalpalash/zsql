@@ -109,6 +109,47 @@ test "postgres live: handshake, params, tx, errors, inspect" {
     _ = try conn.exec("drop table if exists zsql_live_users");
 }
 
+test "postgres live: inspectSchema exports user tables" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, io, config);
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists zsql_inspect_demo");
+    _ = try conn.exec(
+        \\create table zsql_inspect_demo (
+        \\  id bigserial primary key,
+        \\  email text not null
+        \\)
+    );
+
+    const schema = try conn.inspectSchema(allocator);
+    defer pg.freeInspectedSchema(allocator, schema);
+
+    var found = false;
+    for (schema.tables) |table| {
+        if (std.mem.eql(u8, table.name, "zsql_inspect_demo")) {
+            found = true;
+            try std.testing.expect(table.columns.len >= 2);
+        }
+    }
+    try std.testing.expect(found);
+
+    var growing: std.Io.Writer.Allocating = .init(allocator);
+    defer growing.deinit();
+    try zsql.inspect.writeSchemaZon(&growing.writer, schema);
+    try std.testing.expect(std.mem.indexOf(u8, growing.written(), "zsql_inspect_demo") != null);
+
+    _ = try conn.exec("drop table if exists zsql_inspect_demo");
+}
+
 test "postgres live: migrator applies pending files" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

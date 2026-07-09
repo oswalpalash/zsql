@@ -31,10 +31,17 @@ pub const ApplyResult = struct {
     applied: usize,
 };
 
+/// Session-level advisory lock key for zsql migrations.
+/// Chosen as a fixed two-int key so concurrent migrators serialize applies
+/// without blocking ordinary application traffic on `zsql_migrations` alone.
+pub const advisory_lock_class: i32 = 0x7a73_716c; // "zsql"
+pub const advisory_lock_id: i32 = 0x6d69_6772; // "migr"
+
 /// PostgreSQL migrator bound to an open connection.
 ///
-/// Uses the same Flyway-style files and checksum rules as SQLite. Schema
-/// locking is via a single transaction around pending applies.
+/// Uses the same Flyway-style files and checksum rules as SQLite. Concurrent
+/// applies take `pg_advisory_lock` for the session, then run pending migrations
+/// inside a single transaction with dirty markers.
 pub const Migrator = struct {
     conn: *conn_mod.Conn,
 
@@ -53,6 +60,34 @@ pub const Migrator = struct {
             \\  dirty boolean not null default false
             \\)
         );
+    }
+
+    /// Acquire the session advisory lock used to serialize migration applies.
+    /// Uses `queryParams` because `pg_advisory_lock` is invoked via SELECT.
+    pub fn lock(self: Migrator) !void {
+        var rows = try self.conn.queryParams(
+            "select pg_advisory_lock($1::int, $2::int)",
+            &.{
+                .{ .integer = advisory_lock_class },
+                .{ .integer = advisory_lock_id },
+            },
+        );
+        defer rows.deinit();
+        // Function returns void; drain the single empty-ish result row if any.
+        _ = rows.next();
+    }
+
+    /// Release the session advisory lock. Safe to call if the lock is held.
+    pub fn unlock(self: Migrator) void {
+        var rows = self.conn.queryParams(
+            "select pg_advisory_unlock($1::int, $2::int)",
+            &.{
+                .{ .integer = advisory_lock_class },
+                .{ .integer = advisory_lock_id },
+            },
+        ) catch return;
+        defer rows.deinit();
+        _ = rows.next();
     }
 
     pub fn status(self: Migrator, allocator: std.mem.Allocator) !MigrationStatus {
@@ -106,6 +141,10 @@ pub const Migrator = struct {
 
     pub fn apply(self: Migrator, migrations: []const core.migrate.MigrationFile) !ApplyResult {
         try self.ensureTable();
+        try self.lock();
+        defer self.unlock();
+
+        // Re-validate under the lock so concurrent migrators see each other's work.
         try self.validate(migrations);
 
         var st = try self.status(self.conn.allocator);
@@ -183,4 +222,9 @@ test "postgres migrate checksum parse length" {
     const checksum = core.migrate.checksumSql(sql);
     const parsed = try parseChecksum(&checksum);
     try std.testing.expectEqual(checksum, parsed);
+}
+
+test "advisory lock keys are stable non-zero" {
+    try std.testing.expect(advisory_lock_class != 0);
+    try std.testing.expect(advisory_lock_id != 0);
 }

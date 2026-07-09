@@ -73,10 +73,11 @@ fn printHelp(io: std.Io) !void {
         \\  zsql migrate status --url <postgres-url> [--dir migrations]
         \\  zsql migrate up --url <postgres-url> [--dir migrations]
         \\  zsql inspect --database <path> [--out schema.zon]
+        \\  zsql inspect --url <postgres-url> [--out schema.zon]
         \\  zsql --help
         \\
         \\SQLite migrate/inspect require -Denable-sqlite=true.
-        \\Postgres migrate uses --url (native driver, no libpq).
+        \\Postgres migrate/inspect use --url (native driver, no libpq).
         \\zsql is not an ORM. Prefer prepared statements and bind parameters.
         \\
     );
@@ -258,44 +259,62 @@ fn printMigrationStatus(io: std.Io, allocator: std.mem.Allocator, records: anyty
 }
 
 fn cmdInspect(init: std.process.Init, args: *std.process.Args.Iterator) !void {
-    if (!zsql.enable_sqlite) {
-        try writeOut(init.io, .stderr, "inspect currently requires -Denable-sqlite=true\n");
-        return error.Unsupported;
-    }
-
     var database_path: ?[]const u8 = null;
+    var url: ?[]const u8 = null;
     var out_path: []const u8 = "schema.zon";
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--database")) {
             database_path = args.next() orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--url")) {
+            url = args.next() orelse return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--out")) {
             out_path = args.next() orelse return error.InvalidArguments;
         } else {
+            try writeOut(init.io, .stderr, "unknown flag; use --database or --url and optional --out\n");
             return error.InvalidArguments;
         }
     }
-    const db_path = database_path orelse {
-        try writeOut(init.io, .stderr, "usage: zsql inspect --database <path> [--out schema.zon]\n");
+
+    if (database_path != null and url != null) {
+        try writeOut(init.io, .stderr, "use either --database (sqlite) or --url (postgres), not both\n");
         return error.InvalidArguments;
-    };
+    }
 
     const allocator = init.gpa;
     const io = init.io;
 
-    var db = try zsql.drivers.sqlite.Database.open(allocator, .{
-        .mode = .file,
-        .path = db_path,
-    });
-    defer db.deinit();
-    var conn = try db.connect();
-    defer conn.close();
-
-    const schema = try conn.inspectSchema(allocator);
-    defer zsql.drivers.sqlite.freeInspectedSchema(allocator, schema);
-
     var growing: std.Io.Writer.Allocating = .init(allocator);
     defer growing.deinit();
-    try zsql.inspect.writeSchemaZon(&growing.writer, schema);
+
+    if (url) |pg_url| {
+        const pg = zsql.drivers.postgres;
+        var config = try pg.parseUrl(allocator, pg_url);
+        defer config.deinit();
+        var conn = try pg.Conn.open(allocator, io, config);
+        defer conn.deinit();
+        const schema = try conn.inspectSchema(allocator);
+        defer pg.freeInspectedSchema(allocator, schema);
+        try zsql.inspect.writeSchemaZon(&growing.writer, schema);
+    } else {
+        const db_path = database_path orelse {
+            try writeOut(init.io, .stderr, "usage: zsql inspect --database <path>|--url <postgres-url> [--out schema.zon]\n");
+            return error.InvalidArguments;
+        };
+        if (!zsql.enable_sqlite) {
+            try writeOut(init.io, .stderr, "sqlite inspect requires -Denable-sqlite=true\n");
+            return error.Unsupported;
+        }
+        var db = try zsql.drivers.sqlite.Database.open(allocator, .{
+            .mode = .file,
+            .path = db_path,
+        });
+        defer db.deinit();
+        var conn = try db.connect();
+        defer conn.close();
+        const schema = try conn.inspectSchema(allocator);
+        defer zsql.drivers.sqlite.freeInspectedSchema(allocator, schema);
+        try zsql.inspect.writeSchemaZon(&growing.writer, schema);
+    }
 
     const file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
     defer file.close(io);
