@@ -139,6 +139,71 @@ pub fn buildPasswordMessage(allocator: std.mem.Allocator, password: []const u8) 
     return buildMessage(allocator, .password, body.items);
 }
 
+/// Build Parse ('P') for the unnamed statement with unspecified parameter types.
+pub fn buildParseMessage(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendCString(&body, allocator, ""); // statement name
+    try appendCString(&body, allocator, sql);
+    try appendI16(&body, allocator, 0); // parameter type count
+    return buildMessage(allocator, .parse, body.items);
+}
+
+/// Build Bind ('B') for the unnamed portal/statement using text-format values.
+///
+/// Each bind is either `null` (SQL NULL) or UTF-8 text bytes. Values are never
+/// interpolated into SQL; they travel only in the bind payload.
+pub fn buildBindMessage(allocator: std.mem.Allocator, binds: []const ?[]const u8) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+
+    try appendCString(&body, allocator, ""); // portal
+    try appendCString(&body, allocator, ""); // statement
+    try appendI16(&body, allocator, 0); // param format count (all text)
+    try appendI16(&body, allocator, try castI16(binds.len));
+    for (binds) |bind| {
+        if (bind) |bytes| {
+            try appendI32(&body, allocator, try castI32(bytes.len));
+            try body.appendSlice(allocator, bytes);
+        } else {
+            try appendI32(&body, allocator, -1);
+        }
+    }
+    try appendI16(&body, allocator, 0); // result format count (all text)
+    return buildMessage(allocator, .bind, body.items);
+}
+
+/// Build Describe ('D') for the unnamed portal.
+pub fn buildDescribePortalMessage(allocator: std.mem.Allocator) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.append(allocator, 'P');
+    try appendCString(&body, allocator, "");
+    return buildMessage(allocator, .describe, body.items);
+}
+
+/// Build Execute ('E') for the unnamed portal with no row limit.
+pub fn buildExecuteMessage(allocator: std.mem.Allocator) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+    try appendCString(&body, allocator, "");
+    try appendI32(&body, allocator, 0);
+    return buildMessage(allocator, .execute, body.items);
+}
+
+/// Build Sync ('S').
+pub fn buildSyncMessage(allocator: std.mem.Allocator) ![]u8 {
+    return buildMessage(allocator, .sync, &.{});
+}
+
+fn castI16(value: usize) !i16 {
+    return std.math.cast(i16, value) orelse error.InvalidBindValue;
+}
+
+fn castI32(value: usize) !i32 {
+    return std.math.cast(i32, value) orelse error.InvalidBindValue;
+}
+
 /// Parse the common backend header: tag + length. `length` is the Int32 from
 /// the wire (includes itself, excludes the tag). Body size is `length - 4`.
 pub const MessageHeader = struct {
@@ -421,6 +486,32 @@ test "ssl request is fixed 8-byte packet" {
     try std.testing.expectEqual(@as(usize, 8), msg.len);
     try std.testing.expectEqual(@as(u32, 8), readU32(msg[0..4]));
     try std.testing.expectEqual(ssl_request_code, readI32(msg[4..8]));
+}
+
+test "build extended query messages" {
+    const parse_msg = try buildParseMessage(std.testing.allocator, "select $1::int");
+    defer std.testing.allocator.free(parse_msg);
+    try std.testing.expectEqual(@as(u8, 'P'), parse_msg[0]);
+
+    const binds = [_]?[]const u8{ "42", null };
+    const bind_msg = try buildBindMessage(std.testing.allocator, &binds);
+    defer std.testing.allocator.free(bind_msg);
+    try std.testing.expectEqual(@as(u8, 'B'), bind_msg[0]);
+    try std.testing.expect(std.mem.indexOf(u8, bind_msg, "42") != null);
+
+    const describe = try buildDescribePortalMessage(std.testing.allocator);
+    defer std.testing.allocator.free(describe);
+    try std.testing.expectEqual(@as(u8, 'D'), describe[0]);
+    try std.testing.expectEqual(@as(u8, 'P'), describe[5]);
+
+    const execute = try buildExecuteMessage(std.testing.allocator);
+    defer std.testing.allocator.free(execute);
+    try std.testing.expectEqual(@as(u8, 'E'), execute[0]);
+
+    const sync = try buildSyncMessage(std.testing.allocator);
+    defer std.testing.allocator.free(sync);
+    try std.testing.expectEqual(@as(u8, 'S'), sync[0]);
+    try std.testing.expectEqual(@as(usize, 5), sync.len);
 }
 
 test "parse row description and data row" {

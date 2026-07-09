@@ -19,6 +19,32 @@ pub const TypeOid = enum(i32) {
     _,
 };
 
+/// Encode a bind `Value` as PostgreSQL text-format bytes, or null.
+///
+/// Allocator-owned text is returned for non-null values (including booleans and
+/// numbers). Callers must free each non-null slice.
+pub fn encodeText(allocator: std.mem.Allocator, value: core.Value) !?[]u8 {
+    return switch (value) {
+        .null => null,
+        .boolean => |b| try allocator.dupe(u8, if (b) "t" else "f"),
+        .integer => |n| try std.fmt.allocPrint(allocator, "{d}", .{n}),
+        .real => |n| try std.fmt.allocPrint(allocator, "{d}", .{n}),
+        .text => |t| try allocator.dupe(u8, t),
+        .blob => |b| blk: {
+            // Hex bytea text format: \x + hex digits
+            var out = try allocator.alloc(u8, 2 + b.len * 2);
+            out[0] = '\\';
+            out[1] = 'x';
+            const hex_charset = "0123456789abcdef";
+            for (b, 0..) |byte, i| {
+                out[2 + i * 2] = hex_charset[byte >> 4];
+                out[2 + i * 2 + 1] = hex_charset[byte & 15];
+            }
+            break :blk out;
+        },
+    };
+}
+
 /// Decode a text-format field into a `core.Value`.
 ///
 /// - bool / int / float map to typed values
@@ -102,4 +128,20 @@ test "parse command complete tags" {
     try std.testing.expectEqual(@as(u64, 3), parseCommandTag("UPDATE 3").rows_affected);
     try std.testing.expectEqual(@as(u64, 0), parseCommandTag("CREATE TABLE").rows_affected);
     try std.testing.expectEqualStrings("SELECT", parseCommandTag("SELECT 2").command);
+}
+
+test "encode text binds" {
+    const t = (try encodeText(std.testing.allocator, .{ .boolean = true })).?;
+    defer std.testing.allocator.free(t);
+    try std.testing.expectEqualStrings("t", t);
+
+    const n = (try encodeText(std.testing.allocator, .{ .integer = 42 })).?;
+    defer std.testing.allocator.free(n);
+    try std.testing.expectEqualStrings("42", n);
+
+    try std.testing.expect((try encodeText(std.testing.allocator, .{ .null = {} })) == null);
+
+    const blob = (try encodeText(std.testing.allocator, .{ .blob = "A" })).?;
+    defer std.testing.allocator.free(blob);
+    try std.testing.expectEqualStrings("\\x41", blob);
 }

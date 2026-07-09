@@ -104,6 +104,177 @@ pub const Conn = struct {
         }
     }
 
+    /// Execute parameterized SQL via the extended query protocol (Parse/Bind/Execute/Sync).
+    ///
+    /// Placeholders must use PostgreSQL `$1` style. Values are bound in text
+    /// format and never concatenated into the SQL string.
+    pub fn execParams(self: *Conn, sql: []const u8, binds: []const core.Value) !core.ExecResult {
+        if (self.closed) return error.ConnectionClosed;
+        try self.sendExtended(sql, binds, false);
+
+        var rows_affected: u64 = 0;
+        while (true) {
+            const msg = try self.readMessage();
+            defer self.allocator.free(msg.body);
+            switch (msg.tag) {
+                .parse_complete, .bind_complete, .no_data => {},
+                .command_complete => {
+                    const tag = try protocol.parseCommandComplete(msg.body);
+                    rows_affected = types.parseCommandTag(tag).rows_affected;
+                },
+                .ready_for_query => {
+                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    return .{ .rows_affected = rows_affected };
+                },
+                .error_response => return mapSqlError(msg.body),
+                .notice_response => {},
+                .row_description, .data_row => return error.UnexpectedRow,
+                else => return error.ProtocolError,
+            }
+        }
+    }
+
+    /// Parameterized query via extended protocol; returns owned simple rows.
+    pub fn queryParams(self: *Conn, sql: []const u8, binds: []const core.Value) !SimpleRows {
+        if (self.closed) return error.ConnectionClosed;
+        try self.sendExtended(sql, binds, true);
+        return self.collectExtendedRows();
+    }
+
+    pub fn begin(self: *Conn) !void {
+        _ = try self.exec("begin");
+    }
+
+    pub fn commit(self: *Conn) !void {
+        _ = try self.exec("commit");
+    }
+
+    pub fn rollback(self: *Conn) !void {
+        _ = try self.exec("rollback");
+    }
+
+    /// Best-effort rollback for `defer` cleanup when a transaction may be open.
+    pub fn rollbackIfOpen(self: *Conn) void {
+        if (self.closed) return;
+        if (self.tx_status != .in_transaction and self.tx_status != .failed) return;
+        self.rollback() catch {};
+    }
+
+    fn sendExtended(self: *Conn, sql: []const u8, binds: []const core.Value, describe_portal: bool) !void {
+        var encoded: std.ArrayListUnmanaged(?[]u8) = .empty;
+        defer {
+            for (encoded.items) |item| {
+                if (item) |bytes| self.allocator.free(bytes);
+            }
+            encoded.deinit(self.allocator);
+        }
+        try encoded.ensureTotalCapacity(self.allocator, binds.len);
+        for (binds) |value| {
+            try encoded.append(self.allocator, try types.encodeText(self.allocator, value));
+        }
+
+        // Build ?[]const u8 view for bind message.
+        var views = try self.allocator.alloc(?[]const u8, encoded.items.len);
+        defer self.allocator.free(views);
+        for (encoded.items, 0..) |item, i| views[i] = item;
+
+        const parse_msg = try protocol.buildParseMessage(self.allocator, sql);
+        defer self.allocator.free(parse_msg);
+        const bind_msg = try protocol.buildBindMessage(self.allocator, views);
+        defer self.allocator.free(bind_msg);
+        const execute_msg = try protocol.buildExecuteMessage(self.allocator);
+        defer self.allocator.free(execute_msg);
+        const sync_msg = try protocol.buildSyncMessage(self.allocator);
+        defer self.allocator.free(sync_msg);
+
+        try self.writeAll(parse_msg);
+        try self.writeAll(bind_msg);
+        if (describe_portal) {
+            const describe_msg = try protocol.buildDescribePortalMessage(self.allocator);
+            defer self.allocator.free(describe_msg);
+            try self.writeAll(describe_msg);
+        }
+        try self.writeAll(execute_msg);
+        try self.writeAll(sync_msg);
+    }
+
+    fn collectExtendedRows(self: *Conn) !SimpleRows {
+        var columns: []protocol.FieldDescription = &.{};
+        var column_names: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (column_names.items) |name| self.allocator.free(name);
+            column_names.deinit(self.allocator);
+            if (columns.len != 0) self.allocator.free(columns);
+        }
+
+        var rows: std.ArrayListUnmanaged(OwnedSimpleRow) = .empty;
+        errdefer {
+            for (rows.items) |*row| row.deinit(self.allocator);
+            rows.deinit(self.allocator);
+        }
+
+        var rows_affected: u64 = 0;
+        while (true) {
+            const msg = try self.readMessage();
+            defer self.allocator.free(msg.body);
+            switch (msg.tag) {
+                .parse_complete, .bind_complete => {},
+                .row_description => {
+                    if (columns.len != 0) self.allocator.free(columns);
+                    columns = try protocol.parseRowDescription(msg.body, self.allocator);
+                    for (column_names.items) |name| self.allocator.free(name);
+                    column_names.clearRetainingCapacity();
+                    for (columns) |field| {
+                        try column_names.append(self.allocator, try self.allocator.dupe(u8, field.name));
+                    }
+                },
+                .no_data => {},
+                .data_row => {
+                    const data_cols = try protocol.parseDataRow(msg.body, self.allocator);
+                    defer self.allocator.free(data_cols);
+                    if (columns.len == 0 or data_cols.len != columns.len) return error.ProtocolError;
+
+                    const values = try self.allocator.alloc(core.OwnedValue, data_cols.len);
+                    errdefer {
+                        for (values) |*v| v.deinit(self.allocator);
+                        self.allocator.free(values);
+                    }
+                    for (data_cols, columns, 0..) |col, field, i| {
+                        if (col.bytes) |raw| {
+                            const decoded = try types.decodeText(field.type_oid, raw);
+                            values[i] = try core.OwnedValue.from(self.allocator, decoded);
+                        } else {
+                            values[i] = .{ .null = {} };
+                        }
+                    }
+                    try rows.append(self.allocator, .{ .values = values });
+                },
+                .command_complete => {
+                    const tag = try protocol.parseCommandComplete(msg.body);
+                    rows_affected = types.parseCommandTag(tag).rows_affected;
+                },
+                .ready_for_query => {
+                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    const names = try column_names.toOwnedSlice(self.allocator);
+                    column_names = .empty;
+                    if (columns.len != 0) {
+                        self.allocator.free(columns);
+                        columns = &.{};
+                    }
+                    return .{
+                        .allocator = self.allocator,
+                        .column_names = names,
+                        .rows = try rows.toOwnedSlice(self.allocator),
+                        .rows_affected = rows_affected,
+                    };
+                },
+                .error_response => return mapSqlError(msg.body),
+                .notice_response => {},
+                else => return error.ProtocolError,
+            }
+        }
+    }
+
     /// Run a simple query and collect all result rows into allocator-owned storage.
     ///
     /// Column text is copied so values outlive the network buffer. Call
