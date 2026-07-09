@@ -33,7 +33,9 @@ jobs:
       - name: Format check
         run: zig fmt --check .
 
-      - name: Build
+      # Default package path must not require libc/sqlite. Never use std.c
+      # APIs that force libc linkage in code reachable without -Denable-sqlite.
+      - name: Build (default, no sqlite/libc)
         run: zig build
 
       - name: Test (default)
@@ -44,6 +46,9 @@ jobs:
 
       - name: Offline checked-queries example
         run: zig build checked-queries-example
+
+      - name: Postgres pool example (skips without ZSQL_PG_URL)
+        run: zig build postgres-pool-example
 
       - name: Install system SQLite
         run: |
@@ -65,3 +70,8 @@ jobs:
         env:
           ZSQL_PG_URL: postgres://zsql:zsql@127.0.0.1:5432/zsql?sslmode=disable
         run: zig build test-postgres
+
+      - name: Postgres pool example (live)
+        env:
+          ZSQL_PG_URL: postgres://zsql:zsql@127.0.0.1:5432/zsql?sslmode=disable
+        run: zig build postgres-pool-example

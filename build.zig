@@ -3,6 +3,9 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Default builds (enable-sqlite=false) must remain free of libc so the
+    // CLI and library install cleanly without system SQLite. Do not call
+    // std.c.* from code paths compiled into the default package.
     const enable_sqlite = b.option(bool, "enable-sqlite", "Compile the experimental SQLite driver skeleton") orelse false;
 
     const options = b.addOptions();
