@@ -430,6 +430,29 @@ pub const Conn = struct {
         return self.collectExtendedRows();
     }
 
+    /// Query exactly one row. Returns `error.NoRows` / `error.TooManyRows` on
+    /// wrong cardinality. The returned row borrows from a temporary result set
+    /// that is fully collected before return, so values are owned via SimpleRows
+    /// internal storage — call `SimpleRows.deinit` is not needed; values are
+    /// copied into an `OwnedRow`.
+    pub fn queryOneParams(self: *Conn, sql: []const u8, binds: []const core.Value) !core.OwnedRow {
+        var rows = try self.queryParams(sql, binds);
+        defer rows.deinit();
+        const first = rows.next() orelse return error.NoRows;
+        // Build a core.Row view for OwnedRow.init.
+        var names = try self.allocator.alloc([]const u8, first.column_names.len);
+        defer self.allocator.free(names);
+        var values = try self.allocator.alloc(core.Value, first.values.len);
+        defer self.allocator.free(values);
+        for (first.column_names, 0..) |n, i| names[i] = n;
+        for (first.values, 0..) |owned_val, i| values[i] = owned_val.borrowed();
+        const view = try core.Row.init(names, values);
+        var owned = try core.OwnedRow.init(self.allocator, view);
+        errdefer owned.deinit();
+        if (rows.next() != null) return error.TooManyRows;
+        return owned;
+    }
+
     pub fn begin(self: *Conn) !void {
         _ = try self.exec("begin");
     }

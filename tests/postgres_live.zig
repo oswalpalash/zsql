@@ -109,6 +109,32 @@ test "postgres live: handshake, params, tx, errors, inspect" {
     _ = try conn.exec("drop table if exists zsql_live_users");
 }
 
+test "postgres live: queryOneParams enforces cardinality" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, io, config);
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists zsql_one_row");
+    _ = try conn.exec("create temporary table zsql_one_row (id int primary key, name text)");
+    try std.testing.expectError(error.NoRows, conn.queryOneParams("select id from zsql_one_row", &.{}));
+
+    _ = try conn.exec("insert into zsql_one_row (id, name) values (1, 'a'), (2, 'b')");
+    try std.testing.expectError(error.TooManyRows, conn.queryOneParams("select id from zsql_one_row", &.{}));
+
+    var owned = try conn.queryOneParams("select id, name from zsql_one_row where id = $1", &.{.{ .integer = 1 }});
+    defer owned.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try (try owned.getName("id")).asInt());
+    try std.testing.expectEqualStrings("a", try (try owned.getName("name")).asText());
+}
+
 test "postgres live: inspectSchema exports user tables" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
