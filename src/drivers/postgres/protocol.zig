@@ -209,6 +209,87 @@ pub const ErrorFields = struct {
     constraint: ?[]const u8 = null,
 };
 
+/// Field metadata from RowDescription. String slices borrow from the message body.
+pub const FieldDescription = struct {
+    name: []const u8,
+    table_oid: i32,
+    column_attr: i16,
+    type_oid: i32,
+    type_size: i16,
+    type_modifier: i32,
+    format: i16,
+};
+
+/// Parse RowDescription body into field metadata. Field names borrow from `body`.
+pub fn parseRowDescription(body: []const u8, allocator: std.mem.Allocator) ![]FieldDescription {
+    if (body.len < 2) return error.ProtocolError;
+    const count_u = @as(u16, @bitCast(readI16(body[0..2])));
+    const count: usize = count_u;
+
+    const fields = try allocator.alloc(FieldDescription, count);
+    errdefer allocator.free(fields);
+
+    var offset: usize = 2;
+    for (fields) |*field| {
+        const zero = std.mem.indexOfScalarPos(u8, body, offset, 0) orelse return error.ProtocolError;
+        const name = body[offset..zero];
+        offset = zero + 1;
+        if (offset + 18 > body.len) return error.ProtocolError;
+        field.* = .{
+            .name = name,
+            .table_oid = readI32(body[offset..][0..4]),
+            .column_attr = readI16(body[offset + 4 ..][0..2]),
+            .type_oid = readI32(body[offset + 6 ..][0..4]),
+            .type_size = readI16(body[offset + 10 ..][0..2]),
+            .type_modifier = readI32(body[offset + 12 ..][0..4]),
+            .format = readI16(body[offset + 16 ..][0..2]),
+        };
+        offset += 18;
+    }
+    return fields;
+}
+
+/// One column value from a DataRow. `bytes` is null for SQL NULL.
+pub const DataColumn = struct {
+    bytes: ?[]const u8,
+};
+
+/// Parse DataRow body. Column byte slices borrow from `body`.
+pub fn parseDataRow(body: []const u8, allocator: std.mem.Allocator) ![]DataColumn {
+    if (body.len < 2) return error.ProtocolError;
+    const count_u = @as(u16, @bitCast(readI16(body[0..2])));
+    const count: usize = count_u;
+
+    const columns = try allocator.alloc(DataColumn, count);
+    errdefer allocator.free(columns);
+
+    var offset: usize = 2;
+    for (columns) |*column| {
+        if (offset + 4 > body.len) return error.ProtocolError;
+        const len = readI32(body[offset..][0..4]);
+        offset += 4;
+        if (len < 0) {
+            column.* = .{ .bytes = null };
+            continue;
+        }
+        const ulen: usize = @intCast(len);
+        if (offset + ulen > body.len) return error.ProtocolError;
+        column.* = .{ .bytes = body[offset .. offset + ulen] };
+        offset += ulen;
+    }
+    return columns;
+}
+
+/// Parse CommandComplete body: C-string tag.
+pub fn parseCommandComplete(body: []const u8) ![]const u8 {
+    if (body.len == 0) return error.ProtocolError;
+    if (body[body.len - 1] != 0) {
+        // Some servers may omit trailing NUL if length already bounds the tag.
+        return body;
+    }
+    return body[0 .. body.len - 1];
+}
+
 pub fn parseErrorFields(body: []const u8) !ErrorFields {
     var fields: ErrorFields = .{};
     var rest = body;
@@ -340,4 +421,45 @@ test "ssl request is fixed 8-byte packet" {
     try std.testing.expectEqual(@as(usize, 8), msg.len);
     try std.testing.expectEqual(@as(u32, 8), readU32(msg[0..4]));
     try std.testing.expectEqual(ssl_request_code, readI32(msg[4..8]));
+}
+
+test "parse row description and data row" {
+    // name\0 table_oid=0 attr=0 type=25 size=-1 mod=-1 format=0
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    defer body_list.deinit(std.testing.allocator);
+    try appendI16(&body_list, std.testing.allocator, 1);
+    try appendCString(&body_list, std.testing.allocator, "name");
+    try appendI32(&body_list, std.testing.allocator, 0);
+    try appendI16(&body_list, std.testing.allocator, 0);
+    try appendI32(&body_list, std.testing.allocator, 25);
+    try appendI16(&body_list, std.testing.allocator, -1);
+    try appendI32(&body_list, std.testing.allocator, -1);
+    try appendI16(&body_list, std.testing.allocator, 0);
+
+    const fields = try parseRowDescription(body_list.items, std.testing.allocator);
+    defer std.testing.allocator.free(fields);
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    try std.testing.expectEqualStrings("name", fields[0].name);
+    try std.testing.expectEqual(@as(i32, 25), fields[0].type_oid);
+
+    var data_list: std.ArrayListUnmanaged(u8) = .empty;
+    defer data_list.deinit(std.testing.allocator);
+    try appendI16(&data_list, std.testing.allocator, 2);
+    try appendI32(&data_list, std.testing.allocator, 3);
+    try data_list.appendSlice(std.testing.allocator, "ada");
+    try appendI32(&data_list, std.testing.allocator, -1);
+
+    const cols = try parseDataRow(data_list.items, std.testing.allocator);
+    defer std.testing.allocator.free(cols);
+    try std.testing.expectEqual(@as(usize, 2), cols.len);
+    try std.testing.expectEqualStrings("ada", cols[0].bytes.?);
+    try std.testing.expect(cols[1].bytes == null);
+
+    try std.testing.expectEqualStrings("SELECT 1", try parseCommandComplete("SELECT 1\x00"));
+}
+
+pub fn appendI16(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: i16) !void {
+    var buf: [2]u8 = undefined;
+    std.mem.writeInt(i16, &buf, value, .big);
+    try list.appendSlice(allocator, &buf);
 }

@@ -1,7 +1,9 @@
 const std = @import("std");
+const core = @import("../../zsql.zig");
 const url = @import("url.zig");
 const protocol = @import("protocol.zig");
 const auth = @import("auth.zig");
+const types = @import("types.zig");
 
 const Io = std.Io;
 const net = std.Io.net;
@@ -68,6 +70,124 @@ pub const Conn = struct {
         self.allocator.free(self.read_buf);
         self.allocator.free(self.write_buf);
         self.closed = true;
+    }
+
+    /// Execute a simple-query statement that does not return rows.
+    ///
+    /// Prefer extended/parameterized APIs once available for any user values.
+    /// This path is intended for DDL, transaction control, and trusted SQL.
+    pub fn exec(self: *Conn, sql: []const u8) !core.ExecResult {
+        if (self.closed) return error.ConnectionClosed;
+        const packet = try protocol.buildQueryMessage(self.allocator, sql);
+        defer self.allocator.free(packet);
+        try self.writeAll(packet);
+
+        var rows_affected: u64 = 0;
+        while (true) {
+            const msg = try self.readMessage();
+            defer self.allocator.free(msg.body);
+            switch (msg.tag) {
+                .command_complete => {
+                    const tag = try protocol.parseCommandComplete(msg.body);
+                    rows_affected = types.parseCommandTag(tag).rows_affected;
+                },
+                .empty_query_response => {},
+                .ready_for_query => {
+                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    return .{ .rows_affected = rows_affected };
+                },
+                .error_response => return mapSqlError(msg.body),
+                .notice_response => {},
+                .row_description, .data_row => return error.UnexpectedRow,
+                else => return error.ProtocolError,
+            }
+        }
+    }
+
+    /// Run a simple query and collect all result rows into allocator-owned storage.
+    ///
+    /// Column text is copied so values outlive the network buffer. Call
+    /// `SimpleRows.deinit` when finished.
+    pub fn query(self: *Conn, sql: []const u8) !SimpleRows {
+        if (self.closed) return error.ConnectionClosed;
+        const packet = try protocol.buildQueryMessage(self.allocator, sql);
+        defer self.allocator.free(packet);
+        try self.writeAll(packet);
+
+        var columns: []protocol.FieldDescription = &.{};
+        var column_names: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (column_names.items) |name| self.allocator.free(name);
+            column_names.deinit(self.allocator);
+            if (columns.len != 0) self.allocator.free(columns);
+        }
+
+        var rows: std.ArrayListUnmanaged(OwnedSimpleRow) = .empty;
+        errdefer {
+            for (rows.items) |*row| row.deinit(self.allocator);
+            rows.deinit(self.allocator);
+        }
+
+        var rows_affected: u64 = 0;
+        while (true) {
+            const msg = try self.readMessage();
+            defer self.allocator.free(msg.body);
+            switch (msg.tag) {
+                .row_description => {
+                    if (columns.len != 0) self.allocator.free(columns);
+                    columns = try protocol.parseRowDescription(msg.body, self.allocator);
+                    for (column_names.items) |name| self.allocator.free(name);
+                    column_names.clearRetainingCapacity();
+                    for (columns) |field| {
+                        try column_names.append(self.allocator, try self.allocator.dupe(u8, field.name));
+                    }
+                },
+                .data_row => {
+                    const data_cols = try protocol.parseDataRow(msg.body, self.allocator);
+                    defer self.allocator.free(data_cols);
+                    if (columns.len == 0 or data_cols.len != columns.len) return error.ProtocolError;
+
+                    var values = try self.allocator.alloc(core.OwnedValue, data_cols.len);
+                    errdefer {
+                        for (values) |*v| v.deinit(self.allocator);
+                        self.allocator.free(values);
+                    }
+                    for (data_cols, columns, 0..) |col, field, i| {
+                        if (col.bytes) |raw| {
+                            const decoded = try types.decodeText(field.type_oid, raw);
+                            values[i] = try core.OwnedValue.from(self.allocator, decoded);
+                        } else {
+                            values[i] = .{ .null = {} };
+                        }
+                    }
+                    try rows.append(self.allocator, .{ .values = values });
+                },
+                .command_complete => {
+                    const tag = try protocol.parseCommandComplete(msg.body);
+                    rows_affected = types.parseCommandTag(tag).rows_affected;
+                },
+                .empty_query_response => {},
+                .ready_for_query => {
+                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    const names = try column_names.toOwnedSlice(self.allocator);
+                    column_names = .empty;
+                    // Free protocol field metadata; names are owned separately.
+                    if (columns.len != 0) {
+                        self.allocator.free(columns);
+                        columns = &.{};
+                    }
+                    return .{
+                        .allocator = self.allocator,
+                        .column_names = names,
+                        .rows = try rows.toOwnedSlice(self.allocator),
+                        .rows_affected = rows_affected,
+                    };
+                },
+                .error_response => return mapSqlError(msg.body),
+                .notice_response => {},
+                else => return error.ProtocolError,
+            }
+        }
     }
 
     fn startup(self: *Conn, config: url.Config) !void {
@@ -233,6 +353,76 @@ fn mapWriteError(err: ?net.Stream.Writer.Error) anyerror {
     }
     return error.ProtocolError;
 }
+
+fn mapSqlError(body: []const u8) anyerror {
+    const fields = protocol.parseErrorFields(body) catch return error.DriverError;
+    if (fields.code) |code| {
+        if (std.mem.eql(u8, code, "23505")) return error.ConstraintViolation;
+        if (std.mem.eql(u8, code, "23503")) return error.ConstraintViolation;
+        if (std.mem.eql(u8, code, "23502")) return error.ConstraintViolation;
+        if (std.mem.eql(u8, code, "23514")) return error.ConstraintViolation;
+        if (std.mem.eql(u8, code, "40P01")) return error.DriverError;
+        if (std.mem.eql(u8, code, "40001")) return error.DriverError;
+        if (std.mem.eql(u8, code, "28P01") or std.mem.eql(u8, code, "28000")) return error.AuthFailed;
+        if (std.mem.eql(u8, code, "42601")) return error.InvalidSql;
+        if (std.mem.eql(u8, code, "42P01")) return error.InvalidSql;
+    }
+    return error.DriverError;
+}
+
+const OwnedSimpleRow = struct {
+    values: []core.OwnedValue,
+
+    fn deinit(self: *OwnedSimpleRow, allocator: std.mem.Allocator) void {
+        for (self.values) |*value| value.deinit(allocator);
+        allocator.free(self.values);
+        self.* = undefined;
+    }
+};
+
+/// Allocator-owned simple-query result set.
+pub const SimpleRows = struct {
+    allocator: std.mem.Allocator,
+    column_names: [][]u8,
+    rows: []OwnedSimpleRow,
+    rows_affected: u64,
+    index: usize = 0,
+
+    pub fn deinit(self: *SimpleRows) void {
+        for (self.column_names) |name| self.allocator.free(name);
+        self.allocator.free(self.column_names);
+        for (self.rows) |*row| row.deinit(self.allocator);
+        self.allocator.free(self.rows);
+        self.* = undefined;
+    }
+
+    pub fn next(self: *SimpleRows) ?SimpleRow {
+        if (self.index >= self.rows.len) return null;
+        const row = SimpleRow{
+            .column_names = self.column_names,
+            .values = self.rows[self.index].values,
+        };
+        self.index += 1;
+        return row;
+    }
+};
+
+pub const SimpleRow = struct {
+    column_names: []const []u8,
+    values: []const core.OwnedValue,
+
+    pub fn value(self: SimpleRow, name: []const u8) !core.Value {
+        for (self.column_names, self.values) |column_name, owned| {
+            if (std.mem.eql(u8, column_name, name)) return owned.borrowed();
+        }
+        return error.InvalidColumn;
+    }
+
+    pub fn valueAt(self: SimpleRow, index: usize) !core.Value {
+        if (index >= self.values.len) return error.InvalidColumn;
+        return self.values[index].borrowed();
+    }
+};
 
 test "Conn rejects TLS-required configs before connecting" {
     var config = try url.parse(std.testing.allocator, "postgres://u@127.0.0.1:1/db?sslmode=require");
