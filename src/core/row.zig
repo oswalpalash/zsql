@@ -146,7 +146,7 @@ fn convertValue(comptime T: type, value: Value) !T {
             else => error.InvalidColumnType,
         },
         .int => switch (value) {
-            .integer => |v| std.math.cast(T, v) orelse error.InvalidColumnType,
+            .integer => |v| std.math.cast(T, v) orelse error.IntegerOverflow,
             else => error.InvalidColumnType,
         },
         .float => switch (value) {
@@ -154,6 +154,7 @@ fn convertValue(comptime T: type, value: Value) !T {
             .integer => |v| @as(T, @floatFromInt(v)),
             else => error.InvalidColumnType,
         },
+        .@"enum" => convertEnum(T, value),
         .pointer => |pointer| {
             if (pointer.size != .slice or pointer.child != u8) {
                 @compileError("Row.to only supports []const u8 string/blob slices for pointer fields");
@@ -164,7 +165,31 @@ fn convertValue(comptime T: type, value: Value) !T {
                 else => error.InvalidColumnType,
             };
         },
-        else => @compileError("Row.to only supports scalar, optional scalar, and []const u8 fields"),
+        else => @compileError("Row.to only supports scalar, optional scalar, enum, and []const u8 fields"),
+    };
+}
+
+/// Map text (field name) or integer (tag value) into a Zig enum.
+fn convertEnum(comptime T: type, value: Value) !T {
+    return switch (value) {
+        .text => |text| blk: {
+            inline for (std.meta.fields(T)) |field| {
+                if (std.mem.eql(u8, field.name, text)) {
+                    break :blk @field(T, field.name);
+                }
+            }
+            break :blk error.TypeMismatch;
+        },
+        .integer => |int_value| blk: {
+            const tag_type = @typeInfo(T).@"enum".tag_type;
+            const tag = std.math.cast(tag_type, int_value) orelse return error.TypeMismatch;
+            inline for (std.meta.fields(T)) |field| {
+                if (field.value == tag) break :blk @enumFromInt(tag);
+            }
+            if (@typeInfo(T).@"enum".is_exhaustive) return error.TypeMismatch;
+            break :blk @enumFromInt(tag);
+        },
+        else => error.InvalidColumnType,
     };
 }
 
@@ -257,5 +282,30 @@ test "Row.to handles null optionals and rejects invalid field types" {
         id: u8,
     };
     const bad_row = try Row.init(&.{"id"}, &.{.{ .integer = 300 }});
-    try std.testing.expectError(error.InvalidColumnType, bad_row.to(Bad));
+    try std.testing.expectError(error.IntegerOverflow, bad_row.to(Bad));
+}
+
+test "Row maps enum fields from text names and integer tags" {
+    const Role = enum { admin, user, guest };
+    const Status = enum(u8) { active = 1, inactive = 2 };
+
+    const Account = struct {
+        role: Role,
+        status: Status,
+        maybe_role: ?Role,
+    };
+
+    const row = try Row.init(&.{ "role", "status", "maybe_role" }, &.{
+        .{ .text = "admin" },
+        .{ .integer = 1 },
+        .{ .null = {} },
+    });
+    const account = try row.to(Account);
+    try std.testing.expect(account.role == .admin);
+    try std.testing.expect(account.status == .active);
+    try std.testing.expect(account.maybe_role == null);
+
+    const bad = try Row.init(&.{"role"}, &.{.{ .text = "nope" }});
+    const BadRole = struct { role: Role };
+    try std.testing.expectError(error.TypeMismatch, bad.to(BadRole));
 }
