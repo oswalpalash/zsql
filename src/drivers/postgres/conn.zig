@@ -1329,6 +1329,45 @@ pub const SimpleRow = struct {
         if (index >= self.values.len) return error.InvalidColumn;
         return self.values[index].borrowed();
     }
+
+    /// Ordinal `Value` access (matches `core.Row.get`).
+    pub fn get(self: SimpleRow, index: usize) !core.Value {
+        return self.valueAt(index);
+    }
+
+    /// Named `Value` access (matches `core.Row.getName`).
+    pub fn getName(self: SimpleRow, name: []const u8) !core.Value {
+        return self.value(name);
+    }
+
+    /// Typed ordinal decode (same rules as `core.Row.as` / `to`).
+    pub fn as(self: SimpleRow, comptime T: type, index: usize) !T {
+        return core.decode(T, try self.valueAt(index));
+    }
+
+    /// Typed named-column decode (same rules as `core.Row.asName` / `to`).
+    pub fn asName(self: SimpleRow, comptime T: type, name: []const u8) !T {
+        return core.decode(T, try self.value(name));
+    }
+
+    /// Map into a Zig struct by column name, then ordinal fallback.
+    /// Supports up to 64 columns (stack-backed temporary view).
+    pub fn to(self: SimpleRow, comptime T: type) !T {
+        const max_cols = 64;
+        if (self.values.len > max_cols) return error.Unsupported;
+
+        var name_buf: [max_cols][]const u8 = undefined;
+        var value_buf: [max_cols]core.Value = undefined;
+        for (self.column_names, 0..) |n, i| name_buf[i] = n;
+        for (self.values, 0..) |owned, i| value_buf[i] = owned.borrowed();
+        const row = try core.Row.init(name_buf[0..self.column_names.len], value_buf[0..self.values.len]);
+        return row.to(T);
+    }
+
+    /// Copy into an allocator-owned `core.OwnedRow`.
+    pub fn getOwned(self: SimpleRow, allocator: std.mem.Allocator) !core.OwnedRow {
+        return simpleRowToOwned(allocator, self);
+    }
 };
 
 fn simpleRowToOwned(allocator: std.mem.Allocator, row: SimpleRow) !core.OwnedRow {
@@ -1385,6 +1424,42 @@ test "savepoint names are deterministic prefixes" {
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "zsql_sp_{d}", .{0});
     try std.testing.expectEqualStrings("zsql_sp_0", name);
+}
+
+test "SimpleRow get/as/to map like core.Row" {
+    var id_owned = try core.OwnedValue.from(std.testing.allocator, .{ .integer = 7 });
+    defer id_owned.deinit(std.testing.allocator);
+    var name_owned = try core.OwnedValue.from(std.testing.allocator, .{ .text = "ada" });
+    defer name_owned.deinit(std.testing.allocator);
+    var active_owned = try core.OwnedValue.from(std.testing.allocator, .{ .boolean = true });
+    defer active_owned.deinit(std.testing.allocator);
+
+    const names = [_][]u8{ @constCast("id"), @constCast("name"), @constCast("active") };
+    const values = [_]core.OwnedValue{ id_owned, name_owned, active_owned };
+    const row = SimpleRow{
+        .column_names = &names,
+        .values = &values,
+    };
+
+    try std.testing.expectEqual(@as(i64, 7), try (try row.get(0)).asInt());
+    try std.testing.expectEqualStrings("ada", try (try row.getName("name")).asText());
+    try std.testing.expectEqual(@as(i64, 7), try row.as(i64, 0));
+    try std.testing.expectEqualStrings("ada", try row.asName([]const u8, "name"));
+    try std.testing.expect(try row.as(bool, 2));
+
+    const User = struct {
+        id: i64,
+        name: []const u8,
+        active: bool,
+    };
+    const user = try row.to(User);
+    try std.testing.expectEqual(@as(i64, 7), user.id);
+    try std.testing.expectEqualStrings("ada", user.name);
+    try std.testing.expect(user.active);
+
+    var owned = try row.getOwned(std.testing.allocator);
+    defer owned.deinit();
+    try std.testing.expectEqual(@as(i64, 7), try owned.as(i64, 0));
 }
 
 test "captureSqlError stores OwnedDbError for lastError()" {
