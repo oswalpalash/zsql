@@ -85,6 +85,9 @@ pub const PoolConfig = struct {
     /// Multi-threaded: waiters sleep in short slices (≤1ms) and recheck, so a
     /// concurrent `release` unblocks them within about one poll interval.
     acquire_timeout_ns: u64 = 0,
+    /// When non-zero, each newly opened connection enables a prepared-statement
+    /// handle cache of this size. Zero leaves caching off (default).
+    stmt_cache_size: usize = 0,
 };
 
 pub const PoolStats = struct {
@@ -178,7 +181,10 @@ pub const Pool = struct {
                     opened.deinit();
                     self.open_count -|= 1;
                 }
-                const conn = try opened.connect();
+                var conn = try opened.connect();
+                if (self.config.stmt_cache_size > 0) {
+                    try conn.enableStmtCache(self.config.stmt_cache_size);
+                }
                 return .{
                     .pool = self,
                     .db = opened,
