@@ -17,6 +17,15 @@ pub const Schema = struct {
     tables: []const Table,
 };
 
+/// Free a fully allocator-owned schema graph produced by driver inspection.
+pub fn freeSchema(allocator: std.mem.Allocator, schema: Schema) void {
+    for (schema.tables) |table| {
+        allocator.free(table.name);
+        freeColumns(allocator, @constCast(table.columns));
+    }
+    allocator.free(schema.tables);
+}
+
 /// Render a Zig-friendly ZON-like schema document for embedding / offline checks.
 ///
 /// Output is deterministic and intentionally simple (not a full ZON encoder).
@@ -59,6 +68,87 @@ pub fn columnsFromSqliteTableInfo(allocator: std.mem.Allocator, rows: []const Sq
     }
     return columns;
 }
+
+/// One column row from PostgreSQL `information_schema.columns` (+ PK flag).
+pub const PostgresColumnInfoRow = struct {
+    name: []const u8,
+    /// Prefer `udt_name` (e.g. `int4`, `text`) when available; otherwise `data_type`.
+    type_name: []const u8,
+    /// True when `is_nullable = 'YES'`.
+    is_nullable: bool,
+    primary_key: bool,
+};
+
+pub fn columnsFromPostgresColumnInfo(allocator: std.mem.Allocator, rows: []const PostgresColumnInfoRow) ![]Column {
+    const columns = try allocator.alloc(Column, rows.len);
+    var initialized: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < initialized) : (i += 1) {
+            allocator.free(columns[i].name);
+            allocator.free(columns[i].type_name);
+        }
+        allocator.free(columns);
+    }
+    for (rows, 0..) |row, i| {
+        const name = try allocator.dupe(u8, row.name);
+        errdefer allocator.free(name);
+        const type_name = try allocator.dupe(u8, row.type_name);
+        columns[i] = .{
+            .name = name,
+            .type_name = type_name,
+            .nullable = row.is_nullable and !row.primary_key,
+            .primary_key = row.primary_key,
+        };
+        initialized = i + 1;
+    }
+    return columns;
+}
+
+/// Build a stable offline-check table name from PostgreSQL schema + table.
+///
+/// - `public` tables use the bare table name (`users`) so app SQL matches.
+/// - Other schemas are qualified (`audit.events`).
+pub fn postgresTableDisplayName(allocator: std.mem.Allocator, schema_name: []const u8, table_name: []const u8) ![]u8 {
+    if (std.mem.eql(u8, schema_name, "public")) {
+        return try allocator.dupe(u8, table_name);
+    }
+    return try std.fmt.allocPrint(allocator, "{s}.{s}", .{ schema_name, table_name });
+}
+
+/// Trusted SQL used by the Postgres driver to list base tables.
+/// Excluded catalogs: pg_catalog, information_schema.
+pub const postgres_list_tables_sql =
+    \\select table_schema, table_name
+    \\from information_schema.tables
+    \\where table_type = 'BASE TABLE'
+    \\  and table_schema not in ('pg_catalog', 'information_schema')
+    \\order by table_schema, table_name
+;
+
+/// Trusted SQL to list columns for one table. Placeholders: $1 schema, $2 table.
+pub const postgres_list_columns_sql =
+    \\select
+    \\  c.column_name,
+    \\  c.udt_name,
+    \\  c.is_nullable,
+    \\  case when pk.column_name is null then 'NO' else 'YES' end as is_primary_key
+    \\from information_schema.columns c
+    \\left join (
+    \\  select kcu.column_name
+    \\  from information_schema.table_constraints tc
+    \\  join information_schema.key_column_usage kcu
+    \\    on tc.constraint_name = kcu.constraint_name
+    \\   and tc.table_schema = kcu.table_schema
+    \\   and tc.table_name = kcu.table_name
+    \\  where tc.constraint_type = 'PRIMARY KEY'
+    \\    and tc.table_schema = $1
+    \\    and tc.table_name = $2
+    \\) pk on pk.column_name = c.column_name
+    \\where c.table_schema = $1
+    \\  and c.table_name = $2
+    \\order by c.ordinal_position
+;
 
 pub fn freeColumns(allocator: std.mem.Allocator, columns: []Column) void {
     for (columns) |col| {
@@ -109,4 +199,38 @@ test "columnsFromSqliteTableInfo maps nullability and pk" {
     try std.testing.expect(columns[0].primary_key);
     try std.testing.expect(!columns[0].nullable);
     try std.testing.expect(columns[1].nullable);
+}
+
+test "columnsFromPostgresColumnInfo maps nullability and pk" {
+    const rows = [_]PostgresColumnInfoRow{
+        .{ .name = "id", .type_name = "int8", .is_nullable = false, .primary_key = true },
+        .{ .name = "email", .type_name = "text", .is_nullable = false, .primary_key = false },
+        .{ .name = "note", .type_name = "text", .is_nullable = true, .primary_key = false },
+    };
+    const columns = try columnsFromPostgresColumnInfo(std.testing.allocator, &rows);
+    defer freeColumns(std.testing.allocator, columns);
+    try std.testing.expect(columns[0].primary_key);
+    try std.testing.expect(!columns[0].nullable);
+    try std.testing.expect(!columns[1].nullable);
+    try std.testing.expect(columns[2].nullable);
+    try std.testing.expectEqualStrings("int8", columns[0].type_name);
+}
+
+test "postgresTableDisplayName qualifies non-public schemas" {
+    const public_name = try postgresTableDisplayName(std.testing.allocator, "public", "users");
+    defer std.testing.allocator.free(public_name);
+    try std.testing.expectEqualStrings("users", public_name);
+
+    const other = try postgresTableDisplayName(std.testing.allocator, "audit", "events");
+    defer std.testing.allocator.free(other);
+    try std.testing.expectEqualStrings("audit.events", other);
+}
+
+test "postgres inspection SQL is parameterized and catalog-safe" {
+    try std.testing.expect(std.mem.indexOf(u8, postgres_list_tables_sql, "information_schema.tables") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_list_tables_sql, "pg_catalog") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_list_columns_sql, "$1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, postgres_list_columns_sql, "$2") != null);
+    // Values never concatenated; only placeholders for schema/table names.
+    try std.testing.expect(std.mem.indexOf(u8, postgres_list_columns_sql, "PRIMARY KEY") != null);
 }

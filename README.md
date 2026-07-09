@@ -28,11 +28,11 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 
 - `zsql.Database`, `zsql.Conn`, `zsql.Stmt`, `zsql.Tx`, `zsql.Savepoint`
 - `zsql.Rows`, `zsql.Row`, `zsql.OwnedRow`, `zsql.Value`, `zsql.OwnedValue`
-- `zsql.ExecResult`, `zsql.Error`, `zsql.DbError`
+- `zsql.ExecResult`, `zsql.Error`, `zsql.DbError`, `zsql.OwnedDbError`
 - `zsql.QueryBuilder`, `zsql.params`, `zsql.migrate`
 - `zsql.inspect`, `zsql.check`
 - `zsql.drivers.sqlite` (`-Denable-sqlite=true`): full open/exec/query/bind/tx/savepoint/pool/migrator/schema inspect
-- `zsql.drivers.postgres`: native (no libpq) URL parse, SCRAM-SHA-256 / MD5 / cleartext, simple + extended query, tx/savepoints, pool
+- `zsql.drivers.postgres`: native (no libpq) URL parse, SCRAM-SHA-256 / MD5 / cleartext, simple + extended query, tx/savepoints, pool, schema inspect, `Conn.lastError()`
 
 ### SQLite
 
@@ -58,6 +58,27 @@ defer rows.deinit();
 TLS is not implemented: `sslmode=require|verify-*` returns `error.TlsFailed`. Use `sslmode=disable` on trusted networks for now.
 
 Auth: trust, cleartext, MD5, **SCRAM-SHA-256**.
+
+Failed commands map SQLSTATE into fine-grained errors (`UniqueViolation`, `ForeignKeyViolation`, …) and store rich metadata on the connection:
+
+```zig
+conn.execParams(...) catch |err| {
+    if (conn.lastError()) |db_err| {
+        // db_err.code / .table / .constraint — never includes bind params you sent
+        _ = db_err;
+    }
+    return err;
+};
+```
+
+After `ErrorResponse`, the driver drains to `ReadyForQuery` so the connection stays usable.
+
+Schema inspection (for offline checks):
+
+```zig
+const schema = try conn.inspectSchema(allocator);
+defer zsql.drivers.postgres.freeInspectedSchema(allocator, schema);
+```
 
 ### QueryBuilder
 
@@ -88,7 +109,7 @@ try zsql.check.checkQuery(.{
 });
 ```
 
-SQLite can build a schema graph with `Conn.inspectSchema` and render ZON via `zsql.inspect.writeSchemaZon`.
+SQLite and PostgreSQL can build a schema graph with `Conn.inspectSchema` and render ZON via `zsql.inspect.writeSchemaZon`.
 
 ### CLI
 

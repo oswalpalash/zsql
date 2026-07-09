@@ -193,6 +193,85 @@ pub const Conn = struct {
         self.rollback() catch {};
     }
 
+    /// Inspect base tables via `information_schema` for offline query checks.
+    ///
+    /// Caller owns the returned schema; free with `freeInspectedSchema`.
+    /// Table names in the `public` schema are bare; other schemas are
+    /// qualified as `schema.table`. Column types use PostgreSQL `udt_name`.
+    pub fn inspectSchema(self: *Conn, allocator: std.mem.Allocator) !core.inspect.Schema {
+        if (self.closed) return error.ConnectionClosed;
+
+        var tables_list: std.ArrayListUnmanaged(core.inspect.Table) = .empty;
+        errdefer freeInspectedTables(allocator, tables_list.items);
+
+        var table_rows = try self.query(core.inspect.postgres_list_tables_sql);
+        defer table_rows.deinit();
+
+        while (table_rows.next()) |row| {
+            const schema_name = try (try row.value("table_schema")).asText();
+            const table_name = try (try row.value("table_name")).asText();
+
+            const display_name = try core.inspect.postgresTableDisplayName(allocator, schema_name, table_name);
+            errdefer allocator.free(display_name);
+
+            var col_rows = try self.queryParams(core.inspect.postgres_list_columns_sql, &.{
+                .{ .text = schema_name },
+                .{ .text = table_name },
+            });
+            defer col_rows.deinit();
+
+            // Dupe column fields before the next row / rows deinit invalidates
+            // borrowed text from the wire buffers.
+            var owned_info: std.ArrayListUnmanaged(struct {
+                name: []u8,
+                type_name: []u8,
+                is_nullable: bool,
+                primary_key: bool,
+            }) = .empty;
+            defer {
+                for (owned_info.items) |item| {
+                    allocator.free(item.name);
+                    allocator.free(item.type_name);
+                }
+                owned_info.deinit(allocator);
+            }
+
+            while (col_rows.next()) |col_row| {
+                const cname = try (try col_row.value("column_name")).asText();
+                const ctype = try (try col_row.value("udt_name")).asText();
+                const nullable_text = try (try col_row.value("is_nullable")).asText();
+                const pk_text = try (try col_row.value("is_primary_key")).asText();
+                try owned_info.append(allocator, .{
+                    .name = try allocator.dupe(u8, cname),
+                    .type_name = try allocator.dupe(u8, ctype),
+                    .is_nullable = std.ascii.eqlIgnoreCase(nullable_text, "YES"),
+                    .primary_key = std.ascii.eqlIgnoreCase(pk_text, "YES"),
+                });
+            }
+
+            const info = try allocator.alloc(core.inspect.PostgresColumnInfoRow, owned_info.items.len);
+            defer allocator.free(info);
+            for (owned_info.items, 0..) |item, i| {
+                info[i] = .{
+                    .name = item.name,
+                    .type_name = item.type_name,
+                    .is_nullable = item.is_nullable,
+                    .primary_key = item.primary_key,
+                };
+            }
+
+            const columns = try core.inspect.columnsFromPostgresColumnInfo(allocator, info);
+            try tables_list.append(allocator, .{
+                .name = display_name,
+                .columns = columns,
+            });
+        }
+
+        return .{
+            .tables = try tables_list.toOwnedSlice(allocator),
+        };
+    }
+
     /// Create a savepoint with an internally generated name.
     pub fn savepoint(self: *Conn) !Savepoint {
         if (self.closed) return error.ConnectionClosed;
@@ -694,6 +773,23 @@ fn mapWriteError(err: ?net.Stream.Writer.Error) anyerror {
         };
     }
     return error.ProtocolError;
+}
+
+/// Free a schema graph returned by `Conn.inspectSchema`.
+pub fn freeInspectedSchema(allocator: std.mem.Allocator, schema: core.inspect.Schema) void {
+    freeInspectedTables(allocator, @constCast(schema.tables));
+}
+
+fn freeInspectedTables(allocator: std.mem.Allocator, tables: []core.inspect.Table) void {
+    for (tables) |table| {
+        allocator.free(table.name);
+        for (table.columns) |col| {
+            allocator.free(col.name);
+            allocator.free(col.type_name);
+        }
+        allocator.free(@constCast(table.columns));
+    }
+    allocator.free(tables);
 }
 
 const OwnedSimpleRow = struct {
