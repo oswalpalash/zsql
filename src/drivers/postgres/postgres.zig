@@ -12,6 +12,7 @@ pub const auth = @import("auth.zig");
 pub const scram = @import("scram.zig");
 pub const types = @import("types.zig");
 pub const conn = @import("conn.zig");
+pub const pool = @import("pool.zig");
 
 pub const Config = url.Config;
 pub const SslMode = url.SslMode;
@@ -20,6 +21,11 @@ pub const Conn = conn.Conn;
 pub const SimpleRows = conn.SimpleRows;
 pub const SimpleRow = conn.SimpleRow;
 pub const Savepoint = conn.Savepoint;
+pub const Pool = pool.Pool;
+pub const Lease = pool.Lease;
+pub const PooledRows = pool.PooledRows;
+pub const PoolConfig = pool.PoolConfig;
+pub const PoolStats = pool.PoolStats;
 
 pub const enabled = true;
 
@@ -30,4 +36,5 @@ test {
     _ = scram;
     _ = types;
     _ = conn;
+    _ = pool;
 }
