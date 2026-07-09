@@ -189,6 +189,27 @@ test "writeSchemaZon is deterministic" {
     );
 }
 
+test "writeSchemaZon matches golden users_schema.zon" {
+    const schema = Schema{
+        .tables = &.{
+            .{
+                .name = "users",
+                .columns = &.{
+                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+                    .{ .name = "email", .type_name = "TEXT", .nullable = false, .primary_key = false },
+                    .{ .name = "active", .type_name = "BOOLEAN", .nullable = false, .primary_key = false },
+                    .{ .name = "note", .type_name = "TEXT", .nullable = true, .primary_key = false },
+                },
+            },
+        },
+    };
+
+    var buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeSchemaZon(&writer, schema);
+    try std.testing.expectEqualStrings(@embedFile("testdata/users_schema.zon"), writer.buffered());
+}
+
 test "columnsFromSqliteTableInfo maps nullability and pk" {
     const rows = [_]SqliteTableInfoRow{
         .{ .name = "id", .type_name = "INTEGER", .notnull = false, .pk = true },

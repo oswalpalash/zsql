@@ -39,6 +39,10 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run zsql tests");
     test_step.dependOn(&run_tests.step);
 
+    // Convenience aliases used in docs / local workflows.
+    const test_core_step = b.step("test-core", "Alias for zig build test (driver-agnostic + postgres unit tests)");
+    test_core_step.dependOn(test_step);
+
     // CLI
     const cli_mod = b.createModule(.{
         .root_source_file = b.path("cli/main.zig"),
@@ -150,8 +154,15 @@ pub fn build(b: *std.Build) void {
 
         const run_sqlite_migrate_example = b.addRunArtifact(sqlite_migrate_example);
         sqlite_migrate_example_step.dependOn(&run_sqlite_migrate_example.step);
+
+        const test_sqlite_step = b.step("test-sqlite", "Run tests with -Denable-sqlite=true (same as current test run when flag set)");
+        test_sqlite_step.dependOn(test_step);
     } else {
         sqlite_example_step.dependOn(&run_tests.step);
         sqlite_migrate_example_step.dependOn(&run_tests.step);
+
+        // Without the flag, document the intended invocation rather than faking coverage.
+        const test_sqlite_step = b.step("test-sqlite", "Requires: zig build test-sqlite -Denable-sqlite=true");
+        test_sqlite_step.dependOn(test_step);
     }
 }
