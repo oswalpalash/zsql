@@ -1,5 +1,7 @@
 pub const Error = @import("core/error.zig").Error;
 pub const DbError = @import("core/db_error.zig").DbError;
+pub const OwnedDbError = @import("core/db_error.zig").OwnedDbError;
+pub const PostgresErrorFields = @import("core/db_error.zig").PostgresErrorFields;
 pub const ErrorCategory = @import("core/db_error.zig").ErrorCategory;
 pub const DriverKind = @import("core/db_error.zig").DriverKind;
 pub const Value = @import("core/value.zig").Value;

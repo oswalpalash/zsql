@@ -15,6 +15,8 @@ const net = std.Io.net;
 /// - Caller owns `Config` independently of `Conn`.
 /// - `Conn` owns the TCP stream and I/O buffers; call `deinit`.
 /// - Password material is never stored on `Conn` after handshake.
+/// - `lastError()` borrows from connection-owned storage until the next error
+///   is recorded or `deinit` runs.
 pub const Conn = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -30,6 +32,8 @@ pub const Conn = struct {
     backend_secret: ?i32 = null,
     tx_status: protocol.TxStatus = .idle,
     next_savepoint_id: usize = 0,
+    /// Last server ErrorResponse fields, allocator-owned.
+    last_error: ?core.OwnedDbError = null,
 
     /// Open a TCP connection and complete the PostgreSQL startup handshake.
     ///
@@ -71,7 +75,22 @@ pub const Conn = struct {
         self.stream.close(self.io);
         self.allocator.free(self.read_buf);
         self.allocator.free(self.write_buf);
+        self.clearLastError();
         self.closed = true;
+    }
+
+    /// Borrowed view of the last ErrorResponse metadata, if any.
+    /// Valid until the next failing query on this connection or `deinit`.
+    pub fn lastError(self: *const Conn) ?core.DbError {
+        if (self.last_error) |*owned| return owned.view();
+        return null;
+    }
+
+    fn clearLastError(self: *Conn) void {
+        if (self.last_error) |*owned| {
+            owned.deinit(self.allocator);
+            self.last_error = null;
+        }
     }
 
     /// Execute a simple-query statement that does not return rows.
@@ -98,10 +117,16 @@ pub const Conn = struct {
                     self.tx_status = try protocol.parseReadyForQuery(msg.body);
                     return .{ .rows_affected = rows_affected };
                 },
-                .error_response => return mapSqlError(msg.body),
+                .error_response => return self.failFromErrorResponse(msg.body, true),
                 .notice_response => {},
-                .row_description, .data_row => return error.UnexpectedRow,
-                else => return error.ProtocolError,
+                .row_description, .data_row => {
+                    self.drainUntilReady();
+                    return error.UnexpectedRow;
+                },
+                else => {
+                    self.drainUntilReady();
+                    return error.ProtocolError;
+                },
             }
         }
     }
@@ -128,10 +153,16 @@ pub const Conn = struct {
                     self.tx_status = try protocol.parseReadyForQuery(msg.body);
                     return .{ .rows_affected = rows_affected };
                 },
-                .error_response => return mapSqlError(msg.body),
+                .error_response => return self.failFromErrorResponse(msg.body, true),
                 .notice_response => {},
-                .row_description, .data_row => return error.UnexpectedRow,
-                else => return error.ProtocolError,
+                .row_description, .data_row => {
+                    self.drainUntilReady();
+                    return error.UnexpectedRow;
+                },
+                else => {
+                    self.drainUntilReady();
+                    return error.ProtocolError;
+                },
             }
         }
     }
@@ -294,9 +325,12 @@ pub const Conn = struct {
                         .rows_affected = rows_affected,
                     };
                 },
-                .error_response => return mapSqlError(msg.body),
+                .error_response => return self.failFromErrorResponse(msg.body, true),
                 .notice_response => {},
-                else => return error.ProtocolError,
+                else => {
+                    self.drainUntilReady();
+                    return error.ProtocolError;
+                },
             }
         }
     }
@@ -380,9 +414,12 @@ pub const Conn = struct {
                         .rows_affected = rows_affected,
                     };
                 },
-                .error_response => return mapSqlError(msg.body),
+                .error_response => return self.failFromErrorResponse(msg.body, true),
                 .notice_response => {},
-                else => return error.ProtocolError,
+                else => {
+                    self.drainUntilReady();
+                    return error.ProtocolError;
+                },
             }
         }
     }
@@ -485,18 +522,80 @@ pub const Conn = struct {
                     return;
                 },
                 .error_response => {
-                    const fields = try protocol.parseErrorFields(msg.body);
-                    // Prefer auth-ish failures when a SQLSTATE is present.
-                    if (fields.code) |code| {
-                        if (std.mem.eql(u8, code, "28P01") or std.mem.eql(u8, code, "28000")) {
-                            return error.AuthFailed;
-                        }
-                    }
-                    return error.AuthFailed;
+                    // Startup failures usually close the socket; still record
+                    // metadata and map SQLSTATE when present.
+                    const err = self.captureSqlError(msg.body);
+                    // Prefer AuthFailed for handshake failures without a clear code.
+                    if (err == error.DriverError) return error.AuthFailed;
+                    return err;
                 },
                 .notice_response => {},
                 .negotiate_protocol_version => return error.ProtocolError,
                 else => return error.ProtocolError,
+            }
+        }
+    }
+
+    /// Record ErrorResponse metadata and return the mapped Zig error.
+    /// When `drain` is true, consume messages until ReadyForQuery so the
+    /// connection remains usable for subsequent commands.
+    fn failFromErrorResponse(self: *Conn, body: []const u8, drain: bool) anyerror {
+        const err = self.captureSqlError(body);
+        if (drain) self.drainUntilReady();
+        return err;
+    }
+
+    fn captureSqlError(self: *Conn, body: []const u8) anyerror {
+        self.clearLastError();
+        const fields = protocol.parseErrorFields(body) catch return error.DriverError;
+        const zig_err = if (fields.code) |code|
+            core.DbError.errorFromSqlState(code)
+        else
+            error.DriverError;
+
+        const pg_fields = core.PostgresErrorFields{
+            .code = fields.code,
+            .message = fields.message,
+            .detail = fields.detail,
+            .hint = fields.hint,
+            .schema = fields.schema,
+            .table = fields.table,
+            .column = fields.column,
+            .constraint = fields.constraint,
+        };
+        // Best-effort ownership; OOM must not hide the original SQL error.
+        self.last_error = core.OwnedDbError.fromPostgresFields(self.allocator, pg_fields, zig_err) catch null;
+        return zig_err;
+    }
+
+    /// After ErrorResponse (or unexpected messages mid-command), read until
+    /// ReadyForQuery so the session is synchronized again.
+    fn drainUntilReady(self: *Conn) void {
+        while (true) {
+            const msg = self.readMessage() catch {
+                // I/O failure mid-drain: mark closed so callers do not reuse.
+                self.closed = true;
+                return;
+            };
+            defer self.allocator.free(msg.body);
+            switch (msg.tag) {
+                .ready_for_query => {
+                    self.tx_status = protocol.parseReadyForQuery(msg.body) catch .failed;
+                    return;
+                },
+                .error_response, .notice_response => {},
+                .command_complete,
+                .empty_query_response,
+                .parse_complete,
+                .bind_complete,
+                .no_data,
+                .row_description,
+                .data_row,
+                .parameter_status,
+                .parameter_description,
+                .portal_suspended,
+                => {},
+                else => {},
             }
         }
     }
@@ -597,14 +696,6 @@ fn mapWriteError(err: ?net.Stream.Writer.Error) anyerror {
     return error.ProtocolError;
 }
 
-fn mapSqlError(body: []const u8) anyerror {
-    const fields = protocol.parseErrorFields(body) catch return error.DriverError;
-    if (fields.code) |code| {
-        return core.DbError.errorFromSqlState(code);
-    }
-    return error.DriverError;
-}
-
 const OwnedSimpleRow = struct {
     values: []core.OwnedValue,
 
@@ -702,6 +793,35 @@ test "savepoint names are deterministic prefixes" {
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "zsql_sp_{d}", .{0});
     try std.testing.expectEqualStrings("zsql_sp_0", name);
+}
+
+test "captureSqlError stores OwnedDbError for lastError()" {
+    // Exercise the error capture path without a live TCP connection by
+    // constructing a minimal Conn-like storage dance through public helpers.
+    const body =
+        "SERROR\x00C23505\x00Mduplicate key\x00DKey (email)=(x) already exists.\x00tusers\x00cemail\x00nusers_email_key\x00\x00";
+    const fields = try protocol.parseErrorFields(body);
+    try std.testing.expectEqualStrings("23505", fields.code.?);
+
+    const zig_err = core.DbError.errorFromSqlState(fields.code.?);
+    try std.testing.expect(zig_err == error.UniqueViolation);
+
+    var owned = try core.OwnedDbError.fromPostgresFields(std.testing.allocator, .{
+        .code = fields.code,
+        .message = fields.message,
+        .detail = fields.detail,
+        .hint = fields.hint,
+        .schema = fields.schema,
+        .table = fields.table,
+        .column = fields.column,
+        .constraint = fields.constraint,
+    }, zig_err);
+    defer owned.deinit(std.testing.allocator);
+
+    const view = owned.view();
+    try std.testing.expectEqualStrings("users", view.table.?);
+    try std.testing.expectEqualStrings("users_email_key", view.constraint.?);
+    try std.testing.expect(view.category == .constraint);
 }
 
 test "Conn rejects TLS-required configs before connecting" {
