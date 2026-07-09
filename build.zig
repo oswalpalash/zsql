@@ -87,6 +87,10 @@ pub fn build(b: *std.Build) void {
     const checked_example_step = b.step("checked-queries-example", "Run offline checked-query example");
     checked_example_step.dependOn(&run_checked_example.step);
 
+    // Aggregate examples step: always-safe examples (no external DB required).
+    const examples_step = b.step("examples", "Run examples that need no external services");
+    examples_step.dependOn(checked_example_step);
+
     // Optional live PostgreSQL tests (skipped unless ZSQL_PG_URL is set at runtime).
     const pg_live_mod = b.createModule(.{
         .root_source_file = b.path("tests/postgres_live.zig"),
@@ -162,6 +166,10 @@ pub fn build(b: *std.Build) void {
 
         const test_sqlite_step = b.step("test-sqlite", "Run tests with -Denable-sqlite=true (same as current test run when flag set)");
         test_sqlite_step.dependOn(test_step);
+
+        // When SQLite is enabled, fold leak-checked examples into `zig build examples`.
+        examples_step.dependOn(sqlite_example_step);
+        examples_step.dependOn(sqlite_migrate_example_step);
     } else {
         sqlite_example_step.dependOn(&run_tests.step);
         sqlite_migrate_example_step.dependOn(&run_tests.step);
@@ -170,4 +178,7 @@ pub fn build(b: *std.Build) void {
         const test_sqlite_step = b.step("test-sqlite", "Requires: zig build test-sqlite -Denable-sqlite=true");
         test_sqlite_step.dependOn(test_step);
     }
+
+    // Postgres pool example is optional (skips without ZSQL_PG_URL); always buildable.
+    examples_step.dependOn(pg_pool_example_step);
 }
