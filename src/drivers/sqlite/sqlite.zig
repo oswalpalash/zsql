@@ -367,9 +367,31 @@ pub const Conn = struct {
     allocator: std.mem.Allocator,
     handle: *c.sqlite3,
     closed: bool = false,
+    /// Optional prepared-statement handle cache for this connection.
+    prepared_cache: ?PreparedCache = null,
 
     pub fn close(self: *Conn) void {
+        self.disableStmtCache();
         self.closed = true;
+    }
+
+    /// Enable a connection-local prepared statement handle cache.
+    pub fn enableStmtCache(self: *Conn, max_entries: usize) !void {
+        if (self.closed) return error.ConnectionClosed;
+        self.disableStmtCache();
+        self.prepared_cache = try PreparedCache.init(self.allocator, max_entries);
+    }
+
+    pub fn disableStmtCache(self: *Conn) void {
+        if (self.prepared_cache) |*cache| {
+            cache.deinit();
+            self.prepared_cache = null;
+        }
+    }
+
+    pub fn stmtCacheLen(self: *const Conn) usize {
+        if (self.prepared_cache) |*cache| return cache.len();
+        return 0;
     }
 
     pub fn prepare(self: *Conn, sql: []const u8) !Stmt {
@@ -377,10 +399,31 @@ pub const Conn = struct {
         return Stmt.init(self.allocator, self.handle, sql);
     }
 
+    /// Prepare with optional cache reuse. Returned `Prepared` owns cleanup policy.
+    fn prepareCached(self: *Conn, sql: []const u8) !Prepared {
+        if (self.closed) return error.ConnectionClosed;
+        if (self.prepared_cache) |*cache| {
+            if (try cache.get(self.handle, sql)) |stmt| {
+                return .{ .stmt = stmt, .from_cache = true };
+            }
+            var stmt = try Stmt.init(self.allocator, self.handle, sql);
+            cache.put(sql, stmt) catch |err| {
+                stmt.close();
+                return err;
+            };
+            // Borrow a non-finalizing view; cache owns finalize.
+            return .{ .stmt = cache.borrow(sql).?, .from_cache = true };
+        }
+        return .{
+            .stmt = try Stmt.init(self.allocator, self.handle, sql),
+            .from_cache = false,
+        };
+    }
+
     pub fn exec(self: *Conn, sql: []const u8, binds: []const core.Value) !core.ExecResult {
-        var stmt = try self.prepare(sql);
-        defer stmt.close();
-        return stmt.exec(binds);
+        var prepared = try self.prepareCached(sql);
+        defer prepared.release();
+        return prepared.stmt.exec(binds);
     }
 
     pub fn execScript(self: *Conn, sql: []const u8) !void {
@@ -389,21 +432,21 @@ pub const Conn = struct {
     }
 
     pub fn query(self: *Conn, sql: []const u8, binds: []const core.Value) !Rows {
-        var stmt = try self.prepare(sql);
-        errdefer stmt.close();
-        return Rows.init(stmt, binds);
+        var prepared = try self.prepareCached(sql);
+        errdefer prepared.release();
+        return Rows.initOwned(prepared.stmt, binds, !prepared.from_cache);
     }
 
     pub fn execNamed(self: *Conn, sql: []const u8, binds: []const NamedValue) !core.ExecResult {
-        var stmt = try self.prepare(sql);
-        defer stmt.close();
-        return stmt.execNamed(binds);
+        var prepared = try self.prepareCached(sql);
+        defer prepared.release();
+        return prepared.stmt.execNamed(binds);
     }
 
     pub fn queryNamed(self: *Conn, sql: []const u8, binds: []const NamedValue) !Rows {
-        var stmt = try self.prepare(sql);
-        errdefer stmt.close();
-        return Rows.initNamed(stmt, binds);
+        var prepared = try self.prepareCached(sql);
+        errdefer prepared.release();
+        return Rows.initOwnedNamed(prepared.stmt, binds, !prepared.from_cache);
     }
 
     pub fn begin(self: *Conn) !Tx {
@@ -480,6 +523,105 @@ pub const Conn = struct {
         return .{
             .tables = try tables_list.toOwnedSlice(allocator),
         };
+    }
+};
+
+/// Handle + ownership flag for cached vs one-shot prepares.
+const Prepared = struct {
+    stmt: Stmt,
+    from_cache: bool,
+
+    fn release(self: *Prepared) void {
+        if (self.from_cache) {
+            self.stmt.resetForReuse();
+        } else {
+            self.stmt.close();
+        }
+    }
+};
+
+/// Connection-local SQLite prepared statement handle cache (LRU).
+const PreparedCache = struct {
+    allocator: std.mem.Allocator,
+    max_entries: usize,
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+
+    const Entry = struct {
+        sql: []u8,
+        stmt: Stmt,
+    };
+
+    fn init(allocator: std.mem.Allocator, max_entries: usize) !PreparedCache {
+        if (max_entries == 0) return error.InvalidArguments;
+        return .{ .allocator = allocator, .max_entries = max_entries };
+    }
+
+    fn deinit(self: *PreparedCache) void {
+        for (self.entries.items) |*entry| {
+            entry.stmt.close();
+            self.allocator.free(entry.sql);
+        }
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn len(self: *const PreparedCache) usize {
+        return self.entries.items.len;
+    }
+
+    fn get(self: *PreparedCache, db: *c.sqlite3, sql: []const u8) !?Stmt {
+        _ = db;
+        for (self.entries.items, 0..) |*entry, i| {
+            if (std.mem.eql(u8, entry.sql, sql)) {
+                if (i + 1 != self.entries.items.len) {
+                    const moved = self.entries.orderedRemove(i);
+                    try self.entries.append(self.allocator, moved);
+                }
+                return self.borrow(sql);
+            }
+        }
+        return null;
+    }
+
+    fn borrow(self: *PreparedCache, sql: []const u8) ?Stmt {
+        for (self.entries.items) |*entry| {
+            if (std.mem.eql(u8, entry.sql, sql)) {
+                return .{
+                    .allocator = entry.stmt.allocator,
+                    .handle = entry.stmt.handle,
+                    .placeholders = entry.stmt.placeholders,
+                    .owned_bind_buffers = .empty,
+                    .closed = false,
+                    .finalize_on_close = false,
+                };
+            }
+        }
+        return null;
+    }
+
+    fn put(self: *PreparedCache, sql: []const u8, stmt: Stmt) !void {
+        for (self.entries.items, 0..) |*entry, i| {
+            if (std.mem.eql(u8, entry.sql, sql)) {
+                entry.stmt.close();
+                entry.stmt = stmt;
+                if (i + 1 != self.entries.items.len) {
+                    const moved = self.entries.orderedRemove(i);
+                    try self.entries.append(self.allocator, moved);
+                }
+                return;
+            }
+        }
+        while (self.entries.items.len >= self.max_entries) {
+            var old = self.entries.orderedRemove(0);
+            old.stmt.close();
+            self.allocator.free(old.sql);
+        }
+        const owned_sql = try self.allocator.dupe(u8, sql);
+        errdefer self.allocator.free(owned_sql);
+        try self.entries.append(self.allocator, .{
+            .sql = owned_sql,
+            .stmt = stmt,
+        });
     }
 };
 
@@ -702,6 +844,8 @@ pub const Stmt = struct {
     placeholders: core.params.Summary,
     owned_bind_buffers: std.ArrayListUnmanaged([]u8) = .empty,
     closed: bool = false,
+    /// When false, `close` only resets/clears binds (borrowed from a cache).
+    finalize_on_close: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, db: *c.sqlite3, sql: []const u8) !Stmt {
         if (std.mem.trim(u8, sql, " \t\r\n").len == 0) return error.InvalidSql;
@@ -723,10 +867,24 @@ pub const Stmt = struct {
     pub fn close(self: *Stmt) void {
         if (self.closed) return;
         self.freeBindBuffers();
-        const rc = c.sqlite3_finalize(self.handle);
-        std.debug.assert(rc == c.SQLITE_OK);
+        if (self.finalize_on_close) {
+            const rc = c.sqlite3_finalize(self.handle);
+            std.debug.assert(rc == c.SQLITE_OK);
+        } else {
+            _ = c.sqlite3_clear_bindings(self.handle);
+            _ = c.sqlite3_reset(self.handle);
+        }
         self.owned_bind_buffers.deinit(self.allocator);
         self.closed = true;
+    }
+
+    /// Reset a cached statement for reuse without finalizing.
+    pub fn resetForReuse(self: *Stmt) void {
+        if (self.closed) return;
+        self.freeBindBuffers();
+        _ = c.sqlite3_clear_bindings(self.handle);
+        _ = c.sqlite3_reset(self.handle);
+        self.owned_bind_buffers.clearRetainingCapacity();
     }
 
     pub fn exec(self: *Stmt, binds: []const core.Value) !core.ExecResult {
@@ -905,24 +1063,34 @@ pub const Rows = struct {
     columns: []const []const u8,
     values: []core.Value,
     done: bool = false,
+    /// When true, `deinit` finalizes the statement; otherwise only resets it.
+    owns_stmt: bool = true,
 
     pub fn init(stmt: Stmt, binds: []const core.Value) !Rows {
-        var owned_stmt = stmt;
-        errdefer owned_stmt.close();
-
-        try owned_stmt.bindValues(binds);
-        return initBound(owned_stmt);
+        return initOwned(stmt, binds, true);
     }
 
     pub fn initNamed(stmt: Stmt, binds: []const NamedValue) !Rows {
-        var owned_stmt = stmt;
-        errdefer owned_stmt.close();
-
-        try owned_stmt.bindNamedValues(binds);
-        return initBound(owned_stmt);
+        return initOwnedNamed(stmt, binds, true);
     }
 
-    fn initBound(owned_stmt: Stmt) !Rows {
+    pub fn initOwned(stmt: Stmt, binds: []const core.Value, owns_stmt: bool) !Rows {
+        var owned_stmt = stmt;
+        errdefer if (owns_stmt) owned_stmt.close() else owned_stmt.resetForReuse();
+
+        try owned_stmt.bindValues(binds);
+        return initBound(owned_stmt, owns_stmt);
+    }
+
+    pub fn initOwnedNamed(stmt: Stmt, binds: []const NamedValue, owns_stmt: bool) !Rows {
+        var owned_stmt = stmt;
+        errdefer if (owns_stmt) owned_stmt.close() else owned_stmt.resetForReuse();
+
+        try owned_stmt.bindNamedValues(binds);
+        return initBound(owned_stmt, owns_stmt);
+    }
+
+    fn initBound(owned_stmt: Stmt, owns_stmt: bool) !Rows {
         var stmt = owned_stmt;
 
         const column_count = try sqliteColumnCount(stmt.handle);
@@ -940,13 +1108,18 @@ pub const Rows = struct {
             .stmt = stmt,
             .columns = columns,
             .values = values,
+            .owns_stmt = owns_stmt,
         };
     }
 
     pub fn deinit(self: *Rows) void {
         self.stmt.allocator.free(self.values);
         self.stmt.allocator.free(self.columns);
-        self.stmt.close();
+        if (self.owns_stmt) {
+            self.stmt.close();
+        } else {
+            self.stmt.resetForReuse();
+        }
         self.done = true;
     }
 
@@ -1073,6 +1246,32 @@ fn findMigrationRecord(records: []const MigrationRecord, version: u64) ?Migratio
         if (record.version == version) return record;
     }
     return null;
+}
+
+test "SQLite prepared statement cache reuses handles" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    try conn.enableStmtCache(4);
+    _ = try conn.exec("create table cache_probe (id integer primary key, n integer)", &.{});
+    _ = try conn.exec("insert into cache_probe (id, n) values (?, ?)", &.{ .{ .integer = 1 }, .{ .integer = 10 } });
+    try std.testing.expectEqual(@as(usize, 2), conn.stmtCacheLen());
+
+    var rows1 = try conn.query("select n from cache_probe where id = ?", &.{.{ .integer = 1 }});
+    try std.testing.expectEqual(@as(i64, 10), try (try (try rows1.next()).?.value("n")).asInt());
+    rows1.deinit();
+    try std.testing.expectEqual(@as(usize, 3), conn.stmtCacheLen());
+
+    var rows2 = try conn.query("select n from cache_probe where id = ?", &.{.{ .integer = 1 }});
+    try std.testing.expectEqual(@as(i64, 10), try (try (try rows2.next()).?.value("n")).asInt());
+    rows2.deinit();
+    // Same SQL should not grow the cache.
+    try std.testing.expectEqual(@as(usize, 3), conn.stmtCacheLen());
+
+    conn.disableStmtCache();
+    try std.testing.expectEqual(@as(usize, 0), conn.stmtCacheLen());
 }
 
 test "SQLite inspectSchema exports tables and columns" {

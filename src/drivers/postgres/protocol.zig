@@ -157,9 +157,15 @@ pub fn buildPasswordMessage(allocator: std.mem.Allocator, password: []const u8) 
 
 /// Build Parse ('P') for the unnamed statement with unspecified parameter types.
 pub fn buildParseMessage(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
+    return buildParseMessageNamed(allocator, "", sql);
+}
+
+/// Build Parse ('P') for a named or unnamed statement.
+/// `statement_name` empty string means the unnamed statement.
+pub fn buildParseMessageNamed(allocator: std.mem.Allocator, statement_name: []const u8, sql: []const u8) ![]u8 {
     var body: std.ArrayListUnmanaged(u8) = .empty;
     defer body.deinit(allocator);
-    try appendCString(&body, allocator, ""); // statement name
+    try appendCString(&body, allocator, statement_name);
     try appendCString(&body, allocator, sql);
     try appendI16(&body, allocator, 0); // parameter type count
     return buildMessage(allocator, .parse, body.items);
@@ -170,11 +176,20 @@ pub fn buildParseMessage(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
 /// Each bind is either `null` (SQL NULL) or UTF-8 text bytes. Values are never
 /// interpolated into SQL; they travel only in the bind payload.
 pub fn buildBindMessage(allocator: std.mem.Allocator, binds: []const ?[]const u8) ![]u8 {
+    return buildBindMessageNamed(allocator, "", binds);
+}
+
+/// Build Bind ('B') for a named statement and the unnamed portal.
+pub fn buildBindMessageNamed(
+    allocator: std.mem.Allocator,
+    statement_name: []const u8,
+    binds: []const ?[]const u8,
+) ![]u8 {
     var body: std.ArrayListUnmanaged(u8) = .empty;
     defer body.deinit(allocator);
 
     try appendCString(&body, allocator, ""); // portal
-    try appendCString(&body, allocator, ""); // statement
+    try appendCString(&body, allocator, statement_name);
     try appendI16(&body, allocator, 0); // param format count (all text)
     try appendI16(&body, allocator, try castI16(binds.len));
     for (binds) |bind| {
@@ -187,6 +202,15 @@ pub fn buildBindMessage(allocator: std.mem.Allocator, binds: []const ?[]const u8
     }
     try appendI16(&body, allocator, 0); // result format count (all text)
     return buildMessage(allocator, .bind, body.items);
+}
+
+/// Build Close ('C') for a prepared statement by name.
+pub fn buildCloseStatementMessage(allocator: std.mem.Allocator, statement_name: []const u8) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.append(allocator, 'S');
+    try appendCString(&body, allocator, statement_name);
+    return buildMessage(allocator, .close, body.items);
 }
 
 /// Build Describe ('D') for the unnamed portal.
@@ -519,6 +543,20 @@ test "build extended query messages" {
     const bind_msg = try buildBindMessage(std.testing.allocator, &binds);
     defer std.testing.allocator.free(bind_msg);
     try std.testing.expectEqual(@as(u8, 'B'), bind_msg[0]);
+
+    const named_parse = try buildParseMessageNamed(std.testing.allocator, "zsql_ps_0", "select $1::int");
+    defer std.testing.allocator.free(named_parse);
+    try std.testing.expect(std.mem.indexOf(u8, named_parse, "zsql_ps_0") != null);
+
+    const named_bind = try buildBindMessageNamed(std.testing.allocator, "zsql_ps_0", &binds);
+    defer std.testing.allocator.free(named_bind);
+    try std.testing.expect(std.mem.indexOf(u8, named_bind, "zsql_ps_0") != null);
+
+    const close_msg = try buildCloseStatementMessage(std.testing.allocator, "zsql_ps_0");
+    defer std.testing.allocator.free(close_msg);
+    try std.testing.expectEqual(@as(u8, 'C'), close_msg[0]);
+    try std.testing.expectEqual(@as(u8, 'S'), close_msg[5]);
+
     try std.testing.expect(std.mem.indexOf(u8, bind_msg, "42") != null);
 
     const describe = try buildDescribePortalMessage(std.testing.allocator);

@@ -59,7 +59,11 @@ pub const StmtCache = struct {
     }
 
     /// Insert or refresh a mapping. Evicts the least-recently-used entry when full.
-    pub fn put(self: *StmtCache, sql: []const u8, name: []const u8) !void {
+    ///
+    /// When an entry is evicted to make room, returns that entry's owned fields so
+    /// the driver can close the server-side prepared statement. Caller must free
+    /// returned slices with `freeEntry` (or free `sql`/`name` individually).
+    pub fn put(self: *StmtCache, sql: []const u8, name: []const u8) !?Entry {
         // Refresh existing.
         for (self.entries.items, 0..) |entry, i| {
             if (std.mem.eql(u8, entry.sql, sql)) {
@@ -73,15 +77,22 @@ pub const StmtCache = struct {
                     const moved = self.entries.orderedRemove(i);
                     try self.entries.append(self.allocator, moved);
                 }
-                return;
+                return null;
             }
         }
 
-        while (self.entries.items.len >= self.max_entries) {
-            const old = self.entries.orderedRemove(0);
-            self.allocator.free(old.sql);
-            self.allocator.free(old.name);
+        var evicted: ?Entry = null;
+        if (self.entries.items.len >= self.max_entries) {
+            evicted = self.entries.orderedRemove(0);
         }
+        errdefer if (evicted) |e| {
+            // Restore on failure so the cache is not left short a slot without
+            // the caller receiving the entry to close/free.
+            self.entries.insert(self.allocator, 0, e) catch {
+                freeEntry(self.allocator, e);
+            };
+            evicted = null;
+        };
 
         const owned_sql = try self.allocator.dupe(u8, sql);
         errdefer self.allocator.free(owned_sql);
@@ -92,6 +103,17 @@ pub const StmtCache = struct {
             .name = owned_name,
             .hits = 1,
         });
+        return evicted;
+    }
+
+    pub fn freeEntry(allocator: std.mem.Allocator, entry: Entry) void {
+        allocator.free(entry.sql);
+        allocator.free(entry.name);
+    }
+
+    /// Remove and return all entries (for connection teardown / Close messages).
+    pub fn drain(self: *StmtCache) ![]Entry {
+        return try self.entries.toOwnedSlice(self.allocator);
     }
 
     pub fn len(self: *const StmtCache) usize {
@@ -116,21 +138,24 @@ test "StmtCache get miss and put hit" {
     defer cache.deinit();
 
     try std.testing.expect(cache.get("select 1") == null);
-    try cache.put("select 1", "zsql_ps_0");
+    try std.testing.expect(try cache.put("select 1", "zsql_ps_0") == null);
     try std.testing.expectEqualStrings("zsql_ps_0", cache.get("select 1").?);
     try std.testing.expectEqual(@as(usize, 1), cache.len());
 }
 
-test "StmtCache LRU eviction" {
+test "StmtCache LRU eviction returns entry" {
     var cache = try StmtCache.init(std.testing.allocator, 2);
     defer cache.deinit();
 
-    try cache.put("a", "n0");
-    try cache.put("b", "n1");
+    try std.testing.expect(try cache.put("a", "n0") == null);
+    try std.testing.expect(try cache.put("b", "n1") == null);
     // Touch a so b becomes older? put order: a then b → a oldest, b newest.
     // Hit a → a becomes newest, b oldest.
     _ = cache.get("a");
-    try cache.put("c", "n2"); // evicts b
+    const evicted = (try cache.put("c", "n2")).?;
+    defer StmtCache.freeEntry(std.testing.allocator, evicted);
+    try std.testing.expectEqualStrings("b", evicted.sql);
+    try std.testing.expectEqualStrings("n1", evicted.name);
     try std.testing.expect(cache.contains("a"));
     try std.testing.expect(cache.contains("c"));
     try std.testing.expect(!cache.contains("b"));
@@ -140,8 +165,8 @@ test "StmtCache LRU eviction" {
 test "StmtCache put refresh updates name" {
     var cache = try StmtCache.init(std.testing.allocator, 4);
     defer cache.deinit();
-    try cache.put("q", "old");
-    try cache.put("q", "new");
+    try std.testing.expect(try cache.put("q", "old") == null);
+    try std.testing.expect(try cache.put("q", "new") == null);
     try std.testing.expectEqualStrings("new", cache.get("q").?);
     try std.testing.expectEqual(@as(usize, 1), cache.len());
 }

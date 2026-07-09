@@ -109,6 +109,39 @@ test "postgres live: handshake, params, tx, errors, inspect" {
     _ = try conn.exec("drop table if exists zsql_live_users");
 }
 
+test "postgres live: statement cache reuses named prepares" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+
+    var conn = try pg.Conn.open(allocator, io, config);
+    defer conn.deinit();
+
+    try conn.enableStmtCache(4);
+    try std.testing.expectEqual(@as(usize, 0), conn.stmtCacheLen());
+
+    const sql = "select $1::int as n";
+    var rows1 = try conn.queryParams(sql, &.{.{ .integer = 1 }});
+    defer rows1.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try (try rows1.next().?.value("n")).asInt());
+    try std.testing.expectEqual(@as(usize, 1), conn.stmtCacheLen());
+
+    var rows2 = try conn.queryParams(sql, &.{.{ .integer = 2 }});
+    defer rows2.deinit();
+    try std.testing.expectEqual(@as(i64, 2), try (try rows2.next().?.value("n")).asInt());
+    // Same SQL should still be a single cached prepare.
+    try std.testing.expectEqual(@as(usize, 1), conn.stmtCacheLen());
+
+    try conn.disableStmtCache();
+    try std.testing.expectEqual(@as(usize, 0), conn.stmtCacheLen());
+}
+
 test "postgres live: pool acquire release" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

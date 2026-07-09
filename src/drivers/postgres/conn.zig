@@ -34,6 +34,11 @@ pub const Conn = struct {
     next_savepoint_id: usize = 0,
     /// Last server ErrorResponse fields, allocator-owned.
     last_error: ?core.OwnedDbError = null,
+    /// Optional connection-local prepared-statement name cache.
+    /// Enabled with `enableStmtCache`; when set, extended queries reuse named
+    /// server prepares and skip Parse on cache hits.
+    stmt_cache: ?core.StmtCache = null,
+    next_stmt_id: u64 = 0,
 
     /// Open a TCP connection and complete the PostgreSQL startup handshake.
     ///
@@ -140,6 +145,8 @@ pub const Conn = struct {
 
     pub fn deinit(self: *Conn) void {
         if (self.closed) return;
+        // Best-effort Close of cached prepares before Terminate.
+        self.disableStmtCache() catch {};
         self.sendTerminate() catch {};
         self.stream.close(self.io);
         self.allocator.free(self.read_buf);
@@ -162,7 +169,68 @@ pub const Conn = struct {
         }
     }
 
-    /// Execute a simple-query statement that does not return rows.
+    /// Enable a connection-local prepared statement name cache.
+    ///
+    /// When enabled, `execParams` / `queryParams` Parse named statements once
+    /// and reuse them on subsequent identical SQL. Max entries must be > 0.
+    /// Calling again replaces the previous cache (after closing server prepares).
+    pub fn enableStmtCache(self: *Conn, max_entries: usize) !void {
+        if (self.closed) return error.ConnectionClosed;
+        try self.disableStmtCache();
+        self.stmt_cache = try core.StmtCache.init(self.allocator, max_entries);
+        self.next_stmt_id = 0;
+    }
+
+    /// Disable the statement cache and Close any named prepares on the server.
+    pub fn disableStmtCache(self: *Conn) !void {
+        if (self.stmt_cache) |*cache| {
+            const entries = try cache.drain();
+            defer {
+                for (entries) |e| core.StmtCache.freeEntry(self.allocator, e);
+                self.allocator.free(entries);
+            }
+            // drain leaves cache.entries empty; free list storage.
+            cache.deinit();
+            self.stmt_cache = null;
+            if (!self.closed) {
+                for (entries) |e| {
+                    self.closePrepared(e.name) catch {};
+                }
+            }
+        }
+    }
+
+    pub fn stmtCacheLen(self: *const Conn) usize {
+        if (self.stmt_cache) |*cache| return cache.len();
+        return 0;
+    }
+
+    fn closePrepared(self: *Conn, name: []const u8) !void {
+        const close_msg = try protocol.buildCloseStatementMessage(self.allocator, name);
+        defer self.allocator.free(close_msg);
+        const sync_msg = try protocol.buildSyncMessage(self.allocator);
+        defer self.allocator.free(sync_msg);
+        try self.writeAll(close_msg);
+        try self.writeAll(sync_msg);
+        // Drain until ReadyForQuery (CloseComplete then ReadyForQuery).
+        while (true) {
+            const msg = try self.readMessage();
+            defer self.allocator.free(msg.body);
+            switch (msg.tag) {
+                .close_complete, .notice_response, .parameter_status => {},
+                .ready_for_query => {
+                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    return;
+                },
+                .error_response => return self.failFromErrorResponse(msg.body, true),
+                else => {
+                    self.drainUntilReady();
+                    return error.ProtocolError;
+                },
+            }
+        }
+    }
+
     ///
     /// Prefer extended/parameterized APIs once available for any user values.
     /// This path is intended for DDL, transaction control, and trusted SQL.
@@ -383,16 +451,49 @@ pub const Conn = struct {
         defer self.allocator.free(views);
         for (encoded.items, 0..) |item, i| views[i] = item;
 
-        const parse_msg = try protocol.buildParseMessage(self.allocator, sql);
-        defer self.allocator.free(parse_msg);
-        const bind_msg = try protocol.buildBindMessage(self.allocator, views);
+        // Resolve optional prepared-statement name from the connection cache.
+        var stmt_name: []const u8 = "";
+        var parse_needed = true;
+        var name_buf: [32]u8 = undefined;
+
+        if (self.stmt_cache) |*cache| {
+            if (cache.get(sql)) |cached_name| {
+                stmt_name = cached_name;
+                parse_needed = false;
+            } else {
+                stmt_name = try core.formatStmtName(&name_buf, self.next_stmt_id);
+                self.next_stmt_id += 1;
+            }
+        }
+
+        if (parse_needed) {
+            if (self.stmt_cache != null and stmt_name.len > 0) {
+                // Reserve cache slot before sending so eviction Close is ordered
+                // before the new Parse on the wire.
+                const evicted = try self.stmt_cache.?.put(sql, stmt_name);
+                if (evicted) |old| {
+                    defer core.StmtCache.freeEntry(self.allocator, old);
+                    try self.closePrepared(old.name);
+                }
+            }
+            const parse_msg = if (stmt_name.len == 0)
+                try protocol.buildParseMessage(self.allocator, sql)
+            else
+                try protocol.buildParseMessageNamed(self.allocator, stmt_name, sql);
+            defer self.allocator.free(parse_msg);
+            try self.writeAll(parse_msg);
+        }
+
+        const bind_msg = if (stmt_name.len == 0)
+            try protocol.buildBindMessage(self.allocator, views)
+        else
+            try protocol.buildBindMessageNamed(self.allocator, stmt_name, views);
         defer self.allocator.free(bind_msg);
         const execute_msg = try protocol.buildExecuteMessage(self.allocator);
         defer self.allocator.free(execute_msg);
         const sync_msg = try protocol.buildSyncMessage(self.allocator);
         defer self.allocator.free(sync_msg);
 
-        try self.writeAll(parse_msg);
         try self.writeAll(bind_msg);
         if (describe_portal) {
             const describe_msg = try protocol.buildDescribePortalMessage(self.allocator);
@@ -999,6 +1100,17 @@ test "Conn require TLS fails when host is unreachable or after SSLRequest" {
 
 test "SslResponse parser is used by negotiation path" {
     try std.testing.expect((try protocol.SslResponse.fromByte('N')) == .rejects_tls);
+}
+
+test "enableStmtCache rejects zero capacity" {
+    // Pure unit path: construct a closed-like cache setup without TCP.
+    // StmtCache.init is what enableStmtCache uses.
+    try std.testing.expectError(error.InvalidArguments, core.StmtCache.init(std.testing.allocator, 0));
+}
+
+test "formatStmtName used for prepared names" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("zsql_ps_0", try core.formatStmtName(&buf, 0));
 }
 
 test "Conn rejects empty user" {

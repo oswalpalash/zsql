@@ -33,7 +33,7 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 - `zsql.StmtCache` (connection-local prepared-statement name LRU)
 - `zsql.inspect`, `zsql.check`
 - `zsql.drivers.sqlite` (`-Denable-sqlite=true`): full open/exec/query/bind/tx/savepoint/pool/migrator/schema inspect
-- `zsql.drivers.postgres`: native (no libpq) URL parse, SCRAM-SHA-256 / MD5 / cleartext, simple + extended query, tx/savepoints, pool, schema inspect, `Conn.lastError()`
+- `zsql.drivers.postgres`: native (no libpq) URL parse, SCRAM-SHA-256 / MD5 / cleartext, simple + extended query, tx/savepoints, pool, schema inspect, `Conn.lastError()`, optional `enableStmtCache`
 
 ### SQLite
 
@@ -79,6 +79,16 @@ conn.execParams(...) catch |err| {
 ```
 
 After `ErrorResponse`, the driver drains to `ReadyForQuery` so the connection stays usable.
+
+Optional prepared-statement cache (connection-local, no global state):
+
+```zig
+try conn.enableStmtCache(32);
+// execParams/queryParams reuse named server prepares for identical SQL
+try conn.disableStmtCache();
+```
+
+SQLite (`-Denable-sqlite=true`) has the same `enableStmtCache` API, caching `sqlite3_stmt` handles.
 
 Schema inspection (for offline checks):
 
