@@ -57,13 +57,13 @@ pub fn main() !void {
     });
     try get_user.validate(schema);
 
-    // JOIN + projection check: qualified columns, multi-table scope.
+    // JOIN + projection/WHERE/ON checks: qualified columns, multi-table scope.
     const user_posts = zsql.checkedQuery(.{
         .sql =
         \\select u.email, p.title
         \\from users u
         \\join posts p on p.user_id = u.id
-        \\where u.id = :id
+        \\where u.id = :id and lower(u.email) is not null
         ,
         .args = &.{.{ .name = "id" }},
         .row = &.{
@@ -71,6 +71,8 @@ pub fn main() !void {
             .{ .name = "p.title", .type_name = "TEXT" },
         },
         .check_projections = true,
+        .check_where = true,
+        .check_join_on = true,
     });
     try user_posts.validate(schema);
 
