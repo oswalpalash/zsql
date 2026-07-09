@@ -42,6 +42,9 @@ pub extern fn sqlite3_open_v2(
 
 pub extern fn sqlite3_close_v2(db: ?*sqlite3) c_int;
 
+/// Sleep up to `ms` when the database is locked (0 disables the busy handler).
+pub extern fn sqlite3_busy_timeout(db: ?*sqlite3, ms: c_int) c_int;
+
 pub extern fn sqlite3_prepare_v2(
     db: ?*sqlite3,
     zSql: [*:0]const u8,

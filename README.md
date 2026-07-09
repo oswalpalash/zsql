@@ -51,6 +51,15 @@ Uses explicit C ABI bindings in `src/drivers/sqlite/c.zig` (no `@cImport`).
 With `-Denable-sqlite=true`, the build fetches and compiles the SQLite amalgamation
 by default. Pass `-Dsqlite-system=true` to link system `libsqlite3` via pkg-config.
 
+```zig
+// Optional lock wait (sqlite3_busy_timeout) for multi-writer apps:
+var db = try zsql.drivers.sqlite.Database.open(allocator, .{
+    .mode = .file,
+    .path = "app.db",
+    .busy_timeout_ms = 5_000,
+});
+```
+
 ### PostgreSQL
 
 Native wire protocol. Prefer parameterized APIs:

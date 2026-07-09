@@ -12,6 +12,10 @@ pub const OpenMode = enum {
 pub const Config = struct {
     path: []const u8 = ":memory:",
     mode: OpenMode = .memory,
+    /// Passed to `sqlite3_busy_timeout` after open. `null` leaves SQLite's
+    /// default (fail immediately on lock). `0` explicitly disables the busy
+    /// handler. Typical values: 1000–5000 ms for multi-writer apps.
+    busy_timeout_ms: ?u32 = null,
 };
 
 pub const NamedValue = struct {
@@ -411,6 +415,19 @@ pub const Database = struct {
                 _ = c.sqlite3_close_v2(opened);
             }
             return error.DriverError;
+        }
+
+        if (config.busy_timeout_ms) |ms| {
+            // Cap at c_int max; SQLite treats the value as milliseconds.
+            const clamped: c_int = if (ms > std.math.maxInt(c_int))
+                std.math.maxInt(c_int)
+            else
+                @intCast(ms);
+            const busy_rc = c.sqlite3_busy_timeout(handle.?, clamped);
+            if (busy_rc != c.SQLITE_OK) {
+                _ = c.sqlite3_close_v2(handle.?);
+                return error.DriverError;
+            }
         }
 
         return .{
@@ -1418,6 +1435,15 @@ test "SQLite ping succeeds on open connection" {
     defer db.deinit();
     var conn = try db.connect();
     defer conn.close();
+    try conn.ping();
+}
+
+test "SQLite open applies busy_timeout_ms" {
+    var db = try Database.open(std.testing.allocator, .{ .busy_timeout_ms = 2500 });
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+    // Setting busy timeout must not break basic query use.
     try conn.ping();
 }
 
