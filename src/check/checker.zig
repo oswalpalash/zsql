@@ -72,7 +72,7 @@ pub fn checkQuery(options: struct {
         for (options.row) |field| {
             const col = findColumn(table, field.name) orelse return error.UnknownColumn;
             if (field.type_name) |want| {
-                if (!std.ascii.eqlIgnoreCase(want, col.type_name)) return error.TypeMismatch;
+                if (!typesCompatible(want, col.type_name)) return error.TypeMismatch;
             }
             if (!field.nullable and col.nullable) return error.NullabilityMismatch;
         }
@@ -104,6 +104,75 @@ fn findColumn(table: inspect.Table, name: []const u8) ?inspect.Column {
         if (std.mem.eql(u8, col.name, name)) return col;
     }
     return null;
+}
+
+/// Loose type compatibility for offline checks across SQLite / Postgres names.
+/// Exact match (case-insensitive) always succeeds; common aliases also match.
+fn typesCompatible(want: []const u8, have: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(want, have)) return true;
+    const a = normalizeTypeName(want);
+    const b = normalizeTypeName(have);
+    if (std.ascii.eqlIgnoreCase(a, b)) return true;
+    // Integer family
+    if (isIntegerType(a) and isIntegerType(b)) return true;
+    // Text family
+    if (isTextType(a) and isTextType(b)) return true;
+    // Float family
+    if (isFloatType(a) and isFloatType(b)) return true;
+    // Bool family
+    if (isBoolType(a) and isBoolType(b)) return true;
+    // Blob family
+    if (isBlobType(a) and isBlobType(b)) return true;
+    return false;
+}
+
+fn normalizeTypeName(name: []const u8) []const u8 {
+    // Strip common modifiers: "character varying", "timestamp without time zone"
+    if (std.ascii.eqlIgnoreCase(name, "character varying")) return "varchar";
+    if (std.ascii.eqlIgnoreCase(name, "double precision")) return "float8";
+    if (std.ascii.indexOfIgnoreCase(name, "timestamp") != null) return "timestamp";
+    return name;
+}
+
+fn isIntegerType(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "integer") or
+        std.ascii.eqlIgnoreCase(name, "int") or
+        std.ascii.eqlIgnoreCase(name, "int2") or
+        std.ascii.eqlIgnoreCase(name, "int4") or
+        std.ascii.eqlIgnoreCase(name, "int8") or
+        std.ascii.eqlIgnoreCase(name, "smallint") or
+        std.ascii.eqlIgnoreCase(name, "bigint") or
+        std.ascii.eqlIgnoreCase(name, "serial") or
+        std.ascii.eqlIgnoreCase(name, "bigserial");
+}
+
+fn isTextType(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "text") or
+        std.ascii.eqlIgnoreCase(name, "varchar") or
+        std.ascii.eqlIgnoreCase(name, "character") or
+        std.ascii.eqlIgnoreCase(name, "char") or
+        std.ascii.eqlIgnoreCase(name, "name") or
+        std.ascii.eqlIgnoreCase(name, "citext");
+}
+
+fn isFloatType(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "real") or
+        std.ascii.eqlIgnoreCase(name, "float") or
+        std.ascii.eqlIgnoreCase(name, "float4") or
+        std.ascii.eqlIgnoreCase(name, "float8") or
+        std.ascii.eqlIgnoreCase(name, "double") or
+        std.ascii.eqlIgnoreCase(name, "numeric");
+}
+
+fn isBoolType(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "bool") or
+        std.ascii.eqlIgnoreCase(name, "boolean");
+}
+
+fn isBlobType(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "blob") or
+        std.ascii.eqlIgnoreCase(name, "bytea") or
+        std.ascii.eqlIgnoreCase(name, "bytes");
 }
 
 /// Build a checked-query type from options. Prefer this for stable embed sites:
@@ -215,6 +284,34 @@ test "checkQuery validates named params and columns" {
         .from_table = "users",
         .row = &.{.{ .name = "bio", .nullable = false }},
     }));
+}
+
+test "typesCompatible accepts common cross-driver aliases" {
+    try std.testing.expect(typesCompatible("INTEGER", "int4"));
+    try std.testing.expect(typesCompatible("bigint", "INTEGER"));
+    try std.testing.expect(typesCompatible("TEXT", "varchar"));
+    try std.testing.expect(typesCompatible("BOOLEAN", "bool"));
+    try std.testing.expect(typesCompatible("BLOB", "bytea"));
+    try std.testing.expect(!typesCompatible("TEXT", "INTEGER"));
+}
+
+test "checkQuery accepts integer alias against int8 column" {
+    const schema = inspect.Schema{
+        .tables = &.{
+            .{
+                .name = "users",
+                .columns = &.{
+                    .{ .name = "id", .type_name = "int8", .nullable = false, .primary_key = true },
+                },
+            },
+        },
+    };
+    try checkQuery(.{
+        .sql = "select id from users",
+        .schema = schema,
+        .from_table = "users",
+        .row = &.{.{ .name = "id", .type_name = "INTEGER" }},
+    });
 }
 
 test "checkedQuery type validates against schema" {
