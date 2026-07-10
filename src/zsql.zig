@@ -16,7 +16,7 @@ pub const Rows = @import("core/rows.zig").Rows;
 pub const ExecResult = @import("core/exec_result.zig").ExecResult;
 pub const Stmt = @import("core/stmt.zig").Stmt;
 pub const Conn = @import("core/conn.zig").Conn;
-pub const Database = @import("core/database.zig").Database;
+pub const CoreDatabase = @import("core/database.zig").Database;
 pub const QueryBuilder = @import("core/query.zig").QueryBuilder;
 pub const hooks = @import("core/hooks.zig");
 pub const Hooks = hooks.Hooks;
@@ -29,6 +29,26 @@ pub const check = @import("check/checker.zig");
 pub const checkedQuery = @import("check/checker.zig").checkedQuery;
 pub const StmtCache = @import("pool/stmt_cache.zig").StmtCache;
 pub const formatStmtName = @import("pool/stmt_cache.zig").formatStmtName;
+
+/// Driver-selected concrete types. These normalize ownership entry points, not SQL dialects.
+pub fn Database(comptime D: type) type {
+    return D.Database;
+}
+pub fn Pool(comptime D: type) type {
+    return D.Pool;
+}
+pub fn Lease(comptime D: type) type {
+    return D.Lease;
+}
+pub fn Tx(comptime D: type) type {
+    return D.Tx;
+}
+pub fn Savepoint(comptime D: type) type {
+    return D.Savepoint;
+}
+pub fn Migrator(comptime D: type) type {
+    return D.Migrator;
+}
 const options = @import("zsql_options");
 
 /// True when this package was built with `-Denable-sqlite=true`.

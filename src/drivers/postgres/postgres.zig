@@ -34,6 +34,17 @@ pub const MigrationStatus = migrate.MigrationStatus;
 pub const MigrationRecord = migrate.MigrationRecord;
 pub const ApplyResult = migrate.ApplyResult;
 
+/// Concrete capability mapping for the root `zsql.*(postgres.Driver)` façade.
+/// PostgreSQL transactions are scoped methods on `Conn`, so `Tx` is `Conn`.
+pub const Driver = struct {
+    pub const Database = conn.Conn;
+    pub const Pool = pool.Pool;
+    pub const Lease = pool.Lease;
+    pub const Tx = conn.Conn;
+    pub const Savepoint = conn.Savepoint;
+    pub const Migrator = migrate.Migrator;
+};
+
 pub const enabled = true;
 
 test {

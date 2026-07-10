@@ -3023,3 +3023,20 @@ test "SQLite validates config and connection lifetime" {
     db.deinit();
     try std.testing.expectError(error.ConnectionClosed, db.connect());
 }
+
+const DriverDatabase = Database;
+const DriverPool = Pool;
+const DriverLease = Lease;
+const DriverTx = Tx;
+const DriverSavepoint = Savepoint;
+const DriverMigrator = Migrator;
+
+/// Concrete capability mapping for the root `zsql.*(sqlite.Driver)` façade.
+pub const Driver = struct {
+    pub const Database = DriverDatabase;
+    pub const Pool = DriverPool;
+    pub const Lease = DriverLease;
+    pub const Tx = DriverTx;
+    pub const Savepoint = DriverSavepoint;
+    pub const Migrator = DriverMigrator;
+};
