@@ -15,6 +15,9 @@ pub const Error = error{
     NoRows,
     TooManyRows,
     InvalidMigrationFilename,
+    /// Two migration files use the same version.
+    MigrationVersionConflict,
+    /// Backward-compatible spelling; new APIs return `MigrationVersionConflict`.
     DuplicateMigrationVersion,
     MigrationChecksumMismatch,
     /// Migration history contains a dirty/incomplete entry and needs repair.

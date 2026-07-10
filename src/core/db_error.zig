@@ -68,7 +68,7 @@ pub const DbError = struct {
             error.SerializationFailure,
             error.DeadlockDetected,
             => .transaction,
-            error.MigrationChecksumMismatch, error.MigrationDirty, error.DirtyMigration, error.DuplicateMigrationVersion => .migration,
+            error.MigrationChecksumMismatch, error.MigrationDirty, error.DirtyMigration, error.MigrationVersionConflict, error.DuplicateMigrationVersion => .migration,
             error.PoolClosed, error.PoolExhausted, error.PoolTimeout, error.LeaseClosed => .pool,
             error.Busy, error.Locked => .connection,
             error.Unsupported => .unsupported,

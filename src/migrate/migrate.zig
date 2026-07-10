@@ -100,7 +100,7 @@ pub fn scanDir(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Migra
     std.mem.sort(MigrationFile, list.items, {}, migrationFileLessThan);
     for (list.items[1..], 1..) |file, index| {
         if (file.id.version == list.items[index - 1].id.version) {
-            return error.DuplicateMigrationVersion;
+            return error.MigrationVersionConflict;
         }
     }
 
@@ -202,5 +202,5 @@ test "migration directory scanner rejects duplicate versions" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "V0001__create_users.sql", .data = "create table users (id integer);\n" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "V1__add_users.sql", .data = "alter table users add column name text;\n" });
 
-    try std.testing.expectError(error.DuplicateMigrationVersion, scanDir(std.testing.allocator, std.testing.io, tmp.dir));
+    try std.testing.expectError(error.MigrationVersionConflict, scanDir(std.testing.allocator, std.testing.io, tmp.dir));
 }
