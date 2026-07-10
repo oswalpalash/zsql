@@ -1213,7 +1213,8 @@ fn zigTypeName(comptime T: type) ?[]const u8 {
         else => T,
     };
     if (base == bool) return "BOOLEAN";
-    if (base == i16 or base == u16) return "INT2";
+    // SQL has no portable 8-bit integer; INT2 is the narrowest common carrier.
+    if (base == i8 or base == u8 or base == i16 or base == u16) return "INT2";
     if (base == i32 or base == u32) return "INT4";
     if (base == i64 or base == u64 or base == isize or base == usize) return "INT8";
     if (base == f32) return "FLOAT4";
@@ -1337,6 +1338,11 @@ test "checkedQuery accepts typed argument and row structs" {
         .from_table = "users",
     });
     try q.validate(schema);
+}
+
+test "typed checkedQuery maps 8-bit integers to INT2" {
+    try std.testing.expectEqualStrings("INT2", zigTypeName(i8).?);
+    try std.testing.expectEqualStrings("INT2", zigTypeName(?u8).?);
 }
 
 test "checkQuery join scope with from_tables and qualified columns" {
