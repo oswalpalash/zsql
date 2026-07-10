@@ -26,6 +26,7 @@ pub const QueryEnd = hooks.QueryEnd;
 pub const params = @import("core/params.zig");
 pub const migrate = @import("migrate/migrate.zig");
 pub const inspect = @import("check/inspect.zig");
+pub const codegen = @import("check/codegen.zig");
 pub const check = @import("check/checker.zig");
 pub const checkedQuery = @import("check/checker.zig").checkedQuery;
 pub const StmtCache = @import("pool/stmt_cache.zig").StmtCache;
@@ -89,6 +90,7 @@ test {
     _ = @import("core/hooks.zig");
     _ = @import("migrate/migrate.zig");
     _ = @import("check/inspect.zig");
+    _ = @import("check/codegen.zig");
     _ = @import("check/checker.zig");
     _ = @import("pool/stmt_cache.zig");
     _ = @import("drivers/postgres/postgres.zig");
