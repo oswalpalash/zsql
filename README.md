@@ -26,7 +26,8 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 
 ### Public names
 
-- `zsql.Database`, `zsql.Conn`, `zsql.Stmt`, `zsql.Tx`, `zsql.Savepoint`
+- `zsql.Database(D)`, `zsql.Pool(D)`, `zsql.Lease(D)`, `zsql.Tx(D)`, `zsql.Savepoint(D)`, `zsql.Migrator(D)`
+- `zsql.Conn`, `zsql.Stmt`, `zsql.Rows`, `zsql.Row` (driver-agnostic core adapters)
 - `zsql.Rows`, `zsql.Row`, `zsql.OwnedRow`, `zsql.Value`, `zsql.OwnedValue`, `zsql.decode`
 - `zsql.ExecResult`, `zsql.Error`, `zsql.DbError`, `zsql.OwnedDbError`
 - `zsql.QueryBuilder`, `zsql.params`, `zsql.migrate`
@@ -35,6 +36,11 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 - `zsql.inspect`, `zsql.check`
 - `zsql.drivers.sqlite` (`-Denable-sqlite=true`): full open/exec/query/bind/tx/savepoint/pool/migrator/schema inspect
 - `zsql.drivers.postgres`: native (no libpq) URL parse, SCRAM-SHA-256 / SCRAM-SHA-256-PLUS / MD5 / cleartext, simple + extended query, tx/savepoints, pool, schema inspect, `Conn.lastError()`, optional `enableStmtCache`
+
+Use a driver’s explicit marker for the generic façade, e.g.
+`zsql.Database(zsql.drivers.sqlite.Driver)` or
+`zsql.Pool(zsql.drivers.postgres.Driver)`. The façade selects concrete driver
+types; it does not attempt to normalize SQL dialects.
 
 ### SQLite
 
