@@ -247,6 +247,10 @@ fn convertValue(comptime T: type, value: Value) !T {
         .text => |v| v,
         else => return error.InvalidColumnType,
     } };
+    if (T == types.Uuid) return switch (value) {
+        .text => |v| try types.parseUuid(v),
+        else => error.InvalidColumnType,
+    };
 
     return switch (info) {
         .bool => convertBool(value),
@@ -381,6 +385,7 @@ test "decode supports borrowed SQL domain wrappers" {
     try std.testing.expectEqualStrings("hello", (try decode(types.Text, .{ .text = "hello" })).bytes);
     try std.testing.expectEqualStrings("\x00\x01", (try decode(types.Blob, .{ .blob = "\x00\x01" })).bytes);
     try std.testing.expectEqualStrings("12.30", (try decode(types.Numeric, .{ .text = "12.30" })).text);
+    try std.testing.expectEqual(@as(u8, 0x55), (try decode(types.Uuid, .{ .text = "550e8400-e29b-41d4-a716-446655440000" })).bytes[0]);
     try std.testing.expectError(error.InvalidColumnType, decode(types.Text, .{ .blob = "nope" }));
 }
 
