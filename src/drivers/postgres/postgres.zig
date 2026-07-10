@@ -1,10 +1,10 @@
 //! Native PostgreSQL driver for zsql.
 //!
-//! Pure-Zig URL parsing, protocol framing, MD5/cleartext auth helpers, and a
-//! startup handshake over TCP. No libpq. Live query execution lands next.
+//! Pure-Zig URL parsing, protocol framing, auth, extended queries, pooling,
+//! migrations, and schema inspection over TCP. No libpq.
 //!
-//! Integration: set `ZSQL_PG_URL` to exercise a real handshake; CI stays green
-//! without a Postgres server.
+//! Integration: set `ZSQL_PG_URL` to exercise the live suite locally; CI runs
+//! it against PostgreSQL 16.
 
 pub const url = @import("url.zig");
 pub const protocol = @import("protocol.zig");
