@@ -1,6 +1,7 @@
 const std = @import("std");
 const Value = @import("value.zig").Value;
 const OwnedValue = @import("value.zig").OwnedValue;
+const types = @import("types.zig");
 
 pub const Row = struct {
     columns: []const []const u8,
@@ -234,6 +235,19 @@ fn convertValue(comptime T: type, value: Value) !T {
     // Non-optional fields must not be SQL NULL.
     if (value.isNull()) return error.UnexpectedNull;
 
+    if (T == types.Text) return .{ .bytes = switch (value) {
+        .text => |v| v,
+        else => return error.InvalidColumnType,
+    } };
+    if (T == types.Blob) return .{ .bytes = switch (value) {
+        .blob => |v| v,
+        else => return error.InvalidColumnType,
+    } };
+    if (T == types.Numeric) return .{ .text = switch (value) {
+        .text => |v| v,
+        else => return error.InvalidColumnType,
+    } };
+
     return switch (info) {
         .bool => convertBool(value),
         .int => switch (value) {
@@ -361,6 +375,13 @@ test "OwnedRow duplicates text and blob values" {
     try std.testing.expectEqual(@as(usize, 2), owned.len());
     try std.testing.expectEqualStrings("ada", try (try owned.value("name")).asText());
     try std.testing.expectEqualStrings("zig", try (try owned.value("payload")).asBlob());
+}
+
+test "decode supports borrowed SQL domain wrappers" {
+    try std.testing.expectEqualStrings("hello", (try decode(types.Text, .{ .text = "hello" })).bytes);
+    try std.testing.expectEqualStrings("\x00\x01", (try decode(types.Blob, .{ .blob = "\x00\x01" })).bytes);
+    try std.testing.expectEqualStrings("12.30", (try decode(types.Numeric, .{ .text = "12.30" })).text);
+    try std.testing.expectError(error.InvalidColumnType, decode(types.Text, .{ .blob = "nope" }));
 }
 
 test "Row maps to struct by field name and ordinal fallback" {
