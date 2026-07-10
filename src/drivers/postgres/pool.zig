@@ -184,6 +184,14 @@ pub const Pool = struct {
         return result;
     }
 
+    pub fn execNamed(self: *Pool, sql: []const u8, binds: []const core.params.NamedValue) !core.ExecResult {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        const result = try (try lease.conn()).execNamed(sql, binds);
+        try lease.release();
+        return result;
+    }
+
     /// Holds a lease until `PooledRows.deinit`.
     pub fn queryParams(self: *Pool, sql: []const u8, binds: []const core.Value) !PooledRows {
         var lease = try self.acquire();
@@ -193,6 +201,14 @@ pub const Pool = struct {
             .lease = lease,
             .rows = rows,
         };
+    }
+
+    /// Holds a lease until `PooledRows.deinit`.
+    pub fn queryNamed(self: *Pool, sql: []const u8, binds: []const core.params.NamedValue) !PooledRows {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        const rows = try (try lease.conn()).queryNamed(sql, binds);
+        return .{ .lease = lease, .rows = rows };
     }
 
     /// Acquire a short lease, fetch exactly one owned row, then release.
