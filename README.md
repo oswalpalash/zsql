@@ -281,11 +281,8 @@ try zsql.check.checkQuery(.{
 // Or a reusable checked-query type:
 const get_user = zsql.checkedQuery(.{
     .sql = "select id, email from users where id = :id",
-    .args = &.{.{ .name = "id" }},
-    .row = &.{
-        .{ .name = "id", .type_name = "INTEGER" },
-        .{ .name = "email", .type_name = "TEXT" },
-    },
+    .args = .{ .id = i64 },
+    .row = struct { id: i64, email: []const u8 },
     .from_table = "users",
     .check_where = true,
 });
