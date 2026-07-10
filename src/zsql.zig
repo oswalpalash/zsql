@@ -95,3 +95,22 @@ test {
         _ = @import("drivers/sqlite/sqlite.zig");
     }
 }
+
+test "driver facade resolves concrete capability types" {
+    comptime {
+        _ = Database(drivers.postgres.Driver);
+        _ = Pool(drivers.postgres.Driver);
+        _ = Lease(drivers.postgres.Driver);
+        _ = Tx(drivers.postgres.Driver);
+        _ = Savepoint(drivers.postgres.Driver);
+        _ = Migrator(drivers.postgres.Driver);
+        if (options.enable_sqlite) {
+            _ = Database(drivers.sqlite.Driver);
+            _ = Pool(drivers.sqlite.Driver);
+            _ = Lease(drivers.sqlite.Driver);
+            _ = Tx(drivers.sqlite.Driver);
+            _ = Savepoint(drivers.sqlite.Driver);
+            _ = Migrator(drivers.sqlite.Driver);
+        }
+    }
+}
