@@ -278,6 +278,15 @@ pub const Pool = struct {
         return result;
     }
 
+    /// Execute named SQLite binds under a short-lived lease.
+    pub fn execNamed(self: *Pool, sql: []const u8, binds: []const NamedValue) !core.ExecResult {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        const result = try (try lease.conn()).execNamed(sql, binds);
+        try lease.release();
+        return result;
+    }
+
     /// Run a query under a lease held until `PooledRows.deinit`.
     ///
     /// Borrowed row values remain valid only while the pooled rows (and thus
@@ -290,6 +299,14 @@ pub const Pool = struct {
             .lease = lease,
             .rows = rows,
         };
+    }
+
+    /// Run a named query while holding the lease until `PooledRows.deinit`.
+    pub fn queryNamed(self: *Pool, sql: []const u8, binds: []const NamedValue) !PooledRows {
+        var lease = try self.acquire();
+        errdefer lease.discard() catch {};
+        const rows = try (try lease.conn()).queryNamed(sql, binds);
+        return .{ .lease = lease, .rows = rows };
     }
 
     /// Acquire a short lease, fetch exactly one owned row, then release.
@@ -2392,6 +2409,22 @@ test "SQLite pool queryAll collects owned rows and releases lease" {
     // Lease must be free again after queryAll returns.
     try std.testing.expectEqual(@as(usize, 0), pool.stats().leased);
     try pool.ping();
+}
+
+test "SQLite pool supports named execution and rows" {
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 2 });
+    defer pool.deinit();
+    _ = try pool.exec("create table pool_named (id integer primary key, name text)", &.{});
+    _ = try pool.execNamed("insert into pool_named (id, name) values (:id, :name)", &.{
+        .{ .name = "id", .value = .{ .integer = 1 } },
+        .{ .name = "name", .value = .{ .text = "ada" } },
+    });
+    var rows = try pool.queryNamed("select name from pool_named where id = :id", &.{
+        .{ .name = "id", .value = .{ .integer = 1 } },
+    });
+    defer rows.deinit();
+    const row = (try rows.next()).?;
+    try std.testing.expectEqualStrings("ada", try (try row.value("name")).asText());
 }
 
 test "SQLite pool withTxImmediate commits and releases lease" {
