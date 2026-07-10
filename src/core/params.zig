@@ -14,6 +14,58 @@ pub const Placeholder = struct {
     name: []const u8 = "",
 };
 
+/// A named value used by drivers that expose named bind APIs.
+pub const NamedValue = struct {
+    name: []const u8,
+    value: @import("value.zig").Value,
+};
+
+/// Allocator-owned PostgreSQL rewrite result. Names borrow from the input SQL.
+pub const PostgresRewrite = struct {
+    sql: []u8,
+    names: []const []const u8,
+
+    pub fn deinit(self: *PostgresRewrite, allocator: std.mem.Allocator) void {
+        allocator.free(self.sql);
+        allocator.free(self.names);
+        self.* = undefined;
+    }
+};
+
+/// Rewrite `:name`, `@name`, or `$name` placeholders to PostgreSQL `$n`.
+/// Repeated names share an index; mixed positional/indexed styles are rejected.
+pub fn rewriteNamedPostgres(allocator: std.mem.Allocator, sql: []const u8) !PostgresRewrite {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer names.deinit(allocator);
+
+    var cursor: usize = 0;
+    var iter = Iterator.init(sql);
+    while (try iter.next()) |placeholder| {
+        try out.appendSlice(allocator, sql[cursor..placeholder.offset]);
+        cursor = placeholder.offset + placeholder.len;
+        if (placeholder.style != .named) return error.InvalidSql;
+
+        var index: ?usize = null;
+        for (names.items, 0..) |name, i| {
+            if (std.mem.eql(u8, name, placeholder.name)) {
+                index = i + 1;
+                break;
+            }
+        }
+        const bind_index = index orelse blk: {
+            try names.append(allocator, placeholder.name);
+            break :blk names.items.len;
+        };
+        var number_buf: [20]u8 = undefined;
+        const number = try std.fmt.bufPrint(&number_buf, "${d}", .{bind_index});
+        try out.appendSlice(allocator, number);
+    }
+    try out.appendSlice(allocator, sql[cursor..]);
+    return .{ .sql = try out.toOwnedSlice(allocator), .names = try names.toOwnedSlice(allocator) };
+}
+
 pub const Summary = struct {
     total: usize = 0,
     positional: usize = 0,
@@ -319,4 +371,14 @@ test "nested block comments do not expose false bind markers" {
     try std.testing.expectEqual(@as(usize, 1), summary.named);
 
     try std.testing.expectError(error.InvalidSql, summarize("select /* outer /* inner */"));
+}
+
+test "rewriteNamedPostgres preserves lexical SQL and reuses names" {
+    var rewrite = try rewriteNamedPostgres(std.testing.allocator, "select :id, :id, '@nope', $tag$ :also_nope $tag$ from t where n = @name");
+    defer rewrite.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("select $1, $1, '@nope', $tag$ :also_nope $tag$ from t where n = $2", rewrite.sql);
+    try std.testing.expectEqual(@as(usize, 2), rewrite.names.len);
+    try std.testing.expectEqualStrings("id", rewrite.names[0]);
+    try std.testing.expectEqualStrings("name", rewrite.names[1]);
+    try std.testing.expectError(error.InvalidSql, rewriteNamedPostgres(std.testing.allocator, "select :id, ?"));
 }

@@ -481,6 +481,16 @@ pub const Conn = struct {
         return result;
     }
 
+    /// Execute named parameters by rewriting them to PostgreSQL `$n` binds.
+    /// Values are reordered into a temporary slice; they are never interpolated.
+    pub fn execNamed(self: *Conn, sql: []const u8, binds: []const core.params.NamedValue) !core.ExecResult {
+        var rewrite = try core.params.rewriteNamedPostgres(self.allocator, sql);
+        defer rewrite.deinit(self.allocator);
+        const ordered = try orderedNamedBinds(self.allocator, rewrite.names, binds);
+        defer self.allocator.free(ordered);
+        return self.execParams(rewrite.sql, ordered);
+    }
+
     fn execParamsUnobserved(self: *Conn, sql: []const u8, binds: []const core.Value) !core.ExecResult {
         if (self.closed) return error.ConnectionClosed;
         try self.sendExtended(sql, binds, false);
@@ -611,6 +621,15 @@ pub const Conn = struct {
             });
         }
         return rows;
+    }
+
+    /// Query with named parameters, rewritten to PostgreSQL `$n` binds.
+    pub fn queryNamed(self: *Conn, sql: []const u8, binds: []const core.params.NamedValue) !SimpleRows {
+        var rewrite = try core.params.rewriteNamedPostgres(self.allocator, sql);
+        defer rewrite.deinit(self.allocator);
+        const ordered = try orderedNamedBinds(self.allocator, rewrite.names, binds);
+        defer self.allocator.free(ordered);
+        return self.queryParams(rewrite.sql, ordered);
     }
 
     /// Query exactly one row. Returns `error.NoRows` / `error.TooManyRows` on
@@ -1472,6 +1491,52 @@ const OwnedSimpleRow = struct {
         self.* = undefined;
     }
 };
+
+fn orderedNamedBinds(
+    allocator: std.mem.Allocator,
+    names: []const []const u8,
+    binds: []const core.params.NamedValue,
+) ![]core.Value {
+    const ordered = try allocator.alloc(core.Value, names.len);
+    errdefer allocator.free(ordered);
+    for (names, 0..) |name, i| {
+        var found: ?core.Value = null;
+        for (binds) |bind| {
+            if (!std.mem.eql(u8, bind.name, name)) continue;
+            if (found != null) return error.InvalidBindValue;
+            found = bind.value;
+        }
+        ordered[i] = found orelse return error.BindCountMismatch;
+    }
+    for (binds) |bind| {
+        var used = false;
+        for (names) |name| {
+            if (std.mem.eql(u8, bind.name, name)) {
+                used = true;
+                break;
+            }
+        }
+        if (!used) return error.InvalidBindValue;
+    }
+    return ordered;
+}
+
+test "orderedNamedBinds orders and validates named values" {
+    const binds = [_]core.params.NamedValue{
+        .{ .name = "email", .value = .{ .text = "ada@example.com" } },
+        .{ .name = "id", .value = .{ .integer = 7 } },
+    };
+    const names = [_][]const u8{ "id", "email" };
+    const ordered = try orderedNamedBinds(std.testing.allocator, &names, &binds);
+    defer std.testing.allocator.free(ordered);
+    try std.testing.expectEqual(@as(i64, 7), ordered[0].integer);
+    try std.testing.expectEqualStrings("ada@example.com", ordered[1].text);
+    try std.testing.expectError(error.InvalidBindValue, orderedNamedBinds(std.testing.allocator, &names, &.{
+        .{ .name = "id", .value = .{ .integer = 1 } },
+        .{ .name = "email", .value = .{ .text = "ada@example.com" } },
+        .{ .name = "unused", .value = .{ .integer = 2 } },
+    }));
+}
 
 /// Allocator-owned simple-query result set.
 pub const SimpleRows = struct {
