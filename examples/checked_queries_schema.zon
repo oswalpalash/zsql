@@ -1,0 +1,14 @@
+.{
+    .tables = .{
+        .{ .name = "users", .columns = .{
+            .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+            .{ .name = "email", .type_name = "TEXT", .nullable = false, .primary_key = false },
+            .{ .name = "active", .type_name = "INTEGER", .nullable = false, .primary_key = false },
+        }, .indexes = .{} },
+        .{ .name = "posts", .columns = .{
+            .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+            .{ .name = "user_id", .type_name = "INTEGER", .nullable = false, .primary_key = false },
+            .{ .name = "title", .type_name = "TEXT", .nullable = false, .primary_key = false },
+        }, .indexes = .{} },
+    },
+}

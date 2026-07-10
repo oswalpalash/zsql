@@ -77,6 +77,23 @@ pub fn writeSchemaZon(writer: *std.Io.Writer, schema: Schema) !void {
     try writer.writeAll("}\n");
 }
 
+/// Parse a ZON schema artifact produced by `writeSchemaZon`.
+///
+/// The returned graph is allocator-owned. Release it with
+/// `freeParsedSchemaZon` using the same allocator. `source` is sentinel
+/// terminated so callers can pass `@embedFile("db/schema.zon")` directly.
+pub fn parseSchemaZon(allocator: std.mem.Allocator, source: [:0]const u8) !Schema {
+    return std.zon.parse.fromSliceAlloc(Schema, allocator, source, null, .{});
+}
+
+/// Free a schema returned by `parseSchemaZon`.
+///
+/// This is distinct from `freeSchema`, which frees driver-inspected schemas
+/// assembled by zsql rather than the standard ZON parser.
+pub fn freeParsedSchemaZon(allocator: std.mem.Allocator, schema: Schema) void {
+    std.zon.parse.free(allocator, schema);
+}
+
 /// Parse SQLite `PRAGMA table_info` style rows into columns.
 /// Each row is `(cid, name, type, notnull, dflt_value, pk)`.
 pub const SqliteTableInfoRow = struct {
@@ -257,6 +274,17 @@ test "writeSchemaZon matches golden users_schema.zon" {
     var writer = std.Io.Writer.fixed(&buffer);
     try writeSchemaZon(&writer, schema);
     try std.testing.expectEqualStrings(@embedFile("testdata/users_schema.zon"), writer.buffered());
+}
+
+test "parseSchemaZon loads an embedded artifact" {
+    const schema = try parseSchemaZon(std.testing.allocator, @embedFile("testdata/users_schema.zon"));
+    defer freeParsedSchemaZon(std.testing.allocator, schema);
+
+    try std.testing.expectEqual(@as(usize, 1), schema.tables.len);
+    try std.testing.expectEqualStrings("users", schema.tables[0].name);
+    try std.testing.expectEqual(@as(usize, 4), schema.tables[0].columns.len);
+    try std.testing.expect(schema.tables[0].columns[0].primary_key);
+    try std.testing.expect(schema.tables[0].columns[3].nullable);
 }
 
 test "columnsFromSqliteTableInfo maps nullability and pk" {

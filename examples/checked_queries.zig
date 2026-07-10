@@ -3,26 +3,19 @@ const zsql = @import("zsql");
 
 /// Offline-checked query example (no database connection required).
 pub fn main() !void {
-    const schema = zsql.inspect.Schema{
-        .tables = &.{
-            .{
-                .name = "users",
-                .columns = &.{
-                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
-                    .{ .name = "email", .type_name = "TEXT", .nullable = false },
-                    .{ .name = "active", .type_name = "INTEGER", .nullable = false },
-                },
-            },
-            .{
-                .name = "posts",
-                .columns = &.{
-                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
-                    .{ .name = "user_id", .type_name = "INTEGER", .nullable = false },
-                    .{ .name = "title", .type_name = "TEXT", .nullable = false },
-                },
-            },
-        },
-    };
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    // The build gate validates the exact embedded artifact applications use.
+    const schema = try zsql.inspect.parseSchemaZon(
+        allocator,
+        @embedFile("checked_queries_schema.zon"),
+    );
+    defer zsql.inspect.freeParsedSchemaZon(allocator, schema);
 
     try zsql.check.checkQuery(.{
         .sql =
