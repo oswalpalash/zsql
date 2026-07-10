@@ -17,6 +17,9 @@ pub const Error = error{
     InvalidMigrationFilename,
     DuplicateMigrationVersion,
     MigrationChecksumMismatch,
+    /// Migration history contains a dirty/incomplete entry and needs repair.
+    MigrationDirty,
+    /// Backward-compatible spelling; new APIs return `MigrationDirty`.
     DirtyMigration,
     UnexpectedRow,
     StatementClosed,

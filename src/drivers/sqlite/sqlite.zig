@@ -1013,7 +1013,7 @@ pub fn validateMigrationStatus(conn: *Conn, migrations: []const core.migrate.Mig
     defer status.deinit();
 
     for (status.records) |record| {
-        if (record.dirty) return error.DirtyMigration;
+        if (record.dirty) return error.MigrationDirty;
 
         const migration = findMigration(migrations, record.version) orelse continue;
         if (!std.mem.eql(u8, &record.checksum, &migration.checksum)) {
@@ -2694,7 +2694,7 @@ test "SQLite migration validation rejects dirty records" {
         .checksum = checksum,
     }};
 
-    try std.testing.expectError(error.DirtyMigration, validateMigrationStatus(&conn, &migrations));
+    try std.testing.expectError(error.MigrationDirty, validateMigrationStatus(&conn, &migrations));
 }
 
 test "SQLite migration validation ignores stored versions absent locally" {
@@ -2977,7 +2977,7 @@ test "SQLite migration apply refuses existing dirty migration state" {
         .checksum = core.migrate.checksumSql(pending_sql),
     }};
 
-    try std.testing.expectError(error.DirtyMigration, applyMigrations(&conn, &migrations));
+    try std.testing.expectError(error.MigrationDirty, applyMigrations(&conn, &migrations));
     try std.testing.expectError(error.InvalidSql, conn.query("select id from should_not_apply", &.{}));
 }
 

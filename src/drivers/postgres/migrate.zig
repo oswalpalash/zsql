@@ -135,7 +135,7 @@ pub const Migrator = struct {
         var st = try self.status(self.conn.allocator);
         defer st.deinit();
         for (st.records) |record| {
-            if (record.dirty) return error.DirtyMigration;
+            if (record.dirty) return error.MigrationDirty;
             const migration = findMigration(migrations, record.version) orelse continue;
             if (!std.mem.eql(u8, &record.checksum, &migration.checksum)) {
                 return error.MigrationChecksumMismatch;
