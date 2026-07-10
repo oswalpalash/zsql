@@ -598,6 +598,79 @@ pub const Conn = struct {
         }
     }
 
+    /// COPY trusted SQL input from an explicit byte buffer. Values must be
+    /// encoded by the caller according to the selected COPY format.
+    pub fn copyIn(self: *Conn, sql: []const u8, data: []const u8) !core.ExecResult {
+        if (self.closed) return error.ConnectionClosed;
+        const query_packet = try protocol.buildQueryMessage(self.allocator, sql);
+        defer self.allocator.free(query_packet);
+        try self.writeAll(query_packet);
+
+        var started = false;
+        var rows_affected: u64 = 0;
+        while (true) {
+            const msg = try self.readMessage();
+            defer self.allocator.free(msg.body);
+            switch (msg.tag) {
+                .copy_in_response => {
+                    if (started) return error.ProtocolError;
+                    started = true;
+                    if (data.len != 0) {
+                        const copy_data = try protocol.buildMessage(self.allocator, .copy_data, data);
+                        defer self.allocator.free(copy_data);
+                        try self.writeAll(copy_data);
+                    }
+                    const done = try protocol.buildMessage(self.allocator, .copy_done, &.{});
+                    defer self.allocator.free(done);
+                    try self.writeAll(done);
+                },
+                .command_complete => rows_affected = types.parseCommandTag(try protocol.parseCommandComplete(msg.body)).rows_affected,
+                .ready_for_query => {
+                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    return if (started) .{ .rows_affected = rows_affected } else error.ProtocolError;
+                },
+                .parameter_status, .notice_response, .notification_response => {},
+                .error_response => return self.failFromErrorResponse(msg.body, true),
+                else => return error.ProtocolError,
+            }
+        }
+    }
+
+    /// COPY trusted SQL output into an allocator-owned byte buffer.
+    pub fn copyOut(self: *Conn, sql: []const u8) ![]u8 {
+        if (self.closed) return error.ConnectionClosed;
+        const query_packet = try protocol.buildQueryMessage(self.allocator, sql);
+        defer self.allocator.free(query_packet);
+        try self.writeAll(query_packet);
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        var started = false;
+        while (true) {
+            const msg = try self.readMessage();
+            defer self.allocator.free(msg.body);
+            switch (msg.tag) {
+                .copy_out_response => {
+                    if (started) return error.ProtocolError;
+                    started = true;
+                },
+                .copy_data => {
+                    if (!started) return error.ProtocolError;
+                    try out.appendSlice(self.allocator, msg.body);
+                },
+                .copy_done, .command_complete => {},
+                .ready_for_query => {
+                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    if (!started) return error.ProtocolError;
+                    return out.toOwnedSlice(self.allocator);
+                },
+                .parameter_status, .notice_response, .notification_response => {},
+                .error_response => return self.failFromErrorResponse(msg.body, true),
+                else => return error.ProtocolError,
+            }
+        }
+    }
+
     /// Parameterized query via extended protocol; returns owned simple rows.
     pub fn queryParams(self: *Conn, sql: []const u8, binds: []const core.Value) !SimpleRows {
         const observe = !self.hooks.isEmpty();

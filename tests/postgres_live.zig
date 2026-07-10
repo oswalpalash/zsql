@@ -359,6 +359,25 @@ test "postgres live: migrator applies pending files" {
     _ = try conn.exec("drop table if exists zsql_migrations");
 }
 
+test "postgres live: copy in and out bytes" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, std.testing.io, config);
+    defer conn.deinit();
+
+    _ = try conn.exec("create temporary table zsql_copy_demo (id int, name text)");
+    const result = try conn.copyIn("copy zsql_copy_demo (id, name) from stdin with (format csv)", "1,ada\n2,grace\n");
+    try std.testing.expectEqual(@as(u64, 2), result.rows_affected);
+    const out = try conn.copyOut("copy zsql_copy_demo (id, name) to stdout with (format csv)");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("1,ada\n2,grace\n", out);
+}
+
 test "postgres live: statement cache reuses named prepares" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
