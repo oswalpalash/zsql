@@ -254,6 +254,13 @@ const flag = try zsql.decode(bool, try row.get(2));
 
 Postgres `SimpleRow` exposes the same `get` / `getName` / `as` / `asName` / `to` / `getOwned` surface.
 
+`zsql.types.Text`, `Blob`, `Numeric`, and canonical-text `Uuid` decode through
+the same borrowed row path. PostgreSQL `date`, `time`, `timestamp`, and
+`timestamptz` are intentionally exposed as raw text in this release: parsing
+them implicitly would require timezone and precision policy that zsql does not
+hide. The explicit `Date`, `Time`, and `Timestamp` wrappers are available for
+application-owned conversions.
+
 ### Offline checks
 
 ```zig
