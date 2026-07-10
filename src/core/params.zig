@@ -61,8 +61,8 @@ pub const Iterator = struct {
             const c = self.sql[self.index];
 
             switch (c) {
-                '\'' => try self.skipQuoted('\''),
-                '"' => try self.skipQuoted('"'),
+                '\'' => try self.skipQuoted('\'', self.isPostgresEscapeString(start)),
+                '"' => try self.skipQuoted('"', false),
                 '[' => try self.skipBracketedIdent(),
                 '-' => {
                     if (self.peek(1) == '-') {
@@ -146,9 +146,21 @@ pub const Iterator = struct {
         };
     }
 
-    fn skipQuoted(self: *Iterator, quote: u8) !void {
+    fn isPostgresEscapeString(self: Iterator, quote_start: usize) bool {
+        if (quote_start == 0) return false;
+        const prefix = self.sql[quote_start - 1];
+        if (prefix != 'E' and prefix != 'e') return false;
+        return quote_start == 1 or !isIdentContinue(self.sql[quote_start - 2]);
+    }
+
+    fn skipQuoted(self: *Iterator, quote: u8, backslash_escapes: bool) !void {
         self.index += 1;
         while (self.index < self.sql.len) {
+            if (backslash_escapes and self.sql[self.index] == '\\') {
+                if (self.index + 1 >= self.sql.len) return error.InvalidSql;
+                self.index += 2;
+                continue;
+            }
             if (self.sql[self.index] == quote) {
                 self.index += 1;
                 if (self.index < self.sql.len and self.sql[self.index] == quote) {
@@ -287,4 +299,10 @@ test "postgres dollar-quoted strings do not expose false bind markers" {
     try std.testing.expectEqual(@as(usize, 1), summary.named);
 
     try std.testing.expectError(error.InvalidSql, summarize("select $tag$ unterminated"));
+}
+
+test "postgres escape strings do not expose false bind markers" {
+    const summary = try summarize("select E'it\\'s :ignored', :actual");
+    try std.testing.expectEqual(@as(usize, 1), summary.total);
+    try std.testing.expectEqual(@as(usize, 1), summary.named);
 }
