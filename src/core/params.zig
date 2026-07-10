@@ -79,7 +79,14 @@ pub const Iterator = struct {
                     }
                 },
                 '?' => return try self.parseQuestion(start),
-                ':', '@', '$' => if (try self.parseNamed(start, c)) |placeholder| return placeholder,
+                '$' => {
+                    // PostgreSQL dollar-quoted string literals can legally
+                    // contain text that looks like bind markers. Recognize
+                    // them before considering `$name` a named parameter.
+                    if (try self.skipDollarQuoted()) continue;
+                    if (try self.parseNamed(start, c)) |placeholder| return placeholder;
+                },
+                ':', '@' => if (try self.parseNamed(start, c)) |placeholder| return placeholder,
                 else => self.index += 1,
             }
         }
@@ -153,6 +160,31 @@ pub const Iterator = struct {
             self.index += 1;
         }
         return error.InvalidSql;
+    }
+
+    /// Skip a PostgreSQL dollar-quoted string (`$$...$$` or `$tag$...$tag$`).
+    /// Returns false without consuming input when the current `$` is not a
+    /// valid opening delimiter, so `$name` remains a named bind parameter.
+    fn skipDollarQuoted(self: *Iterator) !bool {
+        const start = self.index;
+        std.debug.assert(self.sql[start] == '$');
+
+        var tag_end = start + 1;
+        if (tag_end < self.sql.len and self.sql[tag_end] != '$') {
+            if (!isIdentStart(self.sql[tag_end])) return false;
+            tag_end += 1;
+            while (tag_end < self.sql.len and isIdentContinue(self.sql[tag_end])) {
+                tag_end += 1;
+            }
+        }
+        if (tag_end >= self.sql.len or self.sql[tag_end] != '$') return false;
+
+        const delimiter = self.sql[start .. tag_end + 1];
+        const content_start = tag_end + 1;
+        const close_start = std.mem.indexOfPos(u8, self.sql, content_start, delimiter) orelse
+            return error.InvalidSql;
+        self.index = close_start + delimiter.len;
+        return true;
     }
 
     fn skipBracketedIdent(self: *Iterator) !void {
@@ -245,4 +277,14 @@ test "postgres casts are not named parameters" {
     const summary = try summarize("select $id, value::text from t where id = :id");
     try std.testing.expectEqual(@as(usize, 2), summary.total);
     try std.testing.expectEqual(@as(usize, 2), summary.named);
+}
+
+test "postgres dollar-quoted strings do not expose false bind markers" {
+    const summary = try summarize(
+        "select $$ :ignored, $also_ignored, ? $$, $tag$ @ignored $tag$, $actual",
+    );
+    try std.testing.expectEqual(@as(usize, 1), summary.total);
+    try std.testing.expectEqual(@as(usize, 1), summary.named);
+
+    try std.testing.expectError(error.InvalidSql, summarize("select $tag$ unterminated"));
 }
