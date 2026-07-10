@@ -5,6 +5,7 @@ pub const PostgresErrorFields = @import("core/db_error.zig").PostgresErrorFields
 pub const ErrorCategory = @import("core/db_error.zig").ErrorCategory;
 pub const DriverKind = @import("core/db_error.zig").DriverKind;
 pub const Value = @import("core/value.zig").Value;
+pub const types = @import("core/types.zig");
 pub const OwnedValue = @import("core/value.zig").OwnedValue;
 pub const Row = @import("core/row.zig").Row;
 pub const OwnedRow = @import("core/row.zig").OwnedRow;
