@@ -194,9 +194,23 @@ test "postgres live: pool queryAllParams collects owned rows" {
         &.{ .{ .integer = 1 }, .{ .text = "a" }, .{ .integer = 2 }, .{ .text = "b" } },
     );
 
+    _ = try pool.execNamed(
+        "insert into zsql_pool_all (id, name) values (:id, :name)",
+        &.{
+            .{ .name = "id", .value = .{ .integer = 3 } },
+            .{ .name = "name", .value = .{ .text = "named" } },
+        },
+    );
+    var named_rows = try pool.queryNamed(
+        "select name from zsql_pool_all where id = :id or id = :id",
+        &.{.{ .name = "id", .value = .{ .integer = 3 } }},
+    );
+    try std.testing.expectEqualStrings("named", try (try named_rows.next().?.value("name")).asText());
+    named_rows.deinit();
+
     const owned = try pool.queryAllParams("select id, name from zsql_pool_all order by id", &.{});
     defer zsql.freeOwnedRows(allocator, owned);
-    try std.testing.expectEqual(@as(usize, 2), owned.len);
+    try std.testing.expectEqual(@as(usize, 3), owned.len);
     try std.testing.expectEqual(@as(i64, 1), try (try owned[0].getName("id")).asInt());
     try std.testing.expectEqualStrings("b", try (try owned[1].getName("name")).asText());
     try std.testing.expectEqual(@as(usize, 0), pool.stats().leased);
