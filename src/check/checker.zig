@@ -427,20 +427,6 @@ const Scanner = struct {
                 try self.skipQuoted('\'');
                 continue;
             }
-            if (c == '"') {
-                try self.skipQuoted('"');
-                continue;
-            }
-            if (c == '`') {
-                try self.skipQuoted('`');
-                continue;
-            }
-            if (c == '[') {
-                self.index += 1;
-                while (self.index < self.sql.len and self.sql[self.index] != ']') : (self.index += 1) {}
-                if (self.index < self.sql.len) self.index += 1;
-                continue;
-            }
             break;
         }
     }
@@ -1335,6 +1321,35 @@ test "checkQuery auto-extracts FROM/JOIN tables and aliases" {
             .{ .name = "p.title", .type_name = "TEXT" },
         },
     });
+}
+
+test "checkQuery resolves quoted table aliases and columns" {
+    const schema = inspect.Schema{
+        .tables = &.{
+            .{
+                .name = "users",
+                .columns = &.{
+                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+                    .{ .name = "email", .type_name = "TEXT", .nullable = false },
+                },
+            },
+        },
+    };
+
+    try checkQuery(.{
+        .sql = "select \"u\".\"email\" from \"users\" as \"u\" where \"u\".\"id\" = :id",
+        .schema = schema,
+        .args = &.{.{ .name = "id" }},
+        .row = &.{.{ .name = "u.email", .type_name = "TEXT" }},
+        .check_projections = true,
+        .check_where = true,
+    });
+
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select \"u\".\"missing\" from \"users\" as \"u\"",
+        .schema = schema,
+        .check_projections = true,
+    }));
 }
 
 test "checkQuery projections validate select list" {
