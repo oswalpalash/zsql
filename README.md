@@ -330,6 +330,11 @@ try get_user.validate(schema);
 // get_user.sql is the trusted SQL string for runtime prepare/bind
 ```
 
+Use `.level = .result_shape` or `.result_types` when a single progressive
+validation policy is preferable to individual clause flags. `result_shape`
+checks projections; `result_types` additionally enables WHERE/HAVING, JOIN ON,
+and ORDER BY reference validation.
+
 When `from_table` / `from_tables` are omitted, `checkQuery` best-effort extracts
 `FROM` / `JOIN` table names and aliases from the SQL. `check_where`,
 `check_join_on`, and `check_order_by` are opt-in: they resolve simple column refs
