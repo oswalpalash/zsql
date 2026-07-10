@@ -187,6 +187,27 @@ const schema = try conn.inspectSchema(allocator);
 defer zsql.drivers.postgres.freeInspectedSchema(allocator, schema);
 ```
 
+### PostgreSQL extensions
+
+LISTEN/NOTIFY keeps a dedicated pool lease until the listener is deinitialized:
+
+```zig
+var listener = try pool.listen();
+defer listener.deinit();
+try listener.listen("events");
+var notification = try listener.next();
+defer notification.deinit(allocator);
+```
+
+COPY uses trusted COPY SQL plus explicit bytes; values are encoded by the caller
+for the selected COPY format:
+
+```zig
+_ = try conn.copyIn("copy users (id, email) from stdin with (format csv)", csv_bytes);
+const exported = try conn.copyOut("copy users to stdout with (format csv)");
+defer allocator.free(exported);
+```
+
 ### QueryBuilder
 
 ```zig
@@ -336,6 +357,9 @@ zig build -Denable-sqlite=true
 ./zig-out/bin/zsql migrate up --url 'postgres://user:pass@127.0.0.1:5432/db?sslmode=disable'
 ./zig-out/bin/zsql migrate status --url 'postgres://user:pass@127.0.0.1:5432/db?sslmode=disable'
 ./zig-out/bin/zsql inspect --url 'postgres://user:pass@127.0.0.1:5432/db?sslmode=disable' --out schema.zon
+
+# Optional schema-to-Zig struct generation:
+./zig-out/bin/zsql gen structs --schema schema.zon --out src/db/schema.zig
 
 zig build checked-queries-example
 # CI-friendly alias for validating the checked-query schema artifact/example:
