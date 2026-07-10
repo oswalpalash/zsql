@@ -16,6 +16,16 @@ pub const CheckError = error{
     TooManyProjections,
 };
 
+/// Progressive offline-validation policy. Existing explicit `check_*` flags
+/// remain available for callers that want a narrower clause selection.
+pub const CheckLevel = enum {
+    none,
+    syntax,
+    parameters,
+    result_shape,
+    result_types,
+};
+
 pub const ArgSpec = struct {
     name: []const u8,
 };
@@ -61,6 +71,7 @@ pub fn checkQuery(options: struct {
     schema: inspect.Schema,
     args: []const ArgSpec = &.{},
     row: []const FieldSpec = &.{},
+    level: CheckLevel = .none,
     /// Single-table scope (legacy / common case).
     from_table: ?[]const u8 = null,
     /// Multi-table scope for JOIN checks. When non-empty, overrides `from_table`.
@@ -79,6 +90,11 @@ pub fn checkQuery(options: struct {
     /// Positional sorts (`ORDER BY 1`) and keywords (`ASC`/`DESC`) are ignored.
     check_order_by: bool = false,
 }) CheckError!void {
+    const level_value = @intFromEnum(options.level);
+    const check_projections = options.check_projections or level_value >= @intFromEnum(CheckLevel.result_shape);
+    const check_where = options.check_where or level_value >= @intFromEnum(CheckLevel.result_types);
+    const check_join_on = options.check_join_on or level_value >= @intFromEnum(CheckLevel.result_types);
+    const check_order_by = options.check_order_by or level_value >= @intFromEnum(CheckLevel.result_types);
     const summary = params.summarize(options.sql) catch return error.InvalidSql;
 
     if (summary.named > 0) {
@@ -144,7 +160,7 @@ pub fn checkQuery(options: struct {
     else
         schemaAsScope(options.schema, &table_buf);
 
-    if (options.check_projections) {
+    if (check_projections) {
         var proj_buf: [max_projections]Projection = undefined;
         const projs = try parseSelectProjections(options.sql, &proj_buf);
         for (projs) |proj| {
@@ -163,7 +179,7 @@ pub fn checkQuery(options: struct {
         }
     }
 
-    if (options.check_where) {
+    if (check_where) {
         var where_buf: [max_projections]Projection = undefined;
         const where_refs = try parseWhereColumnRefs(options.sql, &where_buf);
         try resolveProjectionRefs(options.schema, resolve_scope, where_refs);
@@ -173,13 +189,13 @@ pub fn checkQuery(options: struct {
         try resolveProjectionRefs(options.schema, resolve_scope, having_refs);
     }
 
-    if (options.check_join_on) {
+    if (check_join_on) {
         var on_buf: [max_projections]Projection = undefined;
         const refs = try parseJoinOnColumnRefs(options.sql, &on_buf);
         try resolveProjectionRefs(options.schema, resolve_scope, refs);
     }
 
-    if (options.check_order_by) {
+    if (check_order_by) {
         var order_buf: [max_projections]Projection = undefined;
         const refs = try parseOrderByColumnRefs(options.sql, &order_buf);
         try resolveProjectionRefs(options.schema, resolve_scope, refs);
@@ -1546,6 +1562,17 @@ test "checkQuery projections validate select list" {
         .from_table = "users",
         .check_projections = true,
     });
+}
+
+test "check level enables result-shape validation" {
+    const schema = inspect.Schema{ .tables = &.{.{ .name = "users", .columns = &.{
+        .{ .name = "id", .type_name = "INTEGER", .nullable = false },
+    } }} };
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select missing from users",
+        .schema = schema,
+        .level = .result_shape,
+    }));
 }
 
 test "checkedQuery supports from_tables and check_projections" {
