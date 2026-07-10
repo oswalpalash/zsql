@@ -46,6 +46,12 @@ pub fn main(init: std.process.Init) !void {
         try cmdInspect(init, &args);
         return;
     }
+    if (std.mem.eql(u8, command, "gen")) {
+        const sub = args.next() orelse return error.InvalidArguments;
+        if (!std.mem.eql(u8, sub, "structs")) return error.InvalidArguments;
+        try cmdGenStructs(init, &args);
+        return;
+    }
 
     try writeOut(io, .stderr, "unknown command; try `zsql --help`\n");
     return error.InvalidArguments;
@@ -74,6 +80,7 @@ fn printHelp(io: std.Io) !void {
         \\  zsql migrate up --url <postgres-url> [--dir migrations]
         \\  zsql inspect --database <path> [--out schema.zon]
         \\  zsql inspect --url <postgres-url> [--out schema.zon]
+        \\  zsql gen structs --schema <schema.zon> --out <schema.zig>
         \\  zsql --help
         \\
         \\SQLite migrate/inspect require -Denable-sqlite=true.
@@ -93,6 +100,32 @@ fn printMigrateHelp(io: std.Io) !void {
         \\  zsql migrate up --url <postgres-url> [--dir migrations]
         \\
     );
+}
+
+fn cmdGenStructs(init: std.process.Init, args: *std.process.Args.Iterator) !void {
+    var schema_path: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--schema")) {
+            schema_path = args.next() orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--out")) {
+            out_path = args.next() orelse return error.InvalidArguments;
+        } else return error.InvalidArguments;
+    }
+    const source_path = schema_path orelse return error.InvalidArguments;
+    const dest_path = out_path orelse return error.InvalidArguments;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, source_path, init.gpa, .limited(16 * 1024 * 1024));
+    defer init.gpa.free(bytes);
+    const zon = try init.gpa.dupeZ(u8, bytes);
+    defer init.gpa.free(zon);
+    const schema = try zsql.inspect.parseSchemaZon(init.gpa, zon);
+    defer zsql.inspect.freeParsedSchemaZon(init.gpa, schema);
+    var growing: std.Io.Writer.Allocating = .init(init.gpa);
+    defer growing.deinit();
+    try zsql.codegen.writeStructs(&growing.writer, schema);
+    const file = try std.Io.Dir.cwd().createFile(init.io, dest_path, .{});
+    defer file.close(init.io);
+    try file.writeStreamingAll(init.io, growing.written());
 }
 
 fn cmdDoctor(io: std.Io) !void {
