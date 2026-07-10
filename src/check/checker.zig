@@ -414,26 +414,35 @@ const Scanner = struct {
                 continue;
             }
             if (c == '/' and self.index + 1 < self.sql.len and self.sql[self.index + 1] == '*') {
-                self.index += 2;
-                while (self.index + 1 < self.sql.len) : (self.index += 1) {
-                    if (self.sql[self.index] == '*' and self.sql[self.index + 1] == '/') {
-                        self.index += 2;
-                        break;
-                    }
-                } else return error.InvalidSql;
+                try self.skipBlockComment();
                 continue;
             }
             if (c == '\'') {
-                try self.skipQuoted('\'');
+                try self.skipQuoted('\'', self.isPostgresEscapeString(self.index));
+                continue;
+            }
+            if (c == '$' and try self.skipDollarQuoted()) {
                 continue;
             }
             break;
         }
     }
 
-    fn skipQuoted(self: *Scanner, quote: u8) CheckError!void {
+    fn isPostgresEscapeString(self: Scanner, quote_start: usize) bool {
+        if (quote_start == 0) return false;
+        const prefix = self.sql[quote_start - 1];
+        if (prefix != 'E' and prefix != 'e') return false;
+        return quote_start == 1 or !isIdentContinue(self.sql[quote_start - 2]);
+    }
+
+    fn skipQuoted(self: *Scanner, quote: u8, backslash_escapes: bool) CheckError!void {
         self.index += 1;
         while (self.index < self.sql.len) {
+            if (backslash_escapes and self.sql[self.index] == '\\') {
+                if (self.index + 1 >= self.sql.len) return error.InvalidSql;
+                self.index += 2;
+                continue;
+            }
             if (self.sql[self.index] == quote) {
                 self.index += 1;
                 if (self.index < self.sql.len and self.sql[self.index] == quote) {
@@ -443,6 +452,41 @@ const Scanner = struct {
                 return;
             }
             self.index += 1;
+        }
+        return error.InvalidSql;
+    }
+
+    fn skipDollarQuoted(self: *Scanner) CheckError!bool {
+        const start = self.index;
+        var tag_end = start + 1;
+        if (tag_end < self.sql.len and self.sql[tag_end] != '$') {
+            if (!isIdentStart(self.sql[tag_end])) return false;
+            tag_end += 1;
+            while (tag_end < self.sql.len and isIdentContinue(self.sql[tag_end])) : (tag_end += 1) {}
+        }
+        if (tag_end >= self.sql.len or self.sql[tag_end] != '$') return false;
+
+        const delimiter = self.sql[start .. tag_end + 1];
+        const close_start = std.mem.indexOfPos(u8, self.sql, tag_end + 1, delimiter) orelse
+            return error.InvalidSql;
+        self.index = close_start + delimiter.len;
+        return true;
+    }
+
+    fn skipBlockComment(self: *Scanner) CheckError!void {
+        self.index += 2;
+        var depth: usize = 1;
+        while (self.index + 1 < self.sql.len) {
+            if (self.sql[self.index] == '/' and self.sql[self.index + 1] == '*') {
+                depth += 1;
+                self.index += 2;
+            } else if (self.sql[self.index] == '*' and self.sql[self.index + 1] == '/') {
+                depth -= 1;
+                self.index += 2;
+                if (depth == 0) return;
+            } else {
+                self.index += 1;
+            }
         }
         return error.InvalidSql;
     }
@@ -499,6 +543,14 @@ const Scanner = struct {
         return (tmp.matchKeyword(kw) catch false);
     }
 };
+
+fn isIdentStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_';
+}
+
+fn isIdentContinue(c: u8) bool {
+    return isIdentStart(c) or std.ascii.isDigit(c);
+}
 
 /// Parse table refs after FROM / JOIN. Returns empty slice if none found.
 fn parseFromJoinTables(sql: []const u8, schema: inspect.Schema, buf: *[max_tables]TableRef) CheckError![]const TableRef {
@@ -1350,6 +1402,32 @@ test "checkQuery resolves quoted table aliases and columns" {
         .schema = schema,
         .check_projections = true,
     }));
+}
+
+test "checkQuery ignores postgres literals and nested comments in WHERE" {
+    const schema = inspect.Schema{
+        .tables = &.{
+            .{
+                .name = "users",
+                .columns = &.{
+                    .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+                    .{ .name = "email", .type_name = "TEXT", .nullable = false },
+                },
+            },
+        },
+    };
+
+    try checkQuery(.{
+        .sql =
+        \\select id from users
+        \\where id = :id
+        \\  and email <> $tag$ :not_a_bind and missing_column $tag$
+        \\  /* outer :ignored /* inner missing_column */ */
+        ,
+        .schema = schema,
+        .args = &.{.{ .name = "id" }},
+        .check_where = true,
+    });
 }
 
 test "checkQuery projections validate select list" {
