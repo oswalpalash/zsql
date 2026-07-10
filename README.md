@@ -77,6 +77,12 @@ _ = try conn.execParams("insert into users (email) values ($1)", &.{.{ .text = "
 var rows = try conn.queryParams("select id, email from users where id = $1", &.{.{ .integer = 1 }});
 defer rows.deinit();
 
+// Named binds are rewritten to `$n` safely; repeated names share one bind.
+var named_rows = try conn.queryNamed("select email from users where id = :id", &.{
+    .{ .name = "id", .value = .{ .integer = 1 } },
+});
+defer named_rows.deinit();
+
 // Exactly one row (OwnedRow); NoRows / TooManyRows otherwise:
 var one = try conn.queryOneParams("select id, email from users where id = $1", &.{.{ .integer = 1 }});
 defer one.deinit();

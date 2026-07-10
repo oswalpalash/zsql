@@ -56,6 +56,20 @@ test "postgres live: handshake, params, tx, errors, inspect" {
     try std.testing.expect(try (try row.value("active")).asBool());
     try std.testing.expect(rows.next() == null);
 
+    _ = try conn.execNamed(
+        "insert into zsql_live_users (email, active) values (:email, :active)",
+        &.{
+            .{ .name = "email", .value = .{ .text = "named@example.com" } },
+            .{ .name = "active", .value = .{ .boolean = false } },
+        },
+    );
+    var named_rows = try conn.queryNamed(
+        "select email from zsql_live_users where email = :email or email = :email",
+        &.{.{ .name = "email", .value = .{ .text = "named@example.com" } }},
+    );
+    defer named_rows.deinit();
+    try std.testing.expectEqualStrings("named@example.com", try (try named_rows.next().?.value("email")).asText());
+
     // Unique violation should map + populate lastError, and leave conn usable.
     const dup = conn.execParams(
         "insert into zsql_live_users (email) values ($1)",
@@ -70,7 +84,7 @@ test "postgres live: handshake, params, tx, errors, inspect" {
     var count_rows = try conn.query("select count(*)::bigint as n from zsql_live_users");
     defer count_rows.deinit();
     const count_row = count_rows.next().?;
-    try std.testing.expectEqual(@as(i64, 1), try (try count_row.value("n")).asInt());
+    try std.testing.expectEqual(@as(i64, 2), try (try count_row.value("n")).asInt());
 
     try conn.begin();
     _ = try conn.execParams(
