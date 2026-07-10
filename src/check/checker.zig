@@ -1121,6 +1121,13 @@ pub fn checkedQuery(comptime options: anytype) type {
     const args_value: []const ArgSpec = comptime blk: {
         if (!@hasField(@TypeOf(options), "args")) break :blk &.{};
         const raw = options.args;
+        if (@typeInfo(@TypeOf(raw)) == .@"struct" and !@typeInfo(@TypeOf(raw)).@"struct".is_tuple) {
+            const fields = @typeInfo(@TypeOf(raw)).@"struct".fields;
+            var out: [fields.len]ArgSpec = undefined;
+            for (fields, 0..) |field, i| out[i] = .{ .name = field.name };
+            const frozen = out;
+            break :blk &frozen;
+        }
         var out: [raw.len]ArgSpec = undefined;
         for (raw, 0..) |item, i| {
             out[i] = .{ .name = item.name };
@@ -1132,6 +1139,19 @@ pub fn checkedQuery(comptime options: anytype) type {
     const row_value: []const FieldSpec = comptime blk: {
         if (!@hasField(@TypeOf(options), "row")) break :blk &.{};
         const raw = options.row;
+        if (@TypeOf(raw) == type) {
+            const fields = @typeInfo(raw).@"struct".fields;
+            var out: [fields.len]FieldSpec = undefined;
+            for (fields, 0..) |field, i| {
+                out[i] = .{
+                    .name = field.name,
+                    .type_name = zigTypeName(field.type),
+                    .nullable = zigTypeNullable(field.type),
+                };
+            }
+            const frozen = out;
+            break :blk &frozen;
+        }
         var out: [raw.len]FieldSpec = undefined;
         for (raw, 0..) |item, i| {
             out[i] = .{
@@ -1181,6 +1201,25 @@ pub fn checkedQuery(comptime options: anytype) type {
             });
         }
     };
+}
+
+fn zigTypeNullable(comptime T: type) bool {
+    return @typeInfo(T) == .optional;
+}
+
+fn zigTypeName(comptime T: type) ?[]const u8 {
+    const base = switch (@typeInfo(T)) {
+        .optional => |optional| optional.child,
+        else => T,
+    };
+    if (base == bool) return "BOOLEAN";
+    if (base == i16 or base == u16) return "INT2";
+    if (base == i32 or base == u32) return "INT4";
+    if (base == i64 or base == u64 or base == isize or base == usize) return "INT8";
+    if (base == f32) return "FLOAT4";
+    if (base == f64) return "FLOAT8";
+    if (base == []const u8 or base == []u8) return "TEXT";
+    return null;
 }
 
 test "checkQuery validates named params and columns" {
@@ -1283,6 +1322,21 @@ test "checkedQuery type validates against schema" {
     });
     try get_user.validate(schema);
     try std.testing.expectEqualStrings("select id, email from users where id = :id", get_user.sql);
+}
+
+test "checkedQuery accepts typed argument and row structs" {
+    const schema = inspect.Schema{ .tables = &.{.{ .name = "users", .columns = &.{
+        .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
+        .{ .name = "email", .type_name = "TEXT", .nullable = false },
+        .{ .name = "bio", .type_name = "TEXT", .nullable = true },
+    } }} };
+    const q = checkedQuery(.{
+        .sql = "select id, email, bio from users where id = :id",
+        .args = .{ .id = i64 },
+        .row = struct { id: i64, email: []const u8, bio: ?[]const u8 },
+        .from_table = "users",
+    });
+    try q.validate(schema);
 }
 
 test "checkQuery join scope with from_tables and qualified columns" {

@@ -40,12 +40,8 @@ pub fn main() !void {
         \\from users
         \\where id = :id
         ,
-        .args = &.{.{ .name = "id" }},
-        .row = &.{
-            .{ .name = "id", .type_name = "INTEGER" },
-            .{ .name = "email", .type_name = "TEXT" },
-            .{ .name = "active", .type_name = "INTEGER" },
-        },
+        .args = .{ .id = i64 },
+        .row = struct { id: i64, email: []const u8, active: i64 },
         .from_table = "users",
     });
     try get_user.validate(schema);
