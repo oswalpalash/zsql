@@ -220,12 +220,18 @@ pub const Iterator = struct {
 
     fn skipBlockComment(self: *Iterator) !void {
         self.index += 2;
+        var depth: usize = 1;
         while (self.index + 1 < self.sql.len) {
-            if (self.sql[self.index] == '*' and self.sql[self.index + 1] == '/') {
+            if (self.sql[self.index] == '/' and self.sql[self.index + 1] == '*') {
+                depth += 1;
                 self.index += 2;
-                return;
+            } else if (self.sql[self.index] == '*' and self.sql[self.index + 1] == '/') {
+                depth -= 1;
+                self.index += 2;
+                if (depth == 0) return;
+            } else {
+                self.index += 1;
             }
-            self.index += 1;
         }
         return error.InvalidSql;
     }
@@ -305,4 +311,12 @@ test "postgres escape strings do not expose false bind markers" {
     const summary = try summarize("select E'it\\'s :ignored', :actual");
     try std.testing.expectEqual(@as(usize, 1), summary.total);
     try std.testing.expectEqual(@as(usize, 1), summary.named);
+}
+
+test "nested block comments do not expose false bind markers" {
+    const summary = try summarize("select /* outer :ignored /* inner ? */ $also_ignored */ @actual");
+    try std.testing.expectEqual(@as(usize, 1), summary.total);
+    try std.testing.expectEqual(@as(usize, 1), summary.named);
+
+    try std.testing.expectError(error.InvalidSql, summarize("select /* outer /* inner */"));
 }
