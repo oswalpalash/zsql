@@ -106,6 +106,8 @@ pub fn build(b: *std.Build) void {
     const run_checked_example = b.addRunArtifact(checked_example);
     const checked_example_step = b.step("checked-queries-example", "Run offline checked-query example");
     checked_example_step.dependOn(&run_checked_example.step);
+    const check_sql_step = b.step("check-sql", "Validate the checked-query schema example without a database");
+    check_sql_step.dependOn(&run_checked_example.step);
 
     // Aggregate examples step: always-safe examples (no external DB required).
     const examples_step = b.step("examples", "Run examples that need no external services");

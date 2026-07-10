@@ -316,6 +316,8 @@ zig build -Denable-sqlite=true
 ./zig-out/bin/zsql inspect --url 'postgres://user:pass@127.0.0.1:5432/db?sslmode=disable' --out schema.zon
 
 zig build checked-queries-example
+# CI-friendly alias for validating the checked-query schema artifact/example:
+zig build check-sql
 zig build postgres-pool-example   # skips cleanly if ZSQL_PG_URL unset
 ```
 
