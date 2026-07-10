@@ -238,6 +238,12 @@ pub const Pool = struct {
         try lease.release();
     }
 
+    /// Acquire a dedicated pooled connection for PostgreSQL LISTEN/NOTIFY.
+    /// The lease remains held until `Listener.deinit`.
+    pub fn listen(self: *Pool) !Listener {
+        return .{ .lease = try self.acquire() };
+    }
+
     /// Acquire a lease, run `body` inside `Conn.withTx`, then release the lease.
     /// On body error the connection rolls back and the lease is discarded.
     pub fn withTx(self: *Pool, ctx: anytype, comptime body: *const fn (@TypeOf(ctx), *conn_mod.Conn) anyerror!void) !void {
@@ -263,6 +269,33 @@ pub const Pool = struct {
 
     fn effectiveMaxIdle(self: *const Pool) usize {
         return @min(self.config.max_idle, self.config.max_open);
+    }
+};
+
+/// A dedicated pooled PostgreSQL notification listener.
+pub const Listener = struct {
+    lease: Lease,
+    closed: bool = false,
+
+    pub fn listen(self: *Listener, channel: []const u8) !void {
+        if (self.closed) return error.LeaseClosed;
+        try (try self.lease.conn()).listen(channel);
+    }
+
+    pub fn unlisten(self: *Listener, channel: []const u8) !void {
+        if (self.closed) return error.LeaseClosed;
+        try (try self.lease.conn()).unlisten(channel);
+    }
+
+    pub fn next(self: *Listener) !conn_mod.Notification {
+        if (self.closed) return error.LeaseClosed;
+        return (try self.lease.conn()).nextNotification();
+    }
+
+    pub fn deinit(self: *Listener) void {
+        if (self.closed) return;
+        self.lease.release() catch self.lease.discard() catch {};
+        self.closed = true;
     }
 };
 

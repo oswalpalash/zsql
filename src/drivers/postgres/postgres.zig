@@ -22,11 +22,13 @@ pub const Conn = conn.Conn;
 pub const freeInspectedSchema = conn.freeInspectedSchema;
 pub const SimpleRows = conn.SimpleRows;
 pub const SimpleRow = conn.SimpleRow;
+pub const Notification = conn.Notification;
 pub const Savepoint = conn.Savepoint;
 // Conn.queryOneParams is available on Conn for single-row queries.
 pub const Pool = pool.Pool;
 pub const Lease = pool.Lease;
 pub const PooledRows = pool.PooledRows;
+pub const Listener = pool.Listener;
 pub const PoolConfig = pool.PoolConfig;
 pub const PoolStats = pool.PoolStats;
 pub const Migrator = migrate.Migrator;

@@ -568,6 +568,36 @@ pub const Conn = struct {
         _ = rows.next();
     }
 
+    /// Register this dedicated connection for a PostgreSQL notification channel.
+    /// Channel names are identifier-quoted; payloads are never interpolated.
+    pub fn listen(self: *Conn, channel: []const u8) !void {
+        const sql = try listenSql(self.allocator, "listen", channel);
+        defer self.allocator.free(sql);
+        _ = try self.exec(sql);
+    }
+
+    pub fn unlisten(self: *Conn, channel: []const u8) !void {
+        const sql = try listenSql(self.allocator, "unlisten", channel);
+        defer self.allocator.free(sql);
+        _ = try self.exec(sql);
+    }
+
+    /// Wait for the next asynchronous PostgreSQL notification.
+    /// The returned channel and payload are allocator-owned.
+    pub fn nextNotification(self: *Conn) !Notification {
+        if (self.closed) return error.ConnectionClosed;
+        while (true) {
+            const msg = try self.readMessage();
+            defer self.allocator.free(msg.body);
+            switch (msg.tag) {
+                .notification_response => return Notification.parse(self.allocator, msg.body),
+                .parameter_status, .notice_response => {},
+                .error_response => return self.failFromErrorResponse(msg.body, true),
+                else => return error.ProtocolError,
+            }
+        }
+    }
+
     /// Parameterized query via extended protocol; returns owned simple rows.
     pub fn queryParams(self: *Conn, sql: []const u8, binds: []const core.Value) !SimpleRows {
         const observe = !self.hooks.isEmpty();
@@ -1491,6 +1521,59 @@ const OwnedSimpleRow = struct {
         self.* = undefined;
     }
 };
+
+/// Allocator-owned PostgreSQL asynchronous notification.
+pub const Notification = struct {
+    pid: i32,
+    channel: []u8,
+    payload: []u8,
+
+    pub fn deinit(self: *Notification, allocator: std.mem.Allocator) void {
+        allocator.free(self.channel);
+        allocator.free(self.payload);
+        self.* = undefined;
+    }
+
+    fn parse(allocator: std.mem.Allocator, body: []const u8) !Notification {
+        if (body.len < 6) return error.ProtocolError;
+        const pid = protocol.readI32(body[0..4]);
+        const channel_end = std.mem.indexOfScalarPos(u8, body, 4, 0) orelse return error.ProtocolError;
+        const payload_start = channel_end + 1;
+        const payload_end = std.mem.indexOfScalarPos(u8, body, payload_start, 0) orelse return error.ProtocolError;
+        if (payload_end + 1 != body.len) return error.ProtocolError;
+        const channel = try allocator.dupe(u8, body[4..channel_end]);
+        errdefer allocator.free(channel);
+        return .{ .pid = pid, .channel = channel, .payload = try allocator.dupe(u8, body[payload_start..payload_end]) };
+    }
+};
+
+fn listenSql(allocator: std.mem.Allocator, command: []const u8, channel: []const u8) ![]u8 {
+    if (channel.len == 0 or std.mem.indexOfScalar(u8, channel, 0) != null) return error.InvalidArguments;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, command);
+    try out.appendSlice(allocator, " \"");
+    for (channel) |c| {
+        try out.append(allocator, c);
+        if (c == '"') try out.append(allocator, '"');
+    }
+    try out.append(allocator, '"');
+    return out.toOwnedSlice(allocator);
+}
+
+test "notification parser and listen quoting are strict" {
+    const body = [_]u8{ 0, 0, 0, 7, 'e', 'v', 'e', 'n', 't', 's', 0, '{', '}', 0 };
+    var notification = try Notification.parse(std.testing.allocator, &body);
+    defer notification.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i32, 7), notification.pid);
+    try std.testing.expectEqualStrings("events", notification.channel);
+    try std.testing.expectEqualStrings("{}", notification.payload);
+
+    const sql = try listenSql(std.testing.allocator, "listen", "a\"b");
+    defer std.testing.allocator.free(sql);
+    try std.testing.expectEqualStrings("listen \"a\"\"b\"", sql);
+    try std.testing.expectError(error.InvalidArguments, listenSql(std.testing.allocator, "listen", ""));
+}
 
 fn orderedNamedBinds(
     allocator: std.mem.Allocator,
