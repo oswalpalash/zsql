@@ -507,14 +507,20 @@ simple column refs (including those inside function arguments like
 `lower(email)`), while skipping keywords, binds, casts, and function *names*.
 JOIN USING lists between schema-known tables must name one exposed column on
 the accumulated left relation and a column on the new right table; chained
-USING merges are tracked, while joins involving unknown CTE/subquery relations
-remain outside this bounded validation.
+USING merges are tracked. Opaque CTE/subquery relations return `UnknownTable`
+rather than borrowing unrelated schema columns.
 GROUP BY validation checks reference existence and unique result aliases; it
 does not attempt to prove full SQL grouping legality. SQLite and PostgreSQL can
 build a schema graph with `Conn.inspectSchema` and render ZON via
 `zsql.inspect.writeSchemaZon`. Applications load an embedded artifact with
 `parseSchemaZon` and release its allocator-owned graph with
 `freeParsedSchemaZon`.
+
+For `WITH` queries, projection, scope, and clause discovery is anchored to the
+outer depth-zero statement; nested CTE keywords cannot replace the outer query
+being checked. CTE bodies and CTE-derived relation shapes remain opaque, so
+their internal expressions and output columns are not inferred; using a
+CTE/subquery as an outer relation returns `UnknownTable`.
 
 ### CLI
 

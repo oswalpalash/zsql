@@ -751,6 +751,31 @@ const Scanner = struct {
     }
 };
 
+/// Advance to a keyword at statement parenthesis depth zero. Quoted strings,
+/// dollar-quoted bodies, identifiers, and comments are handled by Scanner.
+fn seekTopLevelKeyword(sc: *Scanner, keyword: []const u8) CheckError!bool {
+    var depth: usize = 0;
+    while (sc.index < sc.sql.len) {
+        try sc.skipTrivia();
+        if (sc.index >= sc.sql.len) return false;
+        const c = sc.peek() orelse return false;
+        if (c == '(') {
+            depth += 1;
+            sc.advance();
+            continue;
+        }
+        if (c == ')') {
+            if (depth == 0) return error.InvalidSql;
+            depth -= 1;
+            sc.advance();
+            continue;
+        }
+        if (depth == 0 and try sc.matchKeyword(keyword)) return true;
+        if ((try sc.readIdentOrStar()) == null) sc.advance();
+    }
+    return false;
+}
+
 fn isIdentStart(c: u8) bool {
     return std.ascii.isAlphabetic(c) or c == '_';
 }
@@ -770,20 +795,8 @@ fn parseFromJoinTables(
     var count: usize = 0;
     var merge_buf: [max_projections]UsingMerge = undefined;
     var merge_count: usize = 0;
-    var all_relations_known = true;
 
-    // Find first FROM keyword at statement level (simple scan).
-    while (sc.index < sc.sql.len) {
-        try sc.skipTrivia();
-        if (sc.index >= sc.sql.len) break;
-        if (try sc.matchKeyword("from")) break;
-        // Skip other tokens roughly: advance one ident or one char.
-        if (try sc.readIdentOrStar()) |_| {
-            continue;
-        } else if (sc.index < sc.sql.len) {
-            sc.advance();
-        }
-    } else return buf[0..0];
+    if (!try seekTopLevelKeyword(&sc, "from")) return buf[0..0];
 
     // After FROM: table [alias] [, table [alias]]* [JOIN table [alias] ...]*
     while (sc.index < sc.sql.len) {
@@ -822,7 +835,7 @@ fn parseFromJoinTables(
         try sc.skipTrivia();
         // ON / USING clauses belong to the most recently appended right table.
         if (try sc.matchKeyword("using")) {
-            if (validate_using and all_relations_known) {
+            if (validate_using) {
                 try validateUsingClause(
                     &sc,
                     schema,
@@ -840,7 +853,10 @@ fn parseFromJoinTables(
             continue;
         }
 
-        const table_name = (try sc.readIdentOrStar()) orelse break;
+        const table_name = (try sc.readIdentOrStar()) orelse {
+            if (sc.peek() == '(') return error.UnknownTable;
+            break;
+        };
         if (std.mem.eql(u8, table_name, "*")) return error.InvalidSql;
 
         // Optional AS alias / bare alias
@@ -877,14 +893,13 @@ fn parseFromJoinTables(
             }
         }
 
-        // Only keep refs that exist in the schema (ignore CTE/subquery noise).
+        // CTE/subquery-derived relation shapes are opaque. Reject them rather
+        // than falling back to unrelated schema tables and claiming success.
         if (findTable(schema, table_name) != null) {
             if (count >= max_tables) return error.TooManyTables;
             buf[count] = .{ .name = table_name, .alias = alias };
             count += 1;
-        } else {
-            all_relations_known = false;
-        }
+        } else return error.UnknownTable;
     }
 
     return buf[0..count];
@@ -1011,12 +1026,7 @@ fn recordUsingMerge(
 /// projections are recognized; other expressions with `(` are skipped.
 fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
     var sc = Scanner.init(sql);
-    // Optional WITH ... skip to SELECT (best-effort: first SELECT)
-    while (sc.index < sc.sql.len) {
-        try sc.skipTrivia();
-        if (try sc.matchKeyword("select")) break;
-        if ((try sc.readIdentOrStar()) == null and sc.index < sc.sql.len) sc.advance();
-    } else return error.InvalidSql;
+    if (!try seekTopLevelKeyword(&sc, "select")) return error.InvalidSql;
 
     // Optional DISTINCT / ALL
     _ = try sc.matchKeyword("distinct");
@@ -1436,12 +1446,7 @@ fn collectColumnRefs(sc: *Scanner, buf: *[max_projections]Projection, start_coun
 /// Returns empty when no WHERE is present. Best-effort; not a full SQL parser.
 fn parseWhereColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
     var sc = Scanner.init(sql);
-    while (sc.index < sc.sql.len) {
-        try sc.skipTrivia();
-        if (sc.index >= sc.sql.len) break;
-        if (try sc.matchKeyword("where")) break;
-        if ((try sc.readIdentOrStar()) == null and sc.index < sc.sql.len) sc.advance();
-    } else return buf[0..0];
+    if (!try seekTopLevelKeyword(&sc, "where")) return buf[0..0];
 
     const count = try collectColumnRefs(&sc, buf, 0, isWhereTerminator);
     return buf[0..count];
@@ -1451,11 +1456,25 @@ fn parseWhereColumnRefs(sql: []const u8, buf: *[max_projections]Projection) Chec
 /// validated separately against both relation sides. Best-effort.
 fn parseJoinOnColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
     var sc = Scanner.init(sql);
+    if (!try seekTopLevelKeyword(&sc, "from")) return buf[0..0];
     var count: usize = 0;
+    var depth: usize = 0;
     while (sc.index < sc.sql.len) {
         try sc.skipTrivia();
         if (sc.index >= sc.sql.len) break;
-        if (try sc.matchKeyword("on")) {
+        const c = sc.peek() orelse break;
+        if (c == '(') {
+            depth += 1;
+            sc.advance();
+            continue;
+        }
+        if (c == ')') {
+            if (depth == 0) return error.InvalidSql;
+            depth -= 1;
+            sc.advance();
+            continue;
+        }
+        if (depth == 0 and try sc.matchKeyword("on")) {
             count = try collectColumnRefs(&sc, buf, count, isJoinOnTerminator);
             continue;
         }
@@ -1468,12 +1487,7 @@ fn parseJoinOnColumnRefs(sql: []const u8, buf: *[max_projections]Projection) Che
 /// Returns empty when no HAVING is present. Best-effort.
 fn parseHavingColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
     var sc = Scanner.init(sql);
-    while (sc.index < sc.sql.len) {
-        try sc.skipTrivia();
-        if (sc.index >= sc.sql.len) break;
-        if (try sc.matchKeyword("having")) break;
-        if ((try sc.readIdentOrStar()) == null and sc.index < sc.sql.len) sc.advance();
-    } else return buf[0..0];
+    if (!try seekTopLevelKeyword(&sc, "having")) return buf[0..0];
 
     // HAVING uses the same terminators as WHERE (ORDER/LIMIT/…).
     const count = try collectColumnRefs(&sc, buf, 0, isWhereTerminator);
@@ -1484,17 +1498,15 @@ fn parseHavingColumnRefs(sql: []const u8, buf: *[max_projections]Projection) Che
 /// Returns empty when no GROUP BY is present. Best-effort.
 fn parseGroupByColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
     var sc = Scanner.init(sql);
-    while (sc.index < sc.sql.len) {
+    var found = false;
+    while (try seekTopLevelKeyword(&sc, "group")) {
         try sc.skipTrivia();
-        if (sc.index >= sc.sql.len) break;
-        if (try sc.matchKeyword("group")) {
-            try sc.skipTrivia();
-            if (try sc.matchKeyword("by")) break;
-            // Bare "group" without "by" — keep scanning.
-            continue;
+        if (try sc.matchKeyword("by")) {
+            found = true;
+            break;
         }
-        if ((try sc.readIdentOrStar()) == null and sc.index < sc.sql.len) sc.advance();
-    } else return buf[0..0];
+    }
+    if (!found) return buf[0..0];
 
     const count = try collectColumnRefs(&sc, buf, 0, isGroupByTerminator);
     return buf[0..count];
@@ -1504,17 +1516,15 @@ fn parseGroupByColumnRefs(sql: []const u8, buf: *[max_projections]Projection) Ch
 /// Returns empty when no ORDER BY is present. Best-effort.
 fn parseOrderByColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
     var sc = Scanner.init(sql);
-    while (sc.index < sc.sql.len) {
+    var found = false;
+    while (try seekTopLevelKeyword(&sc, "order")) {
         try sc.skipTrivia();
-        if (sc.index >= sc.sql.len) break;
-        if (try sc.matchKeyword("order")) {
-            try sc.skipTrivia();
-            if (try sc.matchKeyword("by")) break;
-            // Bare "order" without "by" — keep scanning (e.g. a column named order).
-            continue;
+        if (try sc.matchKeyword("by")) {
+            found = true;
+            break;
         }
-        if ((try sc.readIdentOrStar()) == null and sc.index < sc.sql.len) sc.advance();
-    } else return buf[0..0];
+    }
+    if (!found) return buf[0..0];
 
     const count = try collectColumnRefs(&sc, buf, 0, isOrderByTerminator);
     return buf[0..count];
@@ -2001,6 +2011,85 @@ test "checkQuery auto-extracts FROM/JOIN tables and aliases" {
             .{ .name = "p.title", .type_name = "TEXT" },
         },
     });
+}
+
+test "checkQuery anchors projection scope and clauses outside CTE bodies" {
+    const schema = inspect.Schema{ .tables = &.{
+        .{ .name = "users", .columns = &.{
+            .{ .name = "id", .type_name = "INTEGER", .nullable = false },
+            .{ .name = "email", .type_name = "TEXT", .nullable = false },
+        } },
+        .{ .name = "posts", .columns = &.{.{ .name = "user_id", .type_name = "INTEGER", .nullable = false }} },
+        .{ .name = "audits", .columns = &.{.{ .name = "audit_only", .type_name = "TEXT", .nullable = false }} },
+    } };
+
+    try checkQuery(.{
+        .sql =
+        \\with audit_rows as (
+        \\    select a.audit_only
+        \\    from audits a join audits b on b.audit_only = a.audit_only
+        \\    where a.audit_only is not null
+        \\    group by a.audit_only
+        \\    having count(*) > 0
+        \\    order by a.audit_only
+        \\)
+        \\select u.email as address
+        \\from users u join posts p on p.user_id = u.id
+        \\where u.id > 0
+        \\group by address
+        \\having count(*) > 0
+        \\order by address
+        ,
+        .schema = schema,
+        .row = &.{.{ .name = "address", .type_name = "TEXT" }},
+        .check_projections = true,
+        .check_where = true,
+        .check_join_on = true,
+        .check_group_by = true,
+        .check_order_by = true,
+    });
+
+    try checkQuery(.{
+        .sql =
+        \\with outer_cte as (
+        \\    with inner_cte as (
+        \\        select audit_only,
+        \\               'select from where group order' as note,
+        \\               $tag$( select from where group order )$tag$ as body
+        \\        from audits
+        \\    )
+        \\    select audit_only from inner_cte
+        \\)
+        \\/* select ignored from audits */
+        \\select id from users -- from audits
+        \\where id > 0
+        ,
+        .schema = schema,
+        .row = &.{.{ .name = "id", .type_name = "INTEGER" }},
+        .check_where = true,
+    });
+
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql =
+        \\with audit_rows as (select audit_only from audits)
+        \\select missing from users
+        ,
+        .schema = schema,
+        .check_projections = true,
+    }));
+    try std.testing.expectError(error.UnknownTable, checkQuery(.{
+        .sql =
+        \\with user_ids as (select id from users)
+        \\select id from user_ids
+        ,
+        .schema = schema,
+        .row = &.{.{ .name = "id", .type_name = "INTEGER" }},
+    }));
+    try std.testing.expectError(error.UnknownTable, checkQuery(.{
+        .sql = "select id from (select id from users) nested",
+        .schema = schema,
+        .row = &.{.{ .name = "id", .type_name = "INTEGER" }},
+    }));
 }
 
 test "checkQuery resolves quoted table aliases and columns" {

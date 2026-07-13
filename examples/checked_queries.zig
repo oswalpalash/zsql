@@ -102,6 +102,18 @@ pub fn main() !void {
     });
     try users_by_state.validate(schema);
 
+    // CTE bodies stay opaque, but outer projection/scope/clause discovery is
+    // anchored at statement depth zero rather than the first nested SELECT.
+    const after_cte = zsql.checkedQuery(.{
+        .sql =
+        \\with post_ids as (select user_id from posts where title is not null)
+        \\select email from users where id > 0
+        ,
+        .row = struct { email: []const u8 },
+        .check_where = true,
+    });
+    try after_cte.validate(schema);
+
     var buffer: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     try zsql.inspect.writeSchemaZon(&writer, schema);
