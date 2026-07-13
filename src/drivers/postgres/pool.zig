@@ -194,6 +194,32 @@ pub const Pool = struct {
         return result;
     }
 
+    /// Run COPY FROM STDIN under a short-lived lease.
+    pub fn copyIn(self: *Pool, sql: []const u8, data: []const u8) !core.ExecResult {
+        var lease = try self.acquire();
+        errdefer if (lease.open) lease.discard() catch {};
+        const result = (try lease.conn()).copyIn(sql, data) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
+        try lease.release();
+        return result;
+    }
+
+    /// Run COPY TO STDOUT under a short-lived lease. The returned bytes are
+    /// allocator-owned and remain valid after lease or pool teardown.
+    pub fn copyOut(self: *Pool, sql: []const u8) ![]u8 {
+        var lease = try self.acquire();
+        errdefer if (lease.open) lease.discard() catch {};
+        const output = (try lease.conn()).copyOut(sql) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
+        errdefer self.allocator.free(output);
+        try lease.release();
+        return output;
+    }
+
     /// Prepare a reusable statement on a dedicated lease. The lease remains
     /// held until `PooledStmt.close` / `deinit`.
     pub fn prepare(self: *Pool, sql: []const u8) !PooledStmt {

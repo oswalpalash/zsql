@@ -933,7 +933,7 @@ pub const Conn = struct {
             }
         };
 
-        var out: std.ArrayListUnmanaged(u8) = .empty;
+        var out: CopyOutputBuffer = .{};
         errdefer out.deinit(self.allocator);
         var started = false;
         while (true) {
@@ -950,7 +950,7 @@ pub const Conn = struct {
                 },
                 .copy_data => {
                     if (!started) return error.ProtocolError;
-                    try out.appendSlice(self.allocator, msg.body);
+                    try out.append(self.allocator, msg.body);
                 },
                 .copy_done, .command_complete => {},
                 .ready_for_query => {
@@ -960,7 +960,7 @@ pub const Conn = struct {
                         return error.ProtocolError;
                     };
                     if (!started) return error.ProtocolError;
-                    return out.toOwnedSlice(self.allocator);
+                    return out.finish(self.allocator);
                 },
                 .parameter_status, .notice_response, .notification_response => {},
                 .error_response => return self.failFromErrorResponse(msg.body, false, sql),
@@ -2259,6 +2259,23 @@ pub const Notification = struct {
     }
 };
 
+const CopyOutputBuffer = struct {
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn append(self: *CopyOutputBuffer, allocator: std.mem.Allocator, chunk: []const u8) !void {
+        try self.bytes.appendSlice(allocator, chunk);
+    }
+
+    fn finish(self: *CopyOutputBuffer, allocator: std.mem.Allocator) ![]u8 {
+        return self.bytes.toOwnedSlice(allocator);
+    }
+
+    fn deinit(self: *CopyOutputBuffer, allocator: std.mem.Allocator) void {
+        self.bytes.deinit(allocator);
+        self.* = .{};
+    }
+};
+
 fn listenSql(allocator: std.mem.Allocator, command: []const u8, channel: []const u8) ![]u8 {
     if (channel.len == 0 or std.mem.indexOfScalar(u8, channel, 0) != null) return error.InvalidArguments;
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -2379,6 +2396,24 @@ test "notification parser cleans every partial allocation" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         parseNotificationForAllocationTest,
+        .{},
+    );
+}
+
+fn collectCopyOutputForAllocationTest(allocator: std.mem.Allocator) !void {
+    var output: CopyOutputBuffer = .{};
+    defer output.deinit(allocator);
+    try output.append(allocator, "first,");
+    try output.append(allocator, "second\n");
+    const owned = try output.finish(allocator);
+    defer allocator.free(owned);
+    try std.testing.expectEqualStrings("first,second\n", owned);
+}
+
+test "COPY output aggregation cleans up and transfers ownership on every allocation path" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        collectCopyOutputForAllocationTest,
         .{},
     );
 }

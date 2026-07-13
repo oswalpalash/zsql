@@ -61,6 +61,8 @@ pub fn validate() void {
         });
         requireDecls(zsql.drivers.postgres.Notification, .{"deinit"});
         requireDecls(zsql.drivers.postgres.Listener, .{ "listen", "unlisten", "next", "deinit" });
+        requireDecls(zsql.drivers.postgres.Conn, .{ "copyIn", "copyOut" });
+        requireDecls(zsql.drivers.postgres.Pool, .{ "copyIn", "copyOut" });
 
         if (zsql.enable_sqlite) {
             requireDriver(zsql.drivers.sqlite.Driver);

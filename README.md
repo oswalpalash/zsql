@@ -403,6 +403,11 @@ const exported = try conn.copyOut("copy users to stdout with (format csv)");
 defer allocator.free(exported);
 ```
 
+`Pool.copyIn` and `Pool.copyOut` run the same protocol under a short-lived
+lease. COPY output is allocator-owned and remains valid after the lease or pool
+is deinitialized. If synchronization or lease release fails, the pool discards
+the connection and frees any not-yet-returned output.
+
 ### QueryBuilder
 
 ```zig

@@ -660,6 +660,45 @@ test "postgres live: copy in and out bytes" {
     try conn.ping();
 }
 
+test "postgres live: pooled COPY output survives pool teardown" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa_state.deinit() == .ok);
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+
+    var pool = try pg.Pool.init(allocator, std.testing.io, .{
+        .database = config,
+        .max_open = 1,
+        .max_idle = 1,
+    });
+    errdefer pool.deinit();
+
+    _ = try pool.exec("create temporary table zsql_pool_copy (id int, name text)");
+    const inserted = try pool.copyIn(
+        "copy zsql_pool_copy (id, name) from stdin with (format csv)",
+        "1,ada\n2,grace\n",
+    );
+    try std.testing.expectEqual(@as(u64, 2), inserted.rows_affected);
+    const output = try pool.copyOut(
+        "copy zsql_pool_copy (id, name) to stdout with (format csv)",
+    );
+    defer allocator.free(output);
+
+    // Wrong-direction recovery is synchronized, but the pool conservatively
+    // discards ProtocolError sessions before opening a clean replacement.
+    try std.testing.expectError(
+        error.ProtocolError,
+        pool.copyOut("copy zsql_pool_copy (id, name) from stdin with (format csv)"),
+    );
+    try pool.ping();
+    pool.deinit();
+
+    try std.testing.expectEqualStrings("1,ada\n2,grace\n", output);
+}
+
 test "postgres live: asynchronous notifications preserve session reuse" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
