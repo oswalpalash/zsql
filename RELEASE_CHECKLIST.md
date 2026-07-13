@@ -29,8 +29,9 @@ git diff --check
 
 `release-verify` covers formatting, default and SQLite builds/tests, version
 integrity, checked queries, examples, separate-package consumers, clean-prefix
-installation, Windows and static Linux cross-builds, and a Zig-fetched manifest
-payload. It must finish without ignored failures.
+installation, default and bundled-SQLite cross-builds for Windows and static
+Linux, and a Zig-fetched manifest payload. It must finish without ignored
+failures.
 
 ## 3. Verify PostgreSQL against a live server
 
