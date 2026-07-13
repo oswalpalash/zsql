@@ -602,7 +602,7 @@ pub const Conn = struct {
         return stmt;
     }
 
-    fn prepareNamedStatement(self: *Conn, name: []const u8, sql: []const u8) ![]i32 {
+    fn prepareNamedStatement(self: *Conn, name: []const u8, sql: []const u8) ![]u32 {
         const parse_msg = try protocol.buildParseMessageNamed(self.allocator, name, sql);
         defer self.allocator.free(parse_msg);
         const describe_msg = try protocol.buildDescribeStatementMessage(self.allocator, name);
@@ -614,7 +614,7 @@ pub const Conn = struct {
         try self.writeAll(sync_msg);
 
         var parsed = false;
-        var parameter_oids: ?[]i32 = null;
+        var parameter_oids: ?[]u32 = null;
         errdefer if (parameter_oids) |oids| self.allocator.free(oids);
         while (true) {
             const msg = try self.readMessage();
@@ -2239,7 +2239,7 @@ pub const Stmt = struct {
     allocator: std.mem.Allocator,
     name: []u8,
     sql: []u8,
-    parameter_oids: []i32,
+    parameter_oids: []u32,
     parameter_names: ?[][]const u8 = null,
     open: bool = true,
 
@@ -2247,7 +2247,7 @@ pub const Stmt = struct {
         return self.parameter_oids.len;
     }
 
-    pub fn parameterOids(self: *const Stmt) []const i32 {
+    pub fn parameterOids(self: *const Stmt) []const u32 {
         return self.parameter_oids;
     }
 

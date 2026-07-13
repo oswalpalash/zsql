@@ -159,14 +159,14 @@ test "postgres live: reusable prepared statement exec query and close" {
     var insert = try conn.prepare("insert into zsql_prepared (id, name) values ($1, $2)");
     defer insert.deinit();
     try std.testing.expectEqual(@as(usize, 2), insert.parameterCount());
-    try std.testing.expectEqualSlices(i32, &.{ 20, 25 }, insert.parameterOids());
+    try std.testing.expectEqualSlices(u32, &.{ 20, 25 }, insert.parameterOids());
     try std.testing.expectError(error.BindCountMismatch, insert.exec(&.{.{ .integer = 1 }}));
     try std.testing.expectEqual(@as(u64, 1), (try insert.exec(&.{ .{ .integer = 1 }, .{ .text = "ada" } })).rows_affected);
     try std.testing.expectEqual(@as(u64, 1), (try insert.exec(&.{ .{ .integer = 2 }, .{ .text = "grace" } })).rows_affected);
 
     var select = try conn.prepare("select name from zsql_prepared where id = $1");
     defer select.deinit();
-    try std.testing.expectEqualSlices(i32, &.{20}, select.parameterOids());
+    try std.testing.expectEqualSlices(u32, &.{20}, select.parameterOids());
     var first = try select.query(&.{.{ .integer = 1 }});
     defer first.deinit();
     try std.testing.expectEqualStrings("ada", try (try first.next().?.getName("name")).asText());

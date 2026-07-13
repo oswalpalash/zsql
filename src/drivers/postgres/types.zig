@@ -2,7 +2,7 @@ const std = @import("std");
 const core = @import("../../zsql.zig");
 
 /// Common PostgreSQL type OIDs used for decoding.
-pub const TypeOid = enum(i32) {
+pub const TypeOid = enum(u32) {
     bool = 16,
     bytea = 17,
     int8 = 20,
@@ -53,7 +53,7 @@ pub fn encodeText(allocator: std.mem.Allocator, value: core.Value) !?[]u8 {
 /// - date/timestamp map to `.text` until a dedicated temporal type exists
 ///
 /// `raw` must outlive the returned `Value` for text/blob variants.
-pub fn decodeText(oid: i32, raw: []const u8) !core.Value {
+pub fn decodeText(oid: u32, raw: []const u8) !core.Value {
     return switch (@as(TypeOid, @enumFromInt(oid))) {
         .bool => .{ .boolean = try parseBool(raw) },
         .int2, .int4, .int8 => .{ .integer = try parseInt(raw) },
@@ -121,6 +121,7 @@ test "decode text primitives" {
     try std.testing.expectEqual(@as(i64, -7), (try decodeText(@intFromEnum(TypeOid.int8), "-7")).integer);
     try std.testing.expectEqual(@as(f64, 1.5), (try decodeText(@intFromEnum(TypeOid.float8), "1.5")).real);
     try std.testing.expectEqualStrings("hello", (try decodeText(@intFromEnum(TypeOid.text), "hello")).text);
+    try std.testing.expectEqualStrings("extension", (try decodeText(0xf0000001, "extension")).text);
 }
 
 test "parse command complete tags" {

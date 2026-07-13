@@ -340,26 +340,26 @@ pub const ErrorFields = struct {
 /// Field metadata from RowDescription. String slices borrow from the message body.
 pub const FieldDescription = struct {
     name: []const u8,
-    table_oid: i32,
+    table_oid: u32,
     column_attr: i16,
-    type_oid: i32,
+    type_oid: u32,
     type_size: i16,
     type_modifier: i32,
     format: i16,
 };
 
 /// Parse ParameterDescription into allocator-owned PostgreSQL type OIDs.
-pub fn parseParameterDescription(body: []const u8, allocator: std.mem.Allocator) ![]i32 {
+pub fn parseParameterDescription(body: []const u8, allocator: std.mem.Allocator) ![]u32 {
     if (body.len < 2) return error.ProtocolError;
     const count_u = @as(u16, @bitCast(readI16(body[0..2])));
     const count: usize = count_u;
     if (body.len != 2 + count * 4) return error.ProtocolError;
 
-    const oids = try allocator.alloc(i32, count);
+    const oids = try allocator.alloc(u32, count);
     errdefer allocator.free(oids);
     for (oids, 0..) |*oid, index| {
         const offset = 2 + index * 4;
-        oid.* = readI32(body[offset..][0..4]);
+        oid.* = readU32(body[offset..][0..4]);
     }
     return oids;
 }
@@ -381,9 +381,9 @@ pub fn parseRowDescription(body: []const u8, allocator: std.mem.Allocator) ![]Fi
         if (offset + 18 > body.len) return error.ProtocolError;
         field.* = .{
             .name = name,
-            .table_oid = readI32(body[offset..][0..4]),
+            .table_oid = readU32(body[offset..][0..4]),
             .column_attr = readI16(body[offset + 4 ..][0..2]),
-            .type_oid = readI32(body[offset + 6 ..][0..4]),
+            .type_oid = readU32(body[offset + 6 ..][0..4]),
             .type_size = readI16(body[offset + 10 ..][0..2]),
             .type_modifier = readI32(body[offset + 12 ..][0..4]),
             .format = readI16(body[offset + 16 ..][0..2]),
@@ -628,14 +628,14 @@ test "build extended query messages" {
 }
 
 test "parse row description and data row" {
-    // name\0 table_oid=0 attr=0 type=25 size=-1 mod=-1 format=0
+    // Exercise the full unsigned OID domain, not only built-in low values.
     var body_list: std.ArrayListUnmanaged(u8) = .empty;
     defer body_list.deinit(std.testing.allocator);
     try appendI16(&body_list, std.testing.allocator, 1);
     try appendCString(&body_list, std.testing.allocator, "name");
-    try appendI32(&body_list, std.testing.allocator, 0);
+    try appendU32(&body_list, std.testing.allocator, 0xf0000000);
     try appendI16(&body_list, std.testing.allocator, 0);
-    try appendI32(&body_list, std.testing.allocator, 25);
+    try appendU32(&body_list, std.testing.allocator, 0xf0000001);
     try appendI16(&body_list, std.testing.allocator, -1);
     try appendI32(&body_list, std.testing.allocator, -1);
     try appendI16(&body_list, std.testing.allocator, 0);
@@ -644,7 +644,8 @@ test "parse row description and data row" {
     defer std.testing.allocator.free(fields);
     try std.testing.expectEqual(@as(usize, 1), fields.len);
     try std.testing.expectEqualStrings("name", fields[0].name);
-    try std.testing.expectEqual(@as(i32, 25), fields[0].type_oid);
+    try std.testing.expectEqual(@as(u32, 0xf0000000), fields[0].table_oid);
+    try std.testing.expectEqual(@as(u32, 0xf0000001), fields[0].type_oid);
 
     var data_list: std.ArrayListUnmanaged(u8) = .empty;
     defer data_list.deinit(std.testing.allocator);
@@ -666,17 +667,23 @@ test "parse parameter description" {
     var body: std.ArrayListUnmanaged(u8) = .empty;
     defer body.deinit(std.testing.allocator);
     try appendI16(&body, std.testing.allocator, 2);
-    try appendI32(&body, std.testing.allocator, 20);
-    try appendI32(&body, std.testing.allocator, 25);
+    try appendU32(&body, std.testing.allocator, 20);
+    try appendU32(&body, std.testing.allocator, 0xf0000001);
 
     const oids = try parseParameterDescription(body.items, std.testing.allocator);
     defer std.testing.allocator.free(oids);
-    try std.testing.expectEqualSlices(i32, &.{ 20, 25 }, oids);
+    try std.testing.expectEqualSlices(u32, &.{ 20, 0xf0000001 }, oids);
     try std.testing.expectError(error.ProtocolError, parseParameterDescription(body.items[0 .. body.items.len - 1], std.testing.allocator));
 }
 
 pub fn appendI16(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: i16) !void {
     var buf: [2]u8 = undefined;
     std.mem.writeInt(i16, &buf, value, .big);
+    try list.appendSlice(allocator, &buf);
+}
+
+fn appendU32(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: u32) !void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .big);
     try list.appendSlice(allocator, &buf);
 }

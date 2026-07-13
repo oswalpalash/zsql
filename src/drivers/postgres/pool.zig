@@ -458,7 +458,7 @@ pub const PooledStmt = struct {
         return if (self.closed) 0 else self.stmt.parameterCount();
     }
 
-    pub fn parameterOids(self: *const PooledStmt) []const i32 {
+    pub fn parameterOids(self: *const PooledStmt) []const u32 {
         return if (self.closed) &.{} else self.stmt.parameterOids();
     }
 
