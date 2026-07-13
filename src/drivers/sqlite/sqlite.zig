@@ -519,6 +519,15 @@ pub const Conn = struct {
         self.closed = true;
     }
 
+    /// Create a borrowed cross-task interrupt handle.
+    ///
+    /// The handle may be copied and called from another task, but it must not
+    /// outlive or race `Database.deinit`. Create it before starting the query.
+    pub fn interruptHandle(self: *const Conn) !InterruptHandle {
+        if (self.closed) return error.ConnectionClosed;
+        return .{ .handle = self.handle };
+    }
+
     /// Replace connection-local query hooks. Pass `.{}` to clear.
     pub fn setHooks(self: *Conn, hooks: core.Hooks) void {
         self.hooks = hooks;
@@ -1206,8 +1215,9 @@ pub const Stmt = struct {
         if (self.closed) return;
         self.freeBindBuffers();
         if (self.finalize_on_close) {
-            const rc = c.sqlite3_finalize(self.handle);
-            std.debug.assert(rc == c.SQLITE_OK);
+            // Finalize always releases the statement but returns its most
+            // recent evaluation error (for example SQLITE_INTERRUPT).
+            _ = c.sqlite3_finalize(self.handle);
         } else {
             _ = c.sqlite3_clear_bindings(self.handle);
             _ = c.sqlite3_reset(self.handle);
@@ -1252,7 +1262,7 @@ pub const Stmt = struct {
             },
             else => {
                 _ = c.sqlite3_reset(self.handle);
-                return error.DriverError;
+                return sqliteError(rc);
             },
         }
     }
@@ -1389,11 +1399,7 @@ fn execScriptSql(allocator: std.mem.Allocator, db: *c.sqlite3, sql: []const u8) 
     var message: [*c]u8 = null;
     const rc = c.sqlite3_exec(db, sql_z.ptr, null, null, &message);
     if (message != null) c.sqlite3_free(message);
-    switch (rc) {
-        c.SQLITE_OK => {},
-        c.SQLITE_ERROR => return error.InvalidSql,
-        else => return error.DriverError,
-    }
+    if (rc != c.SQLITE_OK) return sqliteError(rc);
 }
 
 pub const Rows = struct {
@@ -1476,7 +1482,7 @@ pub const Rows = struct {
                 self.done = true;
                 return null;
             },
-            else => return error.DriverError,
+            else => return sqliteError(rc),
         }
     }
 
@@ -1492,8 +1498,30 @@ pub const Rows = struct {
     }
 };
 
+/// Borrowed SQLite interruption capability.
+///
+/// This contains only SQLite's thread-safe connection pointer. It does not own
+/// or extend the database lifetime and must never race `Database.deinit`.
+pub const InterruptHandle = struct {
+    handle: *c.sqlite3,
+
+    pub fn request(self: InterruptHandle) void {
+        c.sqlite3_interrupt(self.handle);
+    }
+};
+
 fn sqliteIndex(index: usize) !c_int {
     return std.math.cast(c_int, index) orelse error.InvalidBindValue;
+}
+
+fn sqliteError(rc: c_int) anyerror {
+    return switch (rc) {
+        c.SQLITE_INTERRUPT => error.QueryTimeout,
+        c.SQLITE_BUSY => error.Busy,
+        c.SQLITE_LOCKED => error.Locked,
+        c.SQLITE_ERROR => error.InvalidSql,
+        else => error.DriverError,
+    };
 }
 
 fn sqliteLen(len: usize) !c_int {
@@ -1610,6 +1638,37 @@ test "SQLite open applies busy_timeout_ms" {
     var conn = try db.connect();
     defer conn.close();
     // Setting busy timeout must not break basic query use.
+    try conn.ping();
+}
+
+fn advanceRowsForInterrupt(rows: *Rows) anyerror!?core.Row {
+    return rows.next();
+}
+
+test "SQLite InterruptHandle cancels a long query and preserves connection use" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+    const interrupt = try conn.interruptHandle();
+
+    {
+        var rows = try conn.query(
+            \\with recursive counter(n) as (
+            \\  values(0)
+            \\  union all select n + 1 from counter where n < 1000000000
+            \\)
+            \\select sum(n) from counter
+        , &.{});
+        defer rows.deinit();
+
+        var query = std.testing.io.async(advanceRowsForInterrupt, .{&rows});
+        defer _ = query.cancel(std.testing.io) catch {};
+        try std.testing.io.sleep(.{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake);
+        interrupt.request();
+        try std.testing.expectError(error.QueryTimeout, query.await(std.testing.io));
+    }
+
     try conn.ping();
 }
 

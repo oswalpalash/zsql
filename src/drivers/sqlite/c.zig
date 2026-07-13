@@ -7,6 +7,7 @@ pub const SQLITE_OK: c_int = 0;
 pub const SQLITE_ERROR: c_int = 1;
 pub const SQLITE_BUSY: c_int = 5;
 pub const SQLITE_LOCKED: c_int = 6;
+pub const SQLITE_INTERRUPT: c_int = 9;
 pub const SQLITE_MISUSE: c_int = 21;
 pub const SQLITE_ROW: c_int = 100;
 pub const SQLITE_DONE: c_int = 101;
@@ -41,6 +42,10 @@ pub extern fn sqlite3_open_v2(
 ) c_int;
 
 pub extern fn sqlite3_close_v2(db: ?*sqlite3) c_int;
+
+/// Interrupt a currently executing operation on this database connection.
+/// SQLite permits this call from a different thread.
+pub extern fn sqlite3_interrupt(db: ?*sqlite3) void;
 
 /// Sleep up to `ms` when the database is locked (0 disables the busy handler).
 pub extern fn sqlite3_busy_timeout(db: ?*sqlite3, ms: c_int) c_int;

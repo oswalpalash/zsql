@@ -34,7 +34,7 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 - `zsql.Hooks`, `zsql.QueryStart`, `zsql.QueryEnd` (connection-local observability)
 - `zsql.StmtCache` (connection-local prepared-statement name LRU)
 - `zsql.inspect`, `zsql.check`
-- `zsql.drivers.sqlite` (`-Denable-sqlite=true`): full open/exec/query/bind/tx/savepoint/pool/migrator/schema inspect
+- `zsql.drivers.sqlite` (`-Denable-sqlite=true`): full open/exec/query/bind/tx/savepoint/pool/migrator/schema inspect and borrowed `InterruptHandle`
 - `zsql.drivers.postgres`: native (no libpq) URL parse, SCRAM-SHA-256 / SCRAM-SHA-256-PLUS / MD5 / cleartext, simple + extended query, tx/savepoints, pool, schema inspect, owned `CancelHandle`, `Conn.lastError()`, optional `enableStmtCache`
 
 Use a driver’s explicit marker for the generic façade, e.g.
@@ -57,6 +57,17 @@ zig build test -Denable-sqlite=true -Dsqlite-system=true
 Uses explicit C ABI bindings in `src/drivers/sqlite/c.zig` (no `@cImport`).
 With `-Denable-sqlite=true`, the build fetches and compiles the SQLite amalgamation
 by default. Pass `-Dsqlite-system=true` to link system `libsqlite3` via pkg-config.
+
+Long-running work can be interrupted from another task with a borrowed handle:
+
+```zig
+const interrupt = try conn.interruptHandle();
+// While a query is active on conn from another task:
+interrupt.request();
+```
+
+The interrupted operation returns `error.QueryTimeout`. The handle does not own
+the database and must not outlive or race `Database.deinit`.
 
 ```zig
 // Optional lock wait (sqlite3_busy_timeout) for multi-writer apps:
