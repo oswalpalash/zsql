@@ -1072,6 +1072,7 @@ pub const Conn = struct {
         }
 
         return .{
+            .dialect = .sqlite,
             .tables = try tables_list.toOwnedSlice(allocator),
         };
     }
@@ -2265,6 +2266,7 @@ test "SQLite inspectSchema exports tables and columns" {
     const schema = try conn.inspectSchema(std.testing.allocator);
     defer freeInspectedSchema(std.testing.allocator, schema);
 
+    try std.testing.expectEqual(core.inspect.Dialect.sqlite, schema.dialect);
     try std.testing.expectEqual(@as(usize, 1), schema.tables.len);
     try std.testing.expectEqualStrings("inspect_users", schema.tables[0].name);
     try std.testing.expectEqual(@as(usize, 3), schema.tables[0].columns.len);

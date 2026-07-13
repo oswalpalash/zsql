@@ -527,6 +527,12 @@ the checker. Double-quoted (`"a""b"`), backtick (`` `a``b` ``), and bracket
 (`[a]]b]`) delimiter escapes are decoded during comparison, so exact inspected
 schema names work across projections, clauses, aggregates, and JOIN USING.
 
+Inspected schema artifacts carry `.dialect = .sqlite` or `.postgres`.
+PostgreSQL checks lowercase unquoted identifiers before catalog lookup; SQLite
+checks unquoted identifiers case-insensitively. Quoted identifiers remain exact.
+Legacy and hand-authored artifacts without this field default to `.unknown` and
+retain exact-match behavior.
+
 ### CLI
 
 Migration applies are transactional and serialized per driver. If migration SQL

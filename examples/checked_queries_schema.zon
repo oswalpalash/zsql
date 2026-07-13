@@ -1,4 +1,5 @@
 .{
+    .dialect = .unknown,
     .tables = .{
         .{ .name = "users", .columns = .{
             .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },

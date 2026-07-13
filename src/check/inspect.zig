@@ -1,5 +1,13 @@
 const std = @import("std");
 
+/// Identifier lookup semantics carried by an offline schema artifact.
+/// `.unknown` preserves exact matching for legacy or hand-authored artifacts.
+pub const Dialect = enum {
+    unknown,
+    sqlite,
+    postgres,
+};
+
 /// Minimal schema model for offline query checking artifacts.
 pub const Column = struct {
     name: []const u8,
@@ -22,6 +30,7 @@ pub const Table = struct {
 };
 
 pub const Schema = struct {
+    dialect: Dialect = .unknown,
     tables: []const Table,
 };
 
@@ -49,6 +58,7 @@ pub fn freeIndexes(allocator: std.mem.Allocator, indexes: []Index) void {
 /// Output is deterministic and intentionally simple (not a full ZON encoder).
 pub fn writeSchemaZon(writer: *std.Io.Writer, schema: Schema) !void {
     try writer.writeAll(".{\n");
+    try writer.print("    .dialect = .{s},\n", .{@tagName(schema.dialect)});
     try writer.writeAll("    .tables = .{\n");
     for (schema.tables) |table| {
         try writer.print("        .{{ .name = \"{s}\", .columns = .{{\n", .{table.name});
@@ -226,6 +236,7 @@ pub fn freeColumns(allocator: std.mem.Allocator, columns: []Column) void {
 
 test "writeSchemaZon is deterministic" {
     const schema = Schema{
+        .dialect = .sqlite,
         .tables = &.{
             .{
                 .name = "users",
@@ -242,6 +253,7 @@ test "writeSchemaZon is deterministic" {
     try writeSchemaZon(&writer, schema);
     try std.testing.expectEqualStrings(
         \\.{
+        \\    .dialect = .sqlite,
         \\    .tables = .{
         \\        .{ .name = "users", .columns = .{
         \\            .{ .name = "id", .type_name = "INTEGER", .nullable = false, .primary_key = true },
@@ -280,11 +292,20 @@ test "parseSchemaZon loads an embedded artifact" {
     const schema = try parseSchemaZon(std.testing.allocator, @embedFile("testdata/users_schema.zon"));
     defer freeParsedSchemaZon(std.testing.allocator, schema);
 
+    try std.testing.expectEqual(Dialect.unknown, schema.dialect);
     try std.testing.expectEqual(@as(usize, 1), schema.tables.len);
     try std.testing.expectEqualStrings("users", schema.tables[0].name);
     try std.testing.expectEqual(@as(usize, 4), schema.tables[0].columns.len);
     try std.testing.expect(schema.tables[0].columns[0].primary_key);
     try std.testing.expect(schema.tables[0].columns[3].nullable);
+}
+
+test "parseSchemaZon defaults legacy artifacts to unknown dialect" {
+    const schema = try parseSchemaZon(std.testing.allocator, ".{ .tables = .{} }");
+    defer freeParsedSchemaZon(std.testing.allocator, schema);
+
+    try std.testing.expectEqual(Dialect.unknown, schema.dialect);
+    try std.testing.expectEqual(@as(usize, 0), schema.tables.len);
 }
 
 test "columnsFromSqliteTableInfo maps nullability and pk" {

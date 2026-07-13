@@ -109,6 +109,7 @@ test "postgres live: handshake, params, tx, errors, inspect" {
 
     const schema = try conn.inspectSchema(allocator);
     defer pg.freeInspectedSchema(allocator, schema);
+    try std.testing.expectEqual(zsql.inspect.Dialect.postgres, schema.dialect);
     var found_users = false;
     for (schema.tables) |table| {
         if (std.mem.eql(u8, table.name, "zsql_live_users")) {
@@ -471,6 +472,7 @@ test "postgres live: inspectSchema exports user tables" {
 
     const schema = try conn.inspectSchema(allocator);
     defer pg.freeInspectedSchema(allocator, schema);
+    try std.testing.expectEqual(zsql.inspect.Dialect.postgres, schema.dialect);
 
     var found = false;
     for (schema.tables) |table| {

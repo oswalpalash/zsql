@@ -191,7 +191,7 @@ pub fn checkQuery(options: struct {
                 .star => {
                     if (proj.qualifier) |q| {
                         // table.* — qualifier must resolve to a known table/alias in scope.
-                        _ = findTableRefSql(resolve_scope, q) orelse return error.UnknownTable;
+                        _ = findTableRefSql(resolve_scope, q, options.schema.dialect) orelse return error.UnknownTable;
                     }
                 },
                 .column, .count, .min, .max => _ = try resolveProjectionColumn(options.schema, resolve_scope, proj),
@@ -243,7 +243,7 @@ fn resolveOutputRefs(
             var alias_projection: ?Projection = null;
             for (projections) |projection| {
                 if (projection.alias) |alias| {
-                    if (sqlIdentsEql(alias, ref.column)) {
+                    if (sqlIdentsResolveEql(alias, ref.column, schema.dialect)) {
                         alias_matches += 1;
                         alias_projection = projection;
                     }
@@ -272,8 +272,10 @@ fn resolveProjectedField(
     var match: ?inspect.Column = null;
     for (projections) |projection| {
         if (projection.kind == .star) continue;
-        if (!projectionMatchesField(projection, field_name)) continue;
+        const has_result_alias = projection.alias != null or projection.kind != .column;
+        if (has_result_alias and !projectionMatchesField(projection, null, field_name, schema.dialect)) continue;
         const column = try resolveProjectionColumn(schema, scope, projection);
+        if (!has_result_alias and !projectionMatchesField(projection, column.name, field_name, schema.dialect)) continue;
         try addProjectionMatch(&match, column);
     }
 
@@ -283,9 +285,9 @@ fn resolveProjectedField(
     for (projections) |projection| {
         if (projection.kind != .star) continue;
         if (projection.qualifier) |star_qualifier| {
-            const table_ref = findTableRefSql(scope, star_qualifier) orelse return error.UnknownTable;
+            const table_ref = findTableRefSql(scope, star_qualifier, schema.dialect) orelse return error.UnknownTable;
             if (field_qualifier) |qualifier| {
-                const field_ref = findTableRef(scope, qualifier) orelse return error.RowFieldNotProjected;
+                const field_ref = findTableRef(scope, qualifier, schema.dialect) orelse return error.RowFieldNotProjected;
                 if (!std.mem.eql(u8, field_ref.name, table_ref.name)) continue;
             }
             const table = findTable(schema, table_ref.name) orelse return error.UnknownTable;
@@ -294,7 +296,7 @@ fn resolveProjectedField(
         } else {
             for (scope) |table_ref| {
                 if (field_qualifier) |qualifier| {
-                    const field_ref = findTableRef(scope, qualifier) orelse return error.RowFieldNotProjected;
+                    const field_ref = findTableRef(scope, qualifier, schema.dialect) orelse return error.RowFieldNotProjected;
                     if (!std.mem.eql(u8, field_ref.name, table_ref.name)) continue;
                 }
                 const table = findTable(schema, table_ref.name) orelse continue;
@@ -346,21 +348,27 @@ fn addProjectionMatch(match: *?inspect.Column, candidate: inspect.Column) CheckE
     match.* = candidate;
 }
 
-fn projectionMatchesField(projection: Projection, field_name: []const u8) bool {
+fn projectionMatchesField(
+    projection: Projection,
+    source_column_name: ?[]const u8,
+    field_name: []const u8,
+    dialect: inspect.Dialect,
+) bool {
     switch (projection.kind) {
         .count, .min, .max => {
             const alias = projection.alias orelse return false;
-            return sqlIdentEql(alias, field_name);
+            return sqlOutputIdentEql(alias, field_name, dialect);
         },
         .column, .star => {},
     }
-    if (projection.alias) |alias| return sqlIdentEql(alias, field_name);
+    if (projection.alias) |alias| return sqlOutputIdentEql(alias, field_name, dialect);
+    const result_name = source_column_name orelse return false;
     if (std.mem.indexOfScalar(u8, field_name, '.')) |dot| {
         const qualifier = projection.qualifier orelse return false;
-        return sqlIdentEql(qualifier, field_name[0..dot]) and
-            sqlIdentEql(projection.column, field_name[dot + 1 ..]);
+        return sqlOutputIdentEql(qualifier, field_name[0..dot], dialect) and
+            std.mem.eql(u8, result_name, field_name[dot + 1 ..]);
     }
-    return sqlIdentEql(projection.column, field_name);
+    return std.mem.eql(u8, result_name, field_name);
 }
 
 fn resolveProjectionRefs(schema: inspect.Schema, scope: []const TableRef, refs: []const Projection) CheckError!void {
@@ -433,7 +441,7 @@ fn resolveQualified(
     qual: []const u8,
     col_name: []const u8,
 ) CheckError!ResolvedColumn {
-    const ref = findTableRef(scope, qual) orelse {
+    const ref = findTableRef(scope, qual, schema.dialect) orelse {
         // Allow direct schema table name even if not in explicit scope.
         if (findTable(schema, qual)) |table| {
             const col = findColumn(table, col_name) orelse return error.UnknownColumn;
@@ -464,15 +472,15 @@ fn resolveQualifiedSql(
     qualifier: []const u8,
     column: []const u8,
 ) CheckError!ResolvedColumn {
-    const ref = findTableRefSql(scope, qualifier) orelse {
+    const ref = findTableRefSql(scope, qualifier, schema.dialect) orelse {
         if (findTableSql(schema, qualifier)) |table| {
-            const col = findColumnSql(table, column) orelse return error.UnknownColumn;
+            const col = findColumnSql(table, column, schema.dialect) orelse return error.UnknownColumn;
             return .{ .table = table, .col = col };
         }
         return error.UnknownTable;
     };
     const table = findTable(schema, ref.name) orelse return error.UnknownTable;
-    const col = findColumnSql(table, column) orelse return error.UnknownColumn;
+    const col = findColumnSql(table, column, schema.dialect) orelse return error.UnknownColumn;
     return .{ .table = table, .col = col };
 }
 
@@ -480,7 +488,7 @@ fn resolveUnqualifiedSql(schema: inspect.Schema, scope: []const TableRef, column
     var found: ?ResolvedColumn = null;
     for (scope) |ref| {
         const table = findTable(schema, ref.name) orelse continue;
-        if (findColumnSql(table, column)) |col| {
+        if (findColumnSql(table, column, schema.dialect)) |col| {
             if (found != null) return error.AmbiguousColumn;
             found = .{ .table = table, .col = col };
         }
@@ -488,21 +496,21 @@ fn resolveUnqualifiedSql(schema: inspect.Schema, scope: []const TableRef, column
     return found orelse error.UnknownColumn;
 }
 
-fn findTableRef(scope: []const TableRef, qual: []const u8) ?TableRef {
+fn findTableRef(scope: []const TableRef, qual: []const u8, dialect: inspect.Dialect) ?TableRef {
     for (scope) |ref| {
         if (std.mem.eql(u8, ref.name, qual)) return ref;
         if (ref.alias) |a| {
-            if (sqlIdentEql(a, qual)) return ref;
+            if (sqlOutputIdentEql(a, qual, dialect)) return ref;
         }
     }
     return null;
 }
 
-fn findTableRefSql(scope: []const TableRef, qualifier: []const u8) ?TableRef {
+fn findTableRefSql(scope: []const TableRef, qualifier: []const u8, dialect: inspect.Dialect) ?TableRef {
     for (scope) |ref| {
-        if (sqlIdentEql(qualifier, ref.name)) return ref;
+        if (sqlSchemaIdentEql(qualifier, ref.name, dialect)) return ref;
         if (ref.alias) |alias| {
-            if (sqlIdentsEql(alias, qualifier)) return ref;
+            if (sqlIdentsResolveEql(alias, qualifier, dialect)) return ref;
         }
     }
     return null;
@@ -525,7 +533,7 @@ fn findTable(schema: inspect.Schema, name: []const u8) ?inspect.Table {
 
 fn findTableSql(schema: inspect.Schema, name: []const u8) ?inspect.Table {
     for (schema.tables) |table| {
-        if (sqlIdentEql(name, table.name)) return table;
+        if (sqlSchemaIdentEql(name, table.name, schema.dialect)) return table;
     }
     return null;
 }
@@ -537,9 +545,9 @@ fn findColumn(table: inspect.Table, name: []const u8) ?inspect.Column {
     return null;
 }
 
-fn findColumnSql(table: inspect.Table, name: []const u8) ?inspect.Column {
+fn findColumnSql(table: inspect.Table, name: []const u8, dialect: inspect.Dialect) ?inspect.Column {
     for (table.columns) |col| {
-        if (sqlIdentEql(name, col.name)) return col;
+        if (sqlSchemaIdentEql(name, col.name, dialect)) return col;
     }
     return null;
 }
@@ -874,6 +882,55 @@ fn sqlIdentsEql(a: []const u8, b: []const u8) bool {
     }
 }
 
+fn foldSqlIdentByte(byte: u8) u8 {
+    return std.ascii.toLower(byte);
+}
+
+fn sqlSchemaIdentEql(encoded: []const u8, schema_name: []const u8, dialect: inspect.Dialect) bool {
+    if (sqlIdentClose(encoded) != null or dialect == .unknown) return sqlIdentEql(encoded, schema_name);
+    if (encoded.len != schema_name.len) return false;
+    return switch (dialect) {
+        .unknown => unreachable,
+        .postgres => for (encoded, schema_name) |sql_byte, schema_byte| {
+            if (foldSqlIdentByte(sql_byte) != schema_byte) break false;
+        } else true,
+        .sqlite => std.ascii.eqlIgnoreCase(encoded, schema_name),
+    };
+}
+
+fn sqlIdentsResolveEql(a: []const u8, b: []const u8, dialect: inspect.Dialect) bool {
+    const a_quoted = sqlIdentClose(a) != null;
+    const b_quoted = sqlIdentClose(b) != null;
+    if (dialect == .unknown or (dialect == .sqlite and (a_quoted or b_quoted))) {
+        return sqlIdentsEql(a, b);
+    }
+
+    var a_it = SqlIdentIterator.init(a);
+    var b_it = SqlIdentIterator.init(b);
+    while (true) {
+        var a_byte = a_it.next();
+        var b_byte = b_it.next();
+        if (dialect == .postgres) {
+            if (!a_quoted and a_byte != null) a_byte = foldSqlIdentByte(a_byte.?);
+            if (!b_quoted and b_byte != null) b_byte = foldSqlIdentByte(b_byte.?);
+        } else {
+            if (a_byte != null) a_byte = foldSqlIdentByte(a_byte.?);
+            if (b_byte != null) b_byte = foldSqlIdentByte(b_byte.?);
+        }
+        if (a_byte != b_byte) return false;
+        if (a_byte == null) return true;
+    }
+}
+
+fn sqlOutputIdentEql(encoded: []const u8, output_name: []const u8, dialect: inspect.Dialect) bool {
+    if (sqlIdentClose(encoded) != null or dialect != .postgres) return sqlIdentEql(encoded, output_name);
+    if (encoded.len != output_name.len) return false;
+    for (encoded, output_name) |sql_byte, output_byte| {
+        if (foldSqlIdentByte(sql_byte) != output_byte) return false;
+    }
+    return true;
+}
+
 fn sqlIdentKeywordEql(encoded: []const u8, keyword: []const u8) bool {
     return sqlIdentClose(encoded) == null and std.ascii.eqlIgnoreCase(encoded, keyword);
 }
@@ -1093,15 +1150,15 @@ fn validateUsingClause(
         if (sqlIdentEql(column, "*")) return error.InvalidSql;
         if (clause_count >= max_projections) return error.TooManyProjections;
         for (clause_columns[0..clause_count]) |previous| {
-            if (sqlIdentsEql(previous, column)) return error.InvalidSql;
+            if (sqlIdentsResolveEql(previous, column, schema.dialect)) return error.InvalidSql;
         }
         clause_columns[clause_count] = column;
         clause_count += 1;
 
         const left_exposures = usingLeftExposureCount(schema, tables[0 .. tables.len - 1], merges[0..merge_count.*], column);
-        if (left_exposures == 0 or findColumnSql(right, column) == null) return error.UnknownColumn;
+        if (left_exposures == 0 or findColumnSql(right, column, schema.dialect) == null) return error.UnknownColumn;
         if (left_exposures > 1) return error.AmbiguousColumn;
-        try recordUsingMerge(merges, merge_count, column);
+        try recordUsingMerge(merges, merge_count, column, schema.dialect);
 
         try sc.skipTrivia();
         if (sc.peek() == ',') {
@@ -1123,10 +1180,10 @@ fn usingLeftExposureCount(
     var physical_count: usize = 0;
     for (left) |ref| {
         const table = findTable(schema, ref.name) orelse continue;
-        if (findColumnSql(table, column) != null) physical_count += 1;
+        if (findColumnSql(table, column, schema.dialect) != null) physical_count += 1;
     }
     for (merges) |merge| {
-        if (sqlIdentsEql(merge.column, column)) {
+        if (sqlIdentsResolveEql(merge.column, column, schema.dialect)) {
             return physical_count -| merge.reductions;
         }
     }
@@ -1137,9 +1194,10 @@ fn recordUsingMerge(
     merges: *[max_projections]UsingMerge,
     merge_count: *usize,
     column: []const u8,
+    dialect: inspect.Dialect,
 ) CheckError!void {
     for (merges[0..merge_count.*]) |*merge| {
-        if (sqlIdentsEql(merge.column, column)) {
+        if (sqlIdentsResolveEql(merge.column, column, dialect)) {
             merge.reductions += 1;
             return;
         }
@@ -2305,6 +2363,81 @@ test "checkQuery decodes doubled quoted identifier delimiters" {
 
     try std.testing.expect(sqlIdentEql("[bracket]]name]", "bracket]name"));
     try std.testing.expect(sqlIdentsEql("[bracket]]name]", "\"bracket]name\""));
+}
+
+test "checkQuery applies dialect-aware unquoted identifier lookup" {
+    const pg_schema = inspect.Schema{ .dialect = .postgres, .tables = &.{
+        .{ .name = "Users", .columns = &.{.{ .name = "Email", .type_name = "TEXT", .nullable = false }} },
+        .{ .name = "users", .columns = &.{.{ .name = "email", .type_name = "TEXT", .nullable = false }} },
+        .{ .name = "a", .columns = &.{.{ .name = "id", .type_name = "INTEGER", .nullable = false }} },
+        .{ .name = "b", .columns = &.{.{ .name = "id", .type_name = "INTEGER", .nullable = false }} },
+    } };
+
+    try checkQuery(.{
+        .sql = "select EMAIL as DisplayName from USERS group by DISPLAYNAME order by displayname",
+        .schema = pg_schema,
+        .row = &.{.{ .name = "displayname", .type_name = "TEXT" }},
+        .check_group_by = true,
+        .check_order_by = true,
+    });
+    try checkQuery(.{
+        .sql = "select EMAIL from USERS",
+        .schema = pg_schema,
+        .row = &.{.{ .name = "email", .type_name = "TEXT" }},
+    });
+    try checkQuery(.{
+        .sql = "select \"U\".\"Email\" as \"DisplayName\" from \"Users\" as \"U\" order by \"DisplayName\"",
+        .schema = pg_schema,
+        .row = &.{.{ .name = "DisplayName", .type_name = "TEXT" }},
+        .check_order_by = true,
+    });
+    try std.testing.expectError(error.UnknownTable, checkQuery(.{
+        .sql = "select email from \"USERS\"",
+        .schema = pg_schema,
+        .check_projections = true,
+    }));
+    try std.testing.expectError(error.InvalidSql, checkQuery(.{
+        .sql = "select a.id from a join b using (ID, id)",
+        .schema = pg_schema,
+        .check_join_on = true,
+    }));
+
+    const sqlite_schema = inspect.Schema{ .dialect = .sqlite, .tables = &.{.{
+        .name = "Users",
+        .columns = &.{.{ .name = "Email", .type_name = "TEXT", .nullable = false }},
+    }} };
+    try checkQuery(.{
+        .sql = "select EMAIL as DisplayName from USERS group by displayname order by DISPLAYNAME",
+        .schema = sqlite_schema,
+        .row = &.{.{ .name = "DisplayName", .type_name = "TEXT" }},
+        .check_group_by = true,
+        .check_order_by = true,
+    });
+    try checkQuery(.{
+        .sql = "select EMAIL from USERS",
+        .schema = sqlite_schema,
+        .row = &.{.{ .name = "Email", .type_name = "TEXT" }},
+    });
+    try checkQuery(.{
+        .sql = "select \"Users\".\"Email\" from \"Users\"",
+        .schema = sqlite_schema,
+        .row = &.{.{ .name = "Users.Email", .type_name = "TEXT" }},
+    });
+    try std.testing.expectError(error.UnknownTable, checkQuery(.{
+        .sql = "select Email from \"users\"",
+        .schema = sqlite_schema,
+        .check_projections = true,
+    }));
+
+    const legacy_schema = inspect.Schema{ .tables = &.{.{
+        .name = "users",
+        .columns = &.{.{ .name = "email", .type_name = "TEXT", .nullable = false }},
+    }} };
+    try std.testing.expectError(error.UnknownTable, checkQuery(.{
+        .sql = "select email from USERS",
+        .schema = legacy_schema,
+        .check_projections = true,
+    }));
 }
 
 test "checkQuery ignores postgres literals and nested comments in WHERE" {

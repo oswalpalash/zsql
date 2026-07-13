@@ -1186,6 +1186,7 @@ pub const Conn = struct {
         }
 
         return .{
+            .dialect = .postgres,
             .tables = try tables_list.toOwnedSlice(allocator),
         };
     }
