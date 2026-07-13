@@ -8,9 +8,17 @@ pub const SQLITE_ERROR: c_int = 1;
 pub const SQLITE_BUSY: c_int = 5;
 pub const SQLITE_LOCKED: c_int = 6;
 pub const SQLITE_INTERRUPT: c_int = 9;
+pub const SQLITE_CONSTRAINT: c_int = 19;
 pub const SQLITE_MISUSE: c_int = 21;
 pub const SQLITE_ROW: c_int = 100;
 pub const SQLITE_DONE: c_int = 101;
+
+pub const SQLITE_CONSTRAINT_CHECK: c_int = SQLITE_CONSTRAINT | (1 << 8);
+pub const SQLITE_CONSTRAINT_FOREIGNKEY: c_int = SQLITE_CONSTRAINT | (3 << 8);
+pub const SQLITE_CONSTRAINT_NOTNULL: c_int = SQLITE_CONSTRAINT | (5 << 8);
+pub const SQLITE_CONSTRAINT_PRIMARYKEY: c_int = SQLITE_CONSTRAINT | (6 << 8);
+pub const SQLITE_CONSTRAINT_UNIQUE: c_int = SQLITE_CONSTRAINT | (8 << 8);
+pub const SQLITE_CONSTRAINT_ROWID: c_int = SQLITE_CONSTRAINT | (10 << 8);
 
 pub const SQLITE_INTEGER: c_int = 1;
 pub const SQLITE_FLOAT: c_int = 2;
@@ -42,6 +50,7 @@ pub extern fn sqlite3_open_v2(
 ) c_int;
 
 pub extern fn sqlite3_close_v2(db: ?*sqlite3) c_int;
+pub extern fn sqlite3_extended_result_codes(db: ?*sqlite3, onoff: c_int) c_int;
 
 /// Interrupt a currently executing operation on this database connection.
 /// SQLite permits this call from a different thread.

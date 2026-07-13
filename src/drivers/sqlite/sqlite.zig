@@ -12,6 +12,8 @@ pub const OpenMode = enum {
 pub const Config = struct {
     path: []const u8 = ":memory:",
     mode: OpenMode = .memory,
+    /// Enforce declared foreign keys for every opened connection (default on).
+    foreign_keys: bool = true,
     /// Passed to `sqlite3_busy_timeout` after open. `null` leaves SQLite's
     /// default (fail immediately on lock). `0` explicitly disables the busy
     /// handler. Typical values: 1000–5000 ms for multi-writer apps.
@@ -524,6 +526,19 @@ pub const Database = struct {
                 _ = c.sqlite3_close_v2(opened);
             }
             return error.DriverError;
+        }
+
+        if (c.sqlite3_extended_result_codes(handle.?, 1) != c.SQLITE_OK) {
+            _ = c.sqlite3_close_v2(handle.?);
+            return error.DriverError;
+        }
+
+        if (config.foreign_keys) {
+            const fk_rc = c.sqlite3_exec(handle.?, "pragma foreign_keys = on", null, null, null);
+            if (fk_rc != c.SQLITE_OK) {
+                _ = c.sqlite3_close_v2(handle.?);
+                return sqliteError(fk_rc);
+            }
         }
 
         if (config.busy_timeout_ms) |ms| {
@@ -1590,6 +1605,14 @@ fn sqliteError(rc: c_int) anyerror {
         c.SQLITE_INTERRUPT => error.QueryTimeout,
         c.SQLITE_BUSY => error.Busy,
         c.SQLITE_LOCKED => error.Locked,
+        c.SQLITE_CONSTRAINT_PRIMARYKEY,
+        c.SQLITE_CONSTRAINT_UNIQUE,
+        c.SQLITE_CONSTRAINT_ROWID,
+        => error.UniqueViolation,
+        c.SQLITE_CONSTRAINT_FOREIGNKEY => error.ForeignKeyViolation,
+        c.SQLITE_CONSTRAINT_NOTNULL => error.NotNullViolation,
+        c.SQLITE_CONSTRAINT_CHECK => error.CheckViolation,
+        c.SQLITE_CONSTRAINT => error.ConstraintViolation,
         c.SQLITE_ERROR => error.InvalidSql,
         else => error.DriverError,
     };
@@ -1709,6 +1732,61 @@ test "SQLite open applies busy_timeout_ms" {
     var conn = try db.connect();
     defer conn.close();
     // Setting busy timeout must not break basic query use.
+    try conn.ping();
+}
+
+test "SQLite enforces foreign keys by default with explicit opt-out" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+    var rows = try conn.query("pragma foreign_keys", &.{});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try (try (try rows.next()).?.get(0)).asInt());
+
+    var relaxed_db = try Database.open(std.testing.allocator, .{ .foreign_keys = false });
+    defer relaxed_db.deinit();
+    var relaxed = try relaxed_db.connect();
+    defer relaxed.close();
+    var relaxed_rows = try relaxed.query("pragma foreign_keys", &.{});
+    defer relaxed_rows.deinit();
+    try std.testing.expectEqual(@as(i64, 0), try (try (try relaxed_rows.next()).?.get(0)).asInt());
+}
+
+test "SQLite maps extended constraint result codes" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+    try conn.execScript(
+        \\create table constraint_parent (id integer primary key);
+        \\create table constraint_child (
+        \\  id integer primary key,
+        \\  email text not null unique,
+        \\  score integer not null check (score > 0),
+        \\  parent_id integer not null references constraint_parent(id)
+        \\);
+        \\insert into constraint_parent (id) values (1);
+        \\insert into constraint_child (id, email, score, parent_id)
+        \\values (1, 'ada@example.com', 1, 1);
+    );
+
+    try std.testing.expectError(error.UniqueViolation, conn.exec(
+        "insert into constraint_child (id, email, score, parent_id) values (2, 'ada@example.com', 1, 1)",
+        &.{},
+    ));
+    try std.testing.expectError(error.NotNullViolation, conn.exec(
+        "insert into constraint_child (id, email, score, parent_id) values (2, null, 1, 1)",
+        &.{},
+    ));
+    try std.testing.expectError(error.CheckViolation, conn.exec(
+        "insert into constraint_child (id, email, score, parent_id) values (2, 'grace@example.com', 0, 1)",
+        &.{},
+    ));
+    try std.testing.expectError(error.ForeignKeyViolation, conn.exec(
+        "insert into constraint_child (id, email, score, parent_id) values (2, 'grace@example.com', 1, 99)",
+        &.{},
+    ));
     try conn.ping();
 }
 
@@ -2568,6 +2646,8 @@ test "SQLite pool retains healthy connections after recoverable SQL errors" {
     try std.testing.expectEqual(@as(usize, 1), pool.stats().open);
     try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
     _ = try pool.exec("insert into pool_reuse (id) values (1)", &.{});
+    try std.testing.expectError(error.UniqueViolation, pool.exec("insert into pool_reuse (id) values (1)", &.{}));
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
 }
 
 test "SQLite pool releases a rolled-back application error connection" {

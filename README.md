@@ -75,8 +75,12 @@ var db = try zsql.drivers.sqlite.Database.open(allocator, .{
     .mode = .file,
     .path = "app.db",
     .busy_timeout_ms = 5_000,
+    .foreign_keys = true, // default; set false only for legacy schemas
 });
 ```
+
+SQLite extended result codes map unique/primary-key, foreign-key, not-null, and
+check failures to the corresponding public `zsql.Error` categories.
 
 ### PostgreSQL
 
