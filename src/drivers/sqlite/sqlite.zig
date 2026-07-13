@@ -3782,6 +3782,9 @@ test "SQLite validates config and connection lifetime" {
 }
 
 const DriverDatabase = Database;
+const DriverConn = Conn;
+const DriverRows = Rows;
+const DriverRow = core.Row;
 const DriverPool = Pool;
 const DriverLease = Lease;
 const DriverTx = Tx;
@@ -3791,6 +3794,9 @@ const DriverMigrator = Migrator;
 /// Concrete capability mapping for the root `zsql.*(sqlite.Driver)` façade.
 pub const Driver = struct {
     pub const Database = DriverDatabase;
+    pub const Conn = DriverConn;
+    pub const Rows = DriverRows;
+    pub const Row = DriverRow;
     pub const Pool = DriverPool;
     pub const Lease = DriverLease;
     pub const Tx = DriverTx;

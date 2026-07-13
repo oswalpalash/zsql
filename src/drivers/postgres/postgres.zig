@@ -41,6 +41,9 @@ pub const ApplyResult = migrate.ApplyResult;
 /// PostgreSQL transactions are scoped methods on `Conn`, so `Tx` is `Conn`.
 pub const Driver = struct {
     pub const Database = conn.Conn;
+    pub const Conn = conn.Conn;
+    pub const Rows = conn.SimpleRows;
+    pub const Row = conn.SimpleRow;
     pub const Pool = pool.Pool;
     pub const Lease = pool.Lease;
     pub const Tx = conn.Conn;

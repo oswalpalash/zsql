@@ -13,10 +13,18 @@ pub const OwnedRow = @import("core/row.zig").OwnedRow;
 pub const decode = @import("core/row.zig").decode;
 /// Free a `[]OwnedRow` from driver `queryAll` helpers.
 pub const freeOwnedRows = OwnedRow.freeSlice;
-pub const Rows = @import("core/rows.zig").Rows;
+pub const CoreRows = @import("core/rows.zig").Rows;
+/// Deprecated bootstrap-only slice iterator. Use `ResultRows(D)` for database I/O.
+pub const Rows = CoreRows;
 pub const ExecResult = @import("core/exec_result.zig").ExecResult;
-pub const Stmt = @import("core/stmt.zig").Stmt;
-pub const Conn = @import("core/conn.zig").Conn;
+pub const CoreStmt = @import("core/stmt.zig").Stmt;
+/// Deprecated bootstrap SQL parser whose I/O methods return `DriverUnavailable`.
+/// Use a concrete driver's prepared-statement API.
+pub const Stmt = CoreStmt;
+pub const CoreConn = @import("core/conn.zig").Conn;
+/// Deprecated bootstrap adapter whose I/O methods return `DriverUnavailable`.
+/// Use `Connection(D)` for a concrete driver connection.
+pub const Conn = CoreConn;
 pub const CoreDatabase = @import("core/database.zig").Database;
 pub const QueryBuilder = @import("core/query.zig").QueryBuilder;
 pub const hooks = @import("core/hooks.zig");
@@ -37,7 +45,7 @@ pub const formatStmtName = @import("pool/stmt_cache.zig").formatStmtName;
 /// dialect behavior; concrete driver APIs remain available for those details.
 pub fn validateDriver(comptime D: type) void {
     comptime {
-        requireDecls(D, .{ "Database", "Pool", "Lease", "Tx", "Savepoint", "Migrator" });
+        requireDecls(D, .{ "Database", "Conn", "Rows", "Row", "Pool", "Lease", "Tx", "Savepoint", "Migrator" });
         requireDecls(D.Database, .{ "open", "deinit" });
         requireDecls(D.Pool, .{ "init", "deinit", "acquire" });
         requireDecls(D.Lease, .{ "conn", "release", "discard" });
@@ -59,6 +67,18 @@ fn requireDecls(comptime T: type, comptime names: anytype) void {
 pub fn Database(comptime D: type) type {
     validateDriver(D);
     return D.Database;
+}
+pub fn Connection(comptime D: type) type {
+    validateDriver(D);
+    return D.Conn;
+}
+pub fn ResultRows(comptime D: type) type {
+    validateDriver(D);
+    return D.Rows;
+}
+pub fn ResultRow(comptime D: type) type {
+    validateDriver(D);
+    return D.Row;
 }
 pub fn Pool(comptime D: type) type {
     validateDriver(D);
@@ -132,6 +152,9 @@ test "driver facade resolves concrete capability types" {
     comptime {
         validateDriver(drivers.postgres.Driver);
         _ = Database(drivers.postgres.Driver);
+        _ = Connection(drivers.postgres.Driver);
+        _ = ResultRows(drivers.postgres.Driver);
+        _ = ResultRow(drivers.postgres.Driver);
         _ = Pool(drivers.postgres.Driver);
         _ = Lease(drivers.postgres.Driver);
         _ = Tx(drivers.postgres.Driver);
@@ -140,6 +163,9 @@ test "driver facade resolves concrete capability types" {
         if (options.enable_sqlite) {
             validateDriver(drivers.sqlite.Driver);
             _ = Database(drivers.sqlite.Driver);
+            _ = Connection(drivers.sqlite.Driver);
+            _ = ResultRows(drivers.sqlite.Driver);
+            _ = ResultRow(drivers.sqlite.Driver);
             _ = Pool(drivers.sqlite.Driver);
             _ = Lease(drivers.sqlite.Driver);
             _ = Tx(drivers.sqlite.Driver);

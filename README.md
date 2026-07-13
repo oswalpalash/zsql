@@ -26,8 +26,8 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 
 ### Public names
 
-- `zsql.Database(D)`, `zsql.Pool(D)`, `zsql.Lease(D)`, `zsql.Tx(D)`, `zsql.Savepoint(D)`, `zsql.Migrator(D)`
-- `zsql.Conn`, `zsql.Stmt`, `zsql.Rows`, `zsql.Row` (driver-agnostic parsing/decoding primitives; use concrete driver types for database I/O)
+- `zsql.Database(D)`, `zsql.Connection(D)`, `zsql.ResultRows(D)`, `zsql.ResultRow(D)`
+- `zsql.Pool(D)`, `zsql.Lease(D)`, `zsql.Tx(D)`, `zsql.Savepoint(D)`, `zsql.Migrator(D)`
 - `zsql.OwnedRow`, `zsql.Value`, `zsql.OwnedValue`, `zsql.decode`
 - `zsql.ExecResult`, `zsql.Error`, `zsql.DbError`, `zsql.OwnedDbError`
 - `zsql.QueryBuilder`, `zsql.params`, `zsql.migrate`
@@ -46,6 +46,11 @@ dialects or erase useful ownership differences: SQLite `Database` owns the
 database handle and creates lightweight `Conn` wrappers, while PostgreSQL
 `Database` is the network `Conn` itself, so their `open` signatures remain
 driver-specific.
+
+The old root `zsql.Conn`, `zsql.Stmt`, and `zsql.Rows` names are deprecated
+bootstrap parsing adapters; their execution methods do not access a database.
+They remain temporarily as aliases of `CoreConn`, `CoreStmt`, and `CoreRows` so
+existing parser-only users can migrate without an abrupt removal.
 
 ### SQLite
 
