@@ -622,11 +622,20 @@ pub const Conn = struct {
             switch (msg.tag) {
                 .parse_complete => parsed = true,
                 .parameter_description => {
-                    if (parameter_oids != null) return error.ProtocolError;
-                    parameter_oids = try protocol.parseParameterDescription(msg.body, self.allocator);
+                    if (parameter_oids != null) {
+                        self.drainUntilReady();
+                        return error.ProtocolError;
+                    }
+                    parameter_oids = protocol.parseParameterDescription(msg.body, self.allocator) catch |err| {
+                        self.drainUntilReady();
+                        return err;
+                    };
                 },
                 .row_description => {
-                    const fields = try protocol.parseRowDescription(msg.body, self.allocator);
+                    const fields = protocol.parseRowDescription(msg.body, self.allocator) catch |err| {
+                        self.drainUntilReady();
+                        return err;
+                    };
                     self.allocator.free(fields);
                 },
                 .no_data, .notice_response, .parameter_status => {},
@@ -2249,12 +2258,20 @@ pub const Stmt = struct {
 
     pub fn exec(self: *Stmt, binds: []const core.Value) !core.ExecResult {
         try self.validateBinds(binds);
-        return self.conn.execPrepared(self.name, self.sql, binds);
+        return self.conn.execPrepared(self.name, self.sql, binds) catch |err| {
+            if (!try self.reprepareAfterInvalidation()) return err;
+            try self.validateBinds(binds);
+            return self.conn.execPrepared(self.name, self.sql, binds);
+        };
     }
 
     pub fn query(self: *Stmt, binds: []const core.Value) !SimpleRows {
         try self.validateBinds(binds);
-        return self.conn.queryPrepared(self.name, self.sql, binds);
+        return self.conn.queryPrepared(self.name, self.sql, binds) catch |err| {
+            if (!try self.reprepareAfterInvalidation()) return err;
+            try self.validateBinds(binds);
+            return self.conn.queryPrepared(self.name, self.sql, binds);
+        };
     }
 
     pub fn execNamed(self: *Stmt, binds: []const core.params.NamedValue) !core.ExecResult {
@@ -2297,6 +2314,23 @@ pub const Stmt = struct {
         if (binds.len != self.parameter_oids.len) return error.BindCountMismatch;
     }
 
+    /// Recover only failures PostgreSQL guarantees happened before execution:
+    /// a missing named statement or a cached-plan result shape invalidation.
+    /// The ErrorResponse must already have drained to an idle ReadyForQuery.
+    fn reprepareAfterInvalidation(self: *Stmt) !bool {
+        if (self.conn.closed or self.conn.broken or self.conn.tx_status != .idle) return false;
+        const db_err = self.conn.lastError() orelse return false;
+        const code = db_err.code orelse return false;
+
+        const invalidation = classifyPreparedInvalidation(code, db_err.message) orelse return false;
+
+        if (invalidation == .changed_plan) try self.conn.closePrepared(self.name);
+        const new_oids = try self.conn.prepareNamedStatement(self.name, self.sql);
+        self.allocator.free(self.parameter_oids);
+        self.parameter_oids = new_oids;
+        return true;
+    }
+
     fn releaseOwned(self: *Stmt) void {
         if (self.parameter_names) |names| {
             for (names) |name| self.allocator.free(name);
@@ -2312,6 +2346,16 @@ pub const Stmt = struct {
         self.open = false;
     }
 };
+
+const PreparedInvalidation = enum { missing, changed_plan };
+
+fn classifyPreparedInvalidation(code: []const u8, message: []const u8) ?PreparedInvalidation {
+    if (std.mem.eql(u8, code, "26000")) return .missing;
+    if (std.mem.eql(u8, code, "0A000") and std.mem.indexOf(u8, message, "cached plan") != null) {
+        return .changed_plan;
+    }
+    return null;
+}
 
 /// PostgreSQL savepoint bound to an open connection transaction.
 pub const Savepoint = struct {
@@ -2362,6 +2406,13 @@ test "savepoint names are deterministic prefixes" {
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "zsql_sp_{d}", .{0});
     try std.testing.expectEqualStrings("zsql_sp_0", name);
+}
+
+test "prepared invalidation classification is narrow" {
+    try std.testing.expect(classifyPreparedInvalidation("26000", "prepared statement does not exist") == .missing);
+    try std.testing.expect(classifyPreparedInvalidation("0A000", "cached plan must not change result type") == .changed_plan);
+    try std.testing.expect(classifyPreparedInvalidation("0A000", "feature not supported") == null);
+    try std.testing.expect(classifyPreparedInvalidation("23505", "duplicate key") == null);
 }
 
 test "SimpleRow get/as/to map like core.Row" {

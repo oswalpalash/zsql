@@ -184,6 +184,24 @@ test "postgres live: reusable prepared statement exec query and close" {
         .{ .name = "extra", .value = .{ .integer = 2 } },
     }));
 
+    var shape = try conn.prepare("select * from zsql_prepared order by id");
+    defer shape.deinit();
+    var before_shape = try shape.query(&.{});
+    defer before_shape.deinit();
+    try std.testing.expectEqual(@as(usize, 2), before_shape.next().?.values.len);
+    _ = try conn.exec("alter table zsql_prepared add column active boolean not null default true");
+    var after_shape = try shape.query(&.{});
+    defer after_shape.deinit();
+    try std.testing.expectEqual(@as(usize, 3), after_shape.next().?.values.len);
+
+    try insert.close();
+    try named.close();
+    try shape.close();
+    _ = try conn.exec("deallocate all");
+    var recovered_missing = try select.query(&.{.{ .integer = 1 }});
+    defer recovered_missing.deinit();
+    try std.testing.expectEqualStrings("ada", try (try recovered_missing.next().?.getName("name")).asText());
+
     try select.close();
     try std.testing.expectError(error.StatementClosed, select.query(&.{.{ .integer = 1 }}));
     try std.testing.expectError(error.InvalidSql, conn.prepare("select from"));

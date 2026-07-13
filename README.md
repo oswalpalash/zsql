@@ -60,6 +60,11 @@ deinitializing that `Conn`. `Conn.prepareNamed` rewrites named placeholders once
 and copies their names; `Stmt.execNamed` / `queryNamed` reject missing,
 duplicate, or extra binds before execution.
 
+An explicit PostgreSQL statement performs one safe automatic reprepare when the
+server reports that its name disappeared (`26000`) or that a cached plan changed
+result shape. Recovery occurs only after idle `ReadyForQuery`; statements are
+never retried from an aborted transaction or for generic SQL errors.
+
 ### SQLite
 
 ```sh
