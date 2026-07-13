@@ -45,8 +45,9 @@ pub const formatStmtName = @import("pool/stmt_cache.zig").formatStmtName;
 /// dialect behavior; concrete driver APIs remain available for those details.
 pub fn validateDriver(comptime D: type) void {
     comptime {
-        requireDecls(D, .{ "Database", "Conn", "Rows", "Row", "Pool", "Lease", "Tx", "Savepoint", "Migrator" });
+        requireDecls(D, .{ "Database", "Conn", "Stmt", "Rows", "Row", "Pool", "Lease", "Tx", "Savepoint", "Migrator" });
         requireDecls(D.Database, .{ "open", "deinit" });
+        requireDecls(D.Stmt, .{ "close", "exec", "query" });
         requireDecls(D.Pool, .{ "init", "deinit", "acquire" });
         requireDecls(D.Lease, .{ "conn", "release", "discard" });
         requireDecls(D.Tx, .{ "commit", "rollback", "rollbackIfOpen" });
@@ -71,6 +72,10 @@ pub fn Database(comptime D: type) type {
 pub fn Connection(comptime D: type) type {
     validateDriver(D);
     return D.Conn;
+}
+pub fn Statement(comptime D: type) type {
+    validateDriver(D);
+    return D.Stmt;
 }
 pub fn ResultRows(comptime D: type) type {
     validateDriver(D);
@@ -153,6 +158,7 @@ test "driver facade resolves concrete capability types" {
         validateDriver(drivers.postgres.Driver);
         _ = Database(drivers.postgres.Driver);
         _ = Connection(drivers.postgres.Driver);
+        _ = Statement(drivers.postgres.Driver);
         _ = ResultRows(drivers.postgres.Driver);
         _ = ResultRow(drivers.postgres.Driver);
         _ = Pool(drivers.postgres.Driver);
@@ -164,6 +170,7 @@ test "driver facade resolves concrete capability types" {
             validateDriver(drivers.sqlite.Driver);
             _ = Database(drivers.sqlite.Driver);
             _ = Connection(drivers.sqlite.Driver);
+            _ = Statement(drivers.sqlite.Driver);
             _ = ResultRows(drivers.sqlite.Driver);
             _ = ResultRow(drivers.sqlite.Driver);
             _ = Pool(drivers.sqlite.Driver);

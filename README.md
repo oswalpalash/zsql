@@ -26,7 +26,7 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 
 ### Public names
 
-- `zsql.Database(D)`, `zsql.Connection(D)`, `zsql.ResultRows(D)`, `zsql.ResultRow(D)`
+- `zsql.Database(D)`, `zsql.Connection(D)`, `zsql.Statement(D)`, `zsql.ResultRows(D)`, `zsql.ResultRow(D)`
 - `zsql.Pool(D)`, `zsql.Lease(D)`, `zsql.Tx(D)`, `zsql.Savepoint(D)`, `zsql.Migrator(D)`
 - `zsql.OwnedRow`, `zsql.Value`, `zsql.OwnedValue`, `zsql.decode`
 - `zsql.ExecResult`, `zsql.Error`, `zsql.DbError`, `zsql.OwnedDbError`
@@ -51,6 +51,12 @@ The old root `zsql.Conn`, `zsql.Stmt`, and `zsql.Rows` names are deprecated
 bootstrap parsing adapters; their execution methods do not access a database.
 They remain temporarily as aliases of `CoreConn`, `CoreStmt`, and `CoreRows` so
 existing parser-only users can migrate without an abrupt removal.
+
+PostgreSQL `Conn.prepare(sql)` performs a named server Parse + Describe once.
+The returned allocator-owned `Stmt` exposes parameter OIDs, validates bind
+counts before I/O, and reuses the server statement for `exec`/`query`. It
+borrows the connection: call `Stmt.close()` or `deinit()` before moving or
+deinitializing that `Conn`.
 
 ### SQLite
 

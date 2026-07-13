@@ -548,10 +548,88 @@ pub const Conn = struct {
         return self.execParams(rewrite.sql, ordered);
     }
 
+    /// Parse and describe a reusable named server statement.
+    ///
+    /// The returned `Stmt` owns its SQL/name/type metadata but borrows `self`;
+    /// close it before moving or deinitializing the connection.
+    pub fn prepare(self: *Conn, sql: []const u8) !Stmt {
+        self.clearLastError();
+        if (self.closed) return error.ConnectionClosed;
+        if (std.mem.trim(u8, sql, " \t\r\n").len == 0) return error.InvalidSql;
+
+        var name_buf: [32]u8 = undefined;
+        const name = try core.formatStmtName(&name_buf, self.next_stmt_id);
+        self.next_stmt_id += 1;
+
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const owned_sql = try self.allocator.dupe(u8, sql);
+        errdefer self.allocator.free(owned_sql);
+
+        const parameter_oids = try self.prepareNamedStatement(owned_name, owned_sql);
+        errdefer {
+            self.allocator.free(parameter_oids);
+            if (self.isReusable()) self.closePrepared(owned_name) catch {};
+        }
+        return .{
+            .conn = self,
+            .allocator = self.allocator,
+            .name = owned_name,
+            .sql = owned_sql,
+            .parameter_oids = parameter_oids,
+        };
+    }
+
+    fn prepareNamedStatement(self: *Conn, name: []const u8, sql: []const u8) ![]i32 {
+        const parse_msg = try protocol.buildParseMessageNamed(self.allocator, name, sql);
+        defer self.allocator.free(parse_msg);
+        const describe_msg = try protocol.buildDescribeStatementMessage(self.allocator, name);
+        defer self.allocator.free(describe_msg);
+        const sync_msg = try protocol.buildSyncMessage(self.allocator);
+        defer self.allocator.free(sync_msg);
+        try self.writeAll(parse_msg);
+        try self.writeAll(describe_msg);
+        try self.writeAll(sync_msg);
+
+        var parsed = false;
+        var parameter_oids: ?[]i32 = null;
+        errdefer if (parameter_oids) |oids| self.allocator.free(oids);
+        while (true) {
+            const msg = try self.readMessage();
+            defer self.allocator.free(msg.body);
+            switch (msg.tag) {
+                .parse_complete => parsed = true,
+                .parameter_description => {
+                    if (parameter_oids != null) return error.ProtocolError;
+                    parameter_oids = try protocol.parseParameterDescription(msg.body, self.allocator);
+                },
+                .row_description => {
+                    const fields = try protocol.parseRowDescription(msg.body, self.allocator);
+                    self.allocator.free(fields);
+                },
+                .no_data, .notice_response, .parameter_status => {},
+                .ready_for_query => {
+                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    if (!parsed or parameter_oids == null) return error.ProtocolError;
+                    return parameter_oids.?;
+                },
+                .error_response => return self.failFromErrorResponse(msg.body, true),
+                else => {
+                    self.drainUntilReady();
+                    return error.ProtocolError;
+                },
+            }
+        }
+    }
+
     fn execParamsUnobserved(self: *Conn, sql: []const u8, binds: []const core.Value) !core.ExecResult {
         if (self.closed) return error.ConnectionClosed;
         try self.sendExtended(sql, binds, false);
 
+        return self.collectExtendedExec();
+    }
+
+    fn collectExtendedExec(self: *Conn) !core.ExecResult {
         var rows_affected: u64 = 0;
         while (true) {
             const msg = try self.readMessage();
@@ -578,6 +656,70 @@ pub const Conn = struct {
                 },
             }
         }
+    }
+
+    fn execPrepared(self: *Conn, name: []const u8, sql: []const u8, binds: []const core.Value) !core.ExecResult {
+        self.clearLastError();
+        const observe = !self.hooks.isEmpty();
+        const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
+        if (observe) self.hooks.emitBefore(.{ .driver = .postgres, .sql = sql, .bind_count = binds.len });
+        self.sendBound(name, binds, false) catch |err| {
+            if (observe) self.hooks.emitAfter(.{
+                .driver = .postgres,
+                .sql = sql,
+                .duration_ns = core.hooks.durationSince(start_ns),
+                .err = core.hooks.categoryOfErr(err),
+            });
+            return err;
+        };
+        const result = self.collectExtendedExec() catch |err| {
+            if (observe) self.hooks.emitAfter(.{
+                .driver = .postgres,
+                .sql = sql,
+                .duration_ns = core.hooks.durationSince(start_ns),
+                .err = core.hooks.categoryOfErr(err),
+            });
+            return err;
+        };
+        if (observe) self.hooks.emitAfter(.{
+            .driver = .postgres,
+            .sql = sql,
+            .duration_ns = core.hooks.durationSince(start_ns),
+            .rows_affected = result.rows_affected,
+        });
+        return result;
+    }
+
+    fn queryPrepared(self: *Conn, name: []const u8, sql: []const u8, binds: []const core.Value) !SimpleRows {
+        self.clearLastError();
+        const observe = !self.hooks.isEmpty();
+        const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
+        if (observe) self.hooks.emitBefore(.{ .driver = .postgres, .sql = sql, .bind_count = binds.len });
+        self.sendBound(name, binds, true) catch |err| {
+            if (observe) self.hooks.emitAfter(.{
+                .driver = .postgres,
+                .sql = sql,
+                .duration_ns = core.hooks.durationSince(start_ns),
+                .err = core.hooks.categoryOfErr(err),
+            });
+            return err;
+        };
+        const rows = self.collectExtendedRows() catch |err| {
+            if (observe) self.hooks.emitAfter(.{
+                .driver = .postgres,
+                .sql = sql,
+                .duration_ns = core.hooks.durationSince(start_ns),
+                .err = core.hooks.categoryOfErr(err),
+            });
+            return err;
+        };
+        if (observe) self.hooks.emitAfter(.{
+            .driver = .postgres,
+            .sql = sql,
+            .duration_ns = core.hooks.durationSince(start_ns),
+            .rows_affected = rows.rows_affected,
+        });
+        return rows;
     }
 
     fn execObserved(
@@ -1055,7 +1197,7 @@ pub const Conn = struct {
         };
     }
 
-    fn sendExtended(self: *Conn, sql: []const u8, binds: []const core.Value, describe_portal: bool) !void {
+    fn sendBound(self: *Conn, stmt_name: []const u8, binds: []const core.Value, describe_portal: bool) !void {
         var encoded: std.ArrayListUnmanaged(?[]u8) = .empty;
         defer {
             for (encoded.items) |item| {
@@ -1073,6 +1215,27 @@ pub const Conn = struct {
         defer self.allocator.free(views);
         for (encoded.items, 0..) |item, i| views[i] = item;
 
+        const bind_msg = if (stmt_name.len == 0)
+            try protocol.buildBindMessage(self.allocator, views)
+        else
+            try protocol.buildBindMessageNamed(self.allocator, stmt_name, views);
+        defer self.allocator.free(bind_msg);
+        const execute_msg = try protocol.buildExecuteMessage(self.allocator);
+        defer self.allocator.free(execute_msg);
+        const sync_msg = try protocol.buildSyncMessage(self.allocator);
+        defer self.allocator.free(sync_msg);
+
+        try self.writeAll(bind_msg);
+        if (describe_portal) {
+            const describe_msg = try protocol.buildDescribePortalMessage(self.allocator);
+            defer self.allocator.free(describe_msg);
+            try self.writeAll(describe_msg);
+        }
+        try self.writeAll(execute_msg);
+        try self.writeAll(sync_msg);
+    }
+
+    fn sendExtended(self: *Conn, sql: []const u8, binds: []const core.Value, describe_portal: bool) !void {
         // Resolve optional prepared-statement name from the connection cache.
         var stmt_name: []const u8 = "";
         var parse_needed = true;
@@ -1105,25 +1268,7 @@ pub const Conn = struct {
             defer self.allocator.free(parse_msg);
             try self.writeAll(parse_msg);
         }
-
-        const bind_msg = if (stmt_name.len == 0)
-            try protocol.buildBindMessage(self.allocator, views)
-        else
-            try protocol.buildBindMessageNamed(self.allocator, stmt_name, views);
-        defer self.allocator.free(bind_msg);
-        const execute_msg = try protocol.buildExecuteMessage(self.allocator);
-        defer self.allocator.free(execute_msg);
-        const sync_msg = try protocol.buildSyncMessage(self.allocator);
-        defer self.allocator.free(sync_msg);
-
-        try self.writeAll(bind_msg);
-        if (describe_portal) {
-            const describe_msg = try protocol.buildDescribePortalMessage(self.allocator);
-            defer self.allocator.free(describe_msg);
-            try self.writeAll(describe_msg);
-        }
-        try self.writeAll(execute_msg);
-        try self.writeAll(sync_msg);
+        try self.sendBound(stmt_name, binds, describe_portal);
     }
 
     fn invalidateCachedStatementAfterError(self: *Conn, sql: []const u8, err: anyerror) void {
@@ -2052,6 +2197,74 @@ fn simpleRowToOwned(allocator: std.mem.Allocator, row: SimpleRow) !core.OwnedRow
     const view = try core.Row.init(names, values);
     return core.OwnedRow.init(allocator, view);
 }
+
+/// Allocator-owned named PostgreSQL prepared statement.
+///
+/// `Stmt` borrows its connection. It may move as a value, but the referenced
+/// `Conn` must not move or deinitialize until `close`/`deinit` completes.
+/// SQL text and parameter OIDs remain valid for the statement's lifetime.
+pub const Stmt = struct {
+    conn: *Conn,
+    allocator: std.mem.Allocator,
+    name: []u8,
+    sql: []u8,
+    parameter_oids: []i32,
+    open: bool = true,
+
+    pub fn parameterCount(self: *const Stmt) usize {
+        return self.parameter_oids.len;
+    }
+
+    pub fn parameterOids(self: *const Stmt) []const i32 {
+        return self.parameter_oids;
+    }
+
+    pub fn exec(self: *Stmt, binds: []const core.Value) !core.ExecResult {
+        try self.validateBinds(binds);
+        return self.conn.execPrepared(self.name, self.sql, binds);
+    }
+
+    pub fn query(self: *Stmt, binds: []const core.Value) !SimpleRows {
+        try self.validateBinds(binds);
+        return self.conn.queryPrepared(self.name, self.sql, binds);
+    }
+
+    /// Close the named server statement and release owned client metadata.
+    pub fn close(self: *Stmt) !void {
+        if (!self.open) return error.StatementClosed;
+        if (self.conn.closed) {
+            self.releaseOwned();
+            return error.ConnectionClosed;
+        }
+        try self.conn.closePrepared(self.name);
+        self.releaseOwned();
+    }
+
+    /// Best-effort server Close followed by unconditional client cleanup.
+    pub fn deinit(self: *Stmt) void {
+        if (!self.open) return;
+        if (!self.conn.closed and !self.conn.broken and self.conn.tx_status != .failed) {
+            self.conn.closePrepared(self.name) catch {};
+        }
+        self.releaseOwned();
+    }
+
+    fn validateBinds(self: *Stmt, binds: []const core.Value) !void {
+        if (!self.open) return error.StatementClosed;
+        if (self.conn.closed) return error.ConnectionClosed;
+        if (binds.len != self.parameter_oids.len) return error.BindCountMismatch;
+    }
+
+    fn releaseOwned(self: *Stmt) void {
+        self.allocator.free(self.parameter_oids);
+        self.allocator.free(self.sql);
+        self.allocator.free(self.name);
+        self.parameter_oids = &.{};
+        self.sql = &.{};
+        self.name = &.{};
+        self.open = false;
+    }
+};
 
 /// PostgreSQL savepoint bound to an open connection transaction.
 pub const Savepoint = struct {

@@ -141,6 +141,43 @@ test "postgres live: ping succeeds" {
     try conn.ping();
 }
 
+test "postgres live: reusable prepared statement exec query and close" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, std.testing.io, config);
+    defer conn.deinit();
+
+    _ = try conn.exec("create temporary table zsql_prepared (id bigint primary key, name text not null)");
+    var insert = try conn.prepare("insert into zsql_prepared (id, name) values ($1, $2)");
+    defer insert.deinit();
+    try std.testing.expectEqual(@as(usize, 2), insert.parameterCount());
+    try std.testing.expectEqualSlices(i32, &.{ 20, 25 }, insert.parameterOids());
+    try std.testing.expectError(error.BindCountMismatch, insert.exec(&.{.{ .integer = 1 }}));
+    try std.testing.expectEqual(@as(u64, 1), (try insert.exec(&.{ .{ .integer = 1 }, .{ .text = "ada" } })).rows_affected);
+    try std.testing.expectEqual(@as(u64, 1), (try insert.exec(&.{ .{ .integer = 2 }, .{ .text = "grace" } })).rows_affected);
+
+    var select = try conn.prepare("select name from zsql_prepared where id = $1");
+    defer select.deinit();
+    try std.testing.expectEqualSlices(i32, &.{20}, select.parameterOids());
+    var first = try select.query(&.{.{ .integer = 1 }});
+    defer first.deinit();
+    try std.testing.expectEqualStrings("ada", try (try first.next().?.getName("name")).asText());
+    var second = try select.query(&.{.{ .integer = 2 }});
+    defer second.deinit();
+    try std.testing.expectEqualStrings("grace", try (try second.next().?.getName("name")).asText());
+
+    try select.close();
+    try std.testing.expectError(error.StatementClosed, select.query(&.{.{ .integer = 1 }}));
+    try std.testing.expectError(error.InvalidSql, conn.prepare("select from"));
+    try std.testing.expect(conn.lastError() != null);
+    try conn.ping();
+}
+
 test "postgres live: queryOneParams enforces cardinality" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

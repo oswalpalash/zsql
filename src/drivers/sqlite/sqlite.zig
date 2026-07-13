@@ -3783,6 +3783,7 @@ test "SQLite validates config and connection lifetime" {
 
 const DriverDatabase = Database;
 const DriverConn = Conn;
+const DriverStmt = Stmt;
 const DriverRows = Rows;
 const DriverRow = core.Row;
 const DriverPool = Pool;
@@ -3795,6 +3796,7 @@ const DriverMigrator = Migrator;
 pub const Driver = struct {
     pub const Database = DriverDatabase;
     pub const Conn = DriverConn;
+    pub const Stmt = DriverStmt;
     pub const Rows = DriverRows;
     pub const Row = DriverRow;
     pub const Pool = DriverPool;

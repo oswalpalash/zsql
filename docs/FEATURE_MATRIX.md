@@ -10,7 +10,7 @@ coverage; PostgreSQL rows marked live also run against PostgreSQL 16 in CI.
 | --- | --- | --- | --- |
 | SQLite driver | Complete | `zsql.drivers.sqlite`; borrowed `InterruptHandle` | interruption and driver tests with `-Denable-sqlite=true` |
 | Native PostgreSQL driver | Complete | full-open `connect_timeout`; owned `CancelHandle` | timeout/protocol unit tests; live cancellation in CI |
-| Prepared statements | Complete | schema-aware SQLite cache; PostgreSQL Parse/plan-error cache recovery; explicit SQLite `Conn.prepare` | SQLite schema-change tests and PostgreSQL live invalidation tests |
+| Prepared statements | Complete | driver-selected `Statement(D)`; explicit SQLite/PostgreSQL statement owners; PostgreSQL cache recovery | SQLite schema-change tests and PostgreSQL prepared/cache live tests |
 | Safe parameter binding | Complete | positional and named bind APIs on both drivers | driver tests; `tests/postgres_live.zig` |
 | Typed row decoding | Complete | `Row.as`, `Row.asName`, `Row.to`, `zsql.decode` | core and driver tests |
 | Explicit owned rows | Complete | `OwnedRow`, `Row.getOwned`, `zsql.freeOwnedRows` | allocator-backed core and driver tests |
