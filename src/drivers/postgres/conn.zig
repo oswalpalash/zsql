@@ -25,6 +25,9 @@ const app_buf_len = 16 * 1024;
 pub const Conn = struct {
     allocator: std.mem.Allocator,
     io: Io,
+    /// Allocator-owned endpoint retained for independent CancelRequest handles.
+    server_host: []u8,
+    server_port: u16,
     /// Connection-local observability hooks (no global registry).
     hooks: core.Hooks = .{},
     stream: net.Stream,
@@ -254,6 +257,8 @@ pub const Conn = struct {
     }
 
     fn connectBare(allocator: std.mem.Allocator, io: Io, host: []const u8, port: u16) !Conn {
+        const server_host = try allocator.dupe(u8, host);
+        errdefer allocator.free(server_host);
         const stream = try connectStream(io, host, port);
         errdefer stream.close(io);
 
@@ -265,6 +270,8 @@ pub const Conn = struct {
         return .{
             .allocator = allocator,
             .io = io,
+            .server_host = server_host,
+            .server_port = port,
             .stream = stream,
             .read_buf = read_buf,
             .write_buf = write_buf,
@@ -277,6 +284,7 @@ pub const Conn = struct {
     fn deinitTransportOnly(self: *Conn) void {
         if (self.closed) return;
         self.stream.close(self.io);
+        self.allocator.free(self.server_host);
         self.allocator.free(self.read_buf);
         self.allocator.free(self.write_buf);
         if (self.tls_read_buf) |buf| self.allocator.free(buf);
@@ -321,6 +329,7 @@ pub const Conn = struct {
         self.disableStmtCache() catch {};
         self.sendTerminate() catch {};
         self.stream.close(self.io);
+        self.allocator.free(self.server_host);
         self.allocator.free(self.read_buf);
         self.allocator.free(self.write_buf);
         if (self.tls_read_buf) |buf| self.allocator.free(buf);
@@ -334,6 +343,26 @@ pub const Conn = struct {
         self.peer_cert_der = null;
         self.clearLastError();
         self.closed = true;
+    }
+
+    /// Create an allocator-owned handle that can cancel a query concurrently
+    /// and remains valid independently of this connection's memory.
+    ///
+    /// PostgreSQL cancellation uses a separate plaintext TCP connection. Create
+    /// the handle before starting the query, call `request` from another task,
+    /// and deinitialize it when no longer needed.
+    pub fn createCancelHandle(self: *const Conn, allocator: std.mem.Allocator) !CancelHandle {
+        if (self.closed) return error.ConnectionClosed;
+        const backend_pid = self.backend_pid orelse return error.ProtocolError;
+        const backend_secret = self.backend_secret orelse return error.ProtocolError;
+        return .{
+            .allocator = allocator,
+            .io = self.io,
+            .host = try allocator.dupe(u8, self.server_host),
+            .port = self.server_port,
+            .backend_pid = backend_pid,
+            .backend_secret = backend_secret,
+        };
     }
 
     /// Borrowed view of the last ErrorResponse metadata, if any.
@@ -1525,6 +1554,85 @@ pub const Conn = struct {
         return mapWriteError(self.writer.err);
     }
 };
+
+/// Allocator-owned PostgreSQL CancelRequest credentials and endpoint.
+///
+/// The handle contains sensitive backend-key material. Do not log or format its
+/// fields. Its memory is independent of the originating `Conn`, but callers
+/// must only send requests while that server session is still open.
+pub const CancelHandle = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    host: []u8,
+    port: u16,
+    backend_pid: i32,
+    backend_secret: i32,
+
+    pub fn deinit(self: *CancelHandle) void {
+        self.backend_pid = 0;
+        self.backend_secret = 0;
+        self.allocator.free(self.host);
+        self.* = undefined;
+    }
+
+    /// Send a CancelRequest with a five-second connection/write deadline.
+    pub fn request(self: *const CancelHandle) !void {
+        return self.requestWithTimeout(Io.Duration.fromSeconds(5));
+    }
+
+    /// Send a CancelRequest with an explicit end-to-end deadline.
+    pub fn requestWithTimeout(self: *const CancelHandle, duration: Io.Duration) !void {
+        if (duration.nanoseconds <= 0) return error.InvalidArguments;
+        var socket = try withTimeout(
+            CancelSocket,
+            self.io,
+            duration,
+            CancelSocket.open,
+            .{ self.io, self.host, self.port },
+            CancelSocket.cleanup,
+        );
+        defer socket.deinit();
+
+        const packet = protocol.buildCancelRequest(self.backend_pid, self.backend_secret);
+        var write_buffer: [16]u8 = undefined;
+        var writer = socket.stream.writer(self.io, &write_buffer);
+        writer.interface.writeAll(&packet) catch return mapWriteError(writer.err);
+        writer.interface.flush() catch return mapWriteError(writer.err);
+    }
+};
+
+const CancelSocket = struct {
+    io: Io,
+    stream: net.Stream,
+
+    fn open(io: Io, host: []const u8, port: u16) anyerror!CancelSocket {
+        return .{ .io = io, .stream = try connectStream(io, host, port) };
+    }
+
+    fn deinit(self: *CancelSocket) void {
+        self.stream.close(self.io);
+    }
+
+    fn cleanup(self: *CancelSocket) void {
+        self.deinit();
+    }
+};
+
+test "CancelHandle rejects a non-positive request deadline" {
+    var handle: CancelHandle = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .host = try std.testing.allocator.dupe(u8, "127.0.0.1"),
+        .port = 5432,
+        .backend_pid = 1,
+        .backend_secret = 2,
+    };
+    defer handle.deinit();
+    try std.testing.expectError(
+        error.InvalidArguments,
+        handle.requestWithTimeout(Io.Duration.zero),
+    );
+}
 
 /// Run an allocator/resource-owning operation with a deadline. A select is
 /// used instead of `IpAddress.ConnectOptions.timeout` because Zig 0.16's

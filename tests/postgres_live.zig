@@ -17,6 +17,10 @@ fn requireUrl(allocator: std.mem.Allocator) ![]u8 {
     return std.process.Environ.getAlloc(std.testing.environ, allocator, "ZSQL_PG_URL") catch return error.SkipZigTest;
 }
 
+fn runCancelableQuery(conn: *pg.Conn) anyerror!zsql.ExecResult {
+    return conn.exec("do $$ begin perform pg_sleep(10); end $$");
+}
+
 test "postgres live: handshake, params, tx, errors, inspect" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
@@ -464,6 +468,33 @@ test "postgres live: statement_timeout maps to QueryTimeout" {
     );
     // Connection remains usable after timeout cancel.
     try conn.setStatementTimeoutMs(0);
+    var rows = try conn.query("select 1::int as n");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try rows.next().?.as(i64, 0));
+}
+
+test "postgres live: CancelHandle cancels an active query" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, io, config);
+    defer conn.deinit();
+    var cancel = try conn.createCancelHandle(allocator);
+    defer cancel.deinit();
+
+    var query = io.async(runCancelableQuery, .{&conn});
+    defer _ = query.cancel(io) catch {};
+    try io.sleep(.{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake);
+    try cancel.request();
+    try std.testing.expectError(error.QueryTimeout, query.await(io));
+
+    // Canceling a statement must leave the original session synchronized.
     var rows = try conn.query("select 1::int as n");
     defer rows.deinit();
     try std.testing.expectEqual(@as(i64, 1), try rows.next().?.as(i64, 0));

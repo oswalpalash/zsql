@@ -19,6 +19,7 @@ pub const Config = url.Config;
 pub const SslMode = url.SslMode;
 pub const parseUrl = url.parse;
 pub const Conn = conn.Conn;
+pub const CancelHandle = conn.CancelHandle;
 pub const freeInspectedSchema = conn.freeInspectedSchema;
 pub const SimpleRows = conn.SimpleRows;
 pub const SimpleRow = conn.SimpleRow;

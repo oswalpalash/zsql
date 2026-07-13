@@ -35,7 +35,7 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 - `zsql.StmtCache` (connection-local prepared-statement name LRU)
 - `zsql.inspect`, `zsql.check`
 - `zsql.drivers.sqlite` (`-Denable-sqlite=true`): full open/exec/query/bind/tx/savepoint/pool/migrator/schema inspect
-- `zsql.drivers.postgres`: native (no libpq) URL parse, SCRAM-SHA-256 / SCRAM-SHA-256-PLUS / MD5 / cleartext, simple + extended query, tx/savepoints, pool, schema inspect, `Conn.lastError()`, optional `enableStmtCache`
+- `zsql.drivers.postgres`: native (no libpq) URL parse, SCRAM-SHA-256 / SCRAM-SHA-256-PLUS / MD5 / cleartext, simple + extended query, tx/savepoints, pool, schema inspect, owned `CancelHandle`, `Conn.lastError()`, optional `enableStmtCache`
 
 Use a driver’s explicit marker for the generic façade, e.g.
 `zsql.Database(zsql.drivers.sqlite.Driver)` or
@@ -159,6 +159,20 @@ runtime.
 `connect_timeout=<seconds>` bounds the complete connection setup, including
 DNS, TCP, TLS, startup, authentication, and session settings. Expiry returns
 `error.ConnectionTimeout`; `0` or omission means no connection deadline.
+
+Explicit cancellation uses an allocator-owned handle so it can safely run on a
+separate task and TCP connection without borrowing mutable query state:
+
+```zig
+var cancel = try conn.createCancelHandle(allocator);
+defer cancel.deinit();
+// While a query is active on conn from another task:
+try cancel.request(); // five-second request deadline
+```
+
+The interrupted query returns `error.QueryTimeout`, and the original connection
+drains through `ReadyForQuery` before it is reused. Use
+`requestWithTimeout(duration)` to choose a different cancellation deadline.
 
 Failed commands map SQLSTATE into fine-grained errors (`UniqueViolation`, `ForeignKeyViolation`, …) and store rich metadata on the connection:
 
