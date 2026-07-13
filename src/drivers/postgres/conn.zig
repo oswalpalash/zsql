@@ -580,6 +580,28 @@ pub const Conn = struct {
         };
     }
 
+    /// Rewrite named placeholders once, then prepare the resulting `$n` SQL.
+    /// Parameter names are copied into the returned statement.
+    pub fn prepareNamed(self: *Conn, sql: []const u8) !Stmt {
+        var rewrite = try core.params.rewriteNamedPostgres(self.allocator, sql);
+        defer rewrite.deinit(self.allocator);
+
+        var stmt = try self.prepare(rewrite.sql);
+        errdefer stmt.deinit();
+        const names = try self.allocator.alloc([]const u8, rewrite.names.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (names[0..initialized]) |name| self.allocator.free(name);
+            self.allocator.free(names);
+        }
+        for (rewrite.names, 0..) |name, index| {
+            names[index] = try self.allocator.dupe(u8, name);
+            initialized += 1;
+        }
+        stmt.parameter_names = names;
+        return stmt;
+    }
+
     fn prepareNamedStatement(self: *Conn, name: []const u8, sql: []const u8) ![]i32 {
         const parse_msg = try protocol.buildParseMessageNamed(self.allocator, name, sql);
         defer self.allocator.free(parse_msg);
@@ -2209,6 +2231,7 @@ pub const Stmt = struct {
     name: []u8,
     sql: []u8,
     parameter_oids: []i32,
+    parameter_names: ?[][]const u8 = null,
     open: bool = true,
 
     pub fn parameterCount(self: *const Stmt) usize {
@@ -2219,6 +2242,11 @@ pub const Stmt = struct {
         return self.parameter_oids;
     }
 
+    /// Names in PostgreSQL bind order, or null for positional statements.
+    pub fn parameterNames(self: *const Stmt) ?[]const []const u8 {
+        return self.parameter_names;
+    }
+
     pub fn exec(self: *Stmt, binds: []const core.Value) !core.ExecResult {
         try self.validateBinds(binds);
         return self.conn.execPrepared(self.name, self.sql, binds);
@@ -2227,6 +2255,20 @@ pub const Stmt = struct {
     pub fn query(self: *Stmt, binds: []const core.Value) !SimpleRows {
         try self.validateBinds(binds);
         return self.conn.queryPrepared(self.name, self.sql, binds);
+    }
+
+    pub fn execNamed(self: *Stmt, binds: []const core.params.NamedValue) !core.ExecResult {
+        const names = self.parameter_names orelse return error.InvalidArguments;
+        const ordered = try orderedNamedBinds(self.allocator, names, binds);
+        defer self.allocator.free(ordered);
+        return self.exec(ordered);
+    }
+
+    pub fn queryNamed(self: *Stmt, binds: []const core.params.NamedValue) !SimpleRows {
+        const names = self.parameter_names orelse return error.InvalidArguments;
+        const ordered = try orderedNamedBinds(self.allocator, names, binds);
+        defer self.allocator.free(ordered);
+        return self.query(ordered);
     }
 
     /// Close the named server statement and release owned client metadata.
@@ -2256,10 +2298,15 @@ pub const Stmt = struct {
     }
 
     fn releaseOwned(self: *Stmt) void {
+        if (self.parameter_names) |names| {
+            for (names) |name| self.allocator.free(name);
+            self.allocator.free(names);
+        }
         self.allocator.free(self.parameter_oids);
         self.allocator.free(self.sql);
         self.allocator.free(self.name);
         self.parameter_oids = &.{};
+        self.parameter_names = null;
         self.sql = &.{};
         self.name = &.{};
         self.open = false;

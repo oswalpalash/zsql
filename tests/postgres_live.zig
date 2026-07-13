@@ -171,6 +171,19 @@ test "postgres live: reusable prepared statement exec query and close" {
     defer second.deinit();
     try std.testing.expectEqualStrings("grace", try (try second.next().?.getName("name")).asText());
 
+    var named = try conn.prepareNamed("select name from zsql_prepared where id = :id or id = :id");
+    defer named.deinit();
+    const parameter_names = named.parameterNames().?;
+    try std.testing.expectEqual(@as(usize, 1), parameter_names.len);
+    try std.testing.expectEqualStrings("id", parameter_names[0]);
+    var named_rows = try named.queryNamed(&.{.{ .name = "id", .value = .{ .integer = 2 } }});
+    defer named_rows.deinit();
+    try std.testing.expectEqualStrings("grace", try (try named_rows.next().?.getName("name")).asText());
+    try std.testing.expectError(error.InvalidBindValue, named.queryNamed(&.{
+        .{ .name = "id", .value = .{ .integer = 1 } },
+        .{ .name = "extra", .value = .{ .integer = 2 } },
+    }));
+
     try select.close();
     try std.testing.expectError(error.StatementClosed, select.query(&.{.{ .integer = 1 }}));
     try std.testing.expectError(error.InvalidSql, conn.prepare("select from"));

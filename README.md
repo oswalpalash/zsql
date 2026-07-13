@@ -56,7 +56,9 @@ PostgreSQL `Conn.prepare(sql)` performs a named server Parse + Describe once.
 The returned allocator-owned `Stmt` exposes parameter OIDs, validates bind
 counts before I/O, and reuses the server statement for `exec`/`query`. It
 borrows the connection: call `Stmt.close()` or `deinit()` before moving or
-deinitializing that `Conn`.
+deinitializing that `Conn`. `Conn.prepareNamed` rewrites named placeholders once
+and copies their names; `Stmt.execNamed` / `queryNamed` reject missing,
+duplicate, or extra binds before execution.
 
 ### SQLite
 

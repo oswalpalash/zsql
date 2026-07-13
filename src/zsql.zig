@@ -47,7 +47,7 @@ pub fn validateDriver(comptime D: type) void {
     comptime {
         requireDecls(D, .{ "Database", "Conn", "Stmt", "Rows", "Row", "Pool", "Lease", "Tx", "Savepoint", "Migrator" });
         requireDecls(D.Database, .{ "open", "deinit" });
-        requireDecls(D.Stmt, .{ "close", "exec", "query" });
+        requireDecls(D.Stmt, .{ "close", "exec", "query", "execNamed", "queryNamed" });
         requireDecls(D.Pool, .{ "init", "deinit", "acquire" });
         requireDecls(D.Lease, .{ "conn", "release", "discard" });
         requireDecls(D.Tx, .{ "commit", "rollback", "rollbackIfOpen" });
