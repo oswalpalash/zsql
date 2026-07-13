@@ -244,6 +244,12 @@ pub fn build(b: *std.Build) void {
     const package_smoke = b.addSystemCommand(&.{ "sh", "scripts/package_smoke.sh", b.graph.zig_exe });
     const package_smoke_step = b.step("package-smoke", "Fetch and test the manifest-selected clean package payload");
     package_smoke_step.dependOn(&package_smoke.step);
+
+    const release_verify_test = b.addSystemCommand(&.{ "sh", "scripts/test_release_verify.sh" });
+    const release_verify = b.addSystemCommand(&.{ "sh", "scripts/release_verify.sh", b.graph.zig_exe });
+    release_verify.step.dependOn(&release_verify_test.step);
+    const release_verify_step = b.step("release-verify", "Run every deterministic pre-tag release gate");
+    release_verify_step.dependOn(&release_verify.step);
 }
 
 fn buildSqliteAmalgamation(

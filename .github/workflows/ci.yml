@@ -70,9 +70,6 @@ jobs:
       - name: External consumer (core + bundled SQLite)
         run: zig build consumer-smoke
 
-      - name: Clean fetched-package payload
-        run: zig build package-smoke
-
       - name: Postgres pool example (skips without ZSQL_PG_URL)
         run: zig build run-postgres-pool-example
 
@@ -101,6 +98,9 @@ jobs:
 
       - name: External consumer (system SQLite)
         run: zig build consumer-smoke-system
+
+      - name: Deterministic pre-tag aggregate
+        run: zig build release-verify
 
       - name: Live PostgreSQL integration tests
         env:

@@ -56,6 +56,21 @@ compares the installed doctor's reported version to that manifest value.
 index, runs `zig fetch` into a clean cache, extracts the manifest-selected
 payload, and repeats its test, consumer, and install gates from that package.
 
+Before tagging, run the complete deterministic release contract:
+
+```sh
+zig build release-verify
+```
+
+This covers formatting, default and SQLite tests, version integrity, checked
+queries, examples, external consumers, clean installation, and the fetched
+release payload. PostgreSQL protocol tests are included in the default suite;
+live server behavior remains the explicit final service-backed gate:
+
+```sh
+ZSQL_PG_URL='postgres://…' zig build test-postgres
+```
+
 ### Public names
 
 - `zsql.Database(D)`, `zsql.Connection(D)`, `zsql.Statement(D)`, `zsql.ResultRows(D)`, `zsql.ResultRow(D)`
