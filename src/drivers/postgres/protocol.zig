@@ -236,6 +236,15 @@ pub fn buildDescribePortalMessage(allocator: std.mem.Allocator) ![]u8 {
     return buildMessage(allocator, .describe, body.items);
 }
 
+/// Build Describe ('D') for a named or unnamed prepared statement.
+pub fn buildDescribeStatementMessage(allocator: std.mem.Allocator, statement_name: []const u8) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.append(allocator, 'S');
+    try appendCString(&body, allocator, statement_name);
+    return buildMessage(allocator, .describe, body.items);
+}
+
 /// Build Execute ('E') for the unnamed portal with no row limit.
 pub fn buildExecuteMessage(allocator: std.mem.Allocator) ![]u8 {
     var body: std.ArrayListUnmanaged(u8) = .empty;
@@ -338,6 +347,22 @@ pub const FieldDescription = struct {
     type_modifier: i32,
     format: i16,
 };
+
+/// Parse ParameterDescription into allocator-owned PostgreSQL type OIDs.
+pub fn parseParameterDescription(body: []const u8, allocator: std.mem.Allocator) ![]i32 {
+    if (body.len < 2) return error.ProtocolError;
+    const count_u = @as(u16, @bitCast(readI16(body[0..2])));
+    const count: usize = count_u;
+    if (body.len != 2 + count * 4) return error.ProtocolError;
+
+    const oids = try allocator.alloc(i32, count);
+    errdefer allocator.free(oids);
+    for (oids, 0..) |*oid, index| {
+        const offset = 2 + index * 4;
+        oid.* = readI32(body[offset..][0..4]);
+    }
+    return oids;
+}
 
 /// Parse RowDescription body into field metadata. Field names borrow from `body`.
 pub fn parseRowDescription(body: []const u8, allocator: std.mem.Allocator) ![]FieldDescription {
@@ -586,6 +611,12 @@ test "build extended query messages" {
     try std.testing.expectEqual(@as(u8, 'D'), describe[0]);
     try std.testing.expectEqual(@as(u8, 'P'), describe[5]);
 
+    const describe_statement = try buildDescribeStatementMessage(std.testing.allocator, "zsql_ps_0");
+    defer std.testing.allocator.free(describe_statement);
+    try std.testing.expectEqual(@as(u8, 'D'), describe_statement[0]);
+    try std.testing.expectEqual(@as(u8, 'S'), describe_statement[5]);
+    try std.testing.expect(std.mem.indexOf(u8, describe_statement, "zsql_ps_0") != null);
+
     const execute = try buildExecuteMessage(std.testing.allocator);
     defer std.testing.allocator.free(execute);
     try std.testing.expectEqual(@as(u8, 'E'), execute[0]);
@@ -629,6 +660,19 @@ test "parse row description and data row" {
     try std.testing.expect(cols[1].bytes == null);
 
     try std.testing.expectEqualStrings("SELECT 1", try parseCommandComplete("SELECT 1\x00"));
+}
+
+test "parse parameter description" {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    try appendI16(&body, std.testing.allocator, 2);
+    try appendI32(&body, std.testing.allocator, 20);
+    try appendI32(&body, std.testing.allocator, 25);
+
+    const oids = try parseParameterDescription(body.items, std.testing.allocator);
+    defer std.testing.allocator.free(oids);
+    try std.testing.expectEqualSlices(i32, &.{ 20, 25 }, oids);
+    try std.testing.expectError(error.ProtocolError, parseParameterDescription(body.items[0 .. body.items.len - 1], std.testing.allocator));
 }
 
 pub fn appendI16(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: i16) !void {
