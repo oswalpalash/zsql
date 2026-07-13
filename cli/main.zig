@@ -119,8 +119,13 @@ fn syncPublishedDirectory(dir: std.Io.Dir, io: std.Io) !void {
         .dragonfly,
         .illumos,
         => {
+            // Linux commonly represents non-iterable `Dir` values with
+            // `O_PATH`, which rejects `fsync`. Reopen the same directory with
+            // read/iteration rights before borrowing its handle as a File.
+            const sync_dir = try dir.openDir(io, ".", .{ .iterate = true });
+            defer sync_dir.close(io);
             const directory_file: std.Io.File = .{
-                .handle = dir.handle,
+                .handle = sync_dir.handle,
                 .flags = .{ .nonblocking = false },
             };
             try directory_file.sync(io);
