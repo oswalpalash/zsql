@@ -606,6 +606,19 @@ test "postgres live: copy in and out bytes" {
     const out = try conn.copyOut("copy zsql_copy_demo (id, name) to stdout with (format csv)");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("1,ada\n2,grace\n", out);
+
+    // Wrong-direction calls must terminate or drain the active COPY exchange
+    // before returning so the same connection remains usable.
+    try std.testing.expectError(
+        error.ProtocolError,
+        conn.copyOut("copy zsql_copy_demo (id, name) from stdin with (format csv)"),
+    );
+    try conn.ping();
+    try std.testing.expectError(
+        error.ProtocolError,
+        conn.copyIn("copy zsql_copy_demo (id, name) to stdout with (format csv)", ""),
+    );
+    try conn.ping();
 }
 
 test "postgres live: statement cache reuses named prepares" {

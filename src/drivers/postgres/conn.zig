@@ -843,7 +843,17 @@ pub const Conn = struct {
         defer self.allocator.free(query_packet);
         try self.writeAll(query_packet);
 
+        var synchronized = false;
         var started = false;
+        var terminated = false;
+        errdefer if (!synchronized) {
+            if (started and !terminated) {
+                self.abortCopyInAndDrain();
+            } else {
+                self.drainUntilReady();
+            }
+        };
+
         var rows_affected: u64 = 0;
         while (true) {
             const msg = try self.readMessage();
@@ -860,14 +870,19 @@ pub const Conn = struct {
                     const done = try protocol.buildMessage(self.allocator, .copy_done, &.{});
                     defer self.allocator.free(done);
                     try self.writeAll(done);
+                    terminated = true;
                 },
                 .command_complete => rows_affected = types.parseCommandTag(try protocol.parseCommandComplete(msg.body)).rows_affected,
                 .ready_for_query => {
-                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    synchronized = true;
+                    self.tx_status = protocol.parseReadyForQuery(msg.body) catch {
+                        self.broken = true;
+                        return error.ProtocolError;
+                    };
                     return if (started) .{ .rows_affected = rows_affected } else error.ProtocolError;
                 },
                 .parameter_status, .notice_response, .notification_response => {},
-                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
+                .error_response => return self.failFromErrorResponse(msg.body, false, sql),
                 else => return error.ProtocolError,
             }
         }
@@ -881,6 +896,16 @@ pub const Conn = struct {
         defer self.allocator.free(query_packet);
         try self.writeAll(query_packet);
 
+        var synchronized = false;
+        var server_waiting_for_copy_in = false;
+        errdefer if (!synchronized) {
+            if (server_waiting_for_copy_in) {
+                self.abortCopyInAndDrain();
+            } else {
+                self.drainUntilReady();
+            }
+        };
+
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
         var started = false;
@@ -892,18 +917,26 @@ pub const Conn = struct {
                     if (started) return error.ProtocolError;
                     started = true;
                 },
+                .copy_in_response => {
+                    server_waiting_for_copy_in = true;
+                    return error.ProtocolError;
+                },
                 .copy_data => {
                     if (!started) return error.ProtocolError;
                     try out.appendSlice(self.allocator, msg.body);
                 },
                 .copy_done, .command_complete => {},
                 .ready_for_query => {
-                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    synchronized = true;
+                    self.tx_status = protocol.parseReadyForQuery(msg.body) catch {
+                        self.broken = true;
+                        return error.ProtocolError;
+                    };
                     if (!started) return error.ProtocolError;
                     return out.toOwnedSlice(self.allocator);
                 },
                 .parameter_status, .notice_response, .notification_response => {},
-                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
+                .error_response => return self.failFromErrorResponse(msg.body, false, sql),
                 else => return error.ProtocolError,
             }
         }
@@ -1717,6 +1750,20 @@ pub const Conn = struct {
                 else => {},
             }
         }
+    }
+
+    /// End a COPY FROM STDIN exchange without allocating, then synchronize.
+    /// PostgreSQL waits indefinitely for CopyDone or CopyFail after
+    /// CopyInResponse, so a plain drain is not sufficient in this state.
+    fn abortCopyInAndDrain(self: *Conn) void {
+        const reason = "zsql client copy failed";
+        var packet: [1 + 4 + reason.len + 1]u8 = undefined;
+        packet[0] = @intFromEnum(protocol.FrontendTag.copy_fail);
+        protocol.writeI32(packet[1..5], 4 + reason.len + 1);
+        @memcpy(packet[5 .. 5 + reason.len], reason);
+        packet[packet.len - 1] = 0;
+        self.writeAll(&packet) catch return;
+        self.drainUntilReady();
     }
 
     fn fillClientNonce(self: *Conn, buf: []u8) !void {
