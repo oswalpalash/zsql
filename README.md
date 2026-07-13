@@ -129,7 +129,9 @@ dedicated lease for the statement lifetime. The lease is heap-stable so the
 statement's connection pointer remains valid even when `PooledStmt` moves.
 Closing or deinitializing the statement always happens before releasing or
 discarding its lease; a pool shutdown lets the statement finish, then closes
-the connection instead of returning it to idle.
+the connection instead of returning it to idle. Rows returned by
+`PooledStmt.query` / `queryNamed` own their decoded data and remain valid after
+the statement is closed and the pool is deinitialized.
 
 ### SQLite
 

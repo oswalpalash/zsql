@@ -996,6 +996,45 @@ test "postgres live: pooled prepared statement owns a stable lease" {
     try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
 }
 
+test "postgres live: prepared rows survive statement and pool teardown" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa_state.deinit() == .ok);
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var pool = try pg.Pool.init(allocator, std.testing.io, .{
+        .database = config,
+        .max_open = 1,
+        .max_idle = 1,
+    });
+    errdefer pool.deinit();
+
+    var positional = try pool.prepare("select $1::int as id, $2::text as name");
+    errdefer positional.deinit();
+    var positional_rows = try positional.query(&.{ .{ .integer = 7 }, .{ .text = "close" } });
+    defer positional_rows.deinit();
+    try positional.close();
+
+    var named = try pool.prepareNamed("select :id::int as id, :name::text as name");
+    errdefer named.deinit();
+    var named_rows = try named.queryNamed(&.{
+        .{ .name = "id", .value = .{ .integer = 9 } },
+        .{ .name = "name", .value = .{ .text = "deinit" } },
+    });
+    defer named_rows.deinit();
+    named.deinit();
+    pool.deinit();
+
+    const positional_row = positional_rows.next().?;
+    try std.testing.expectEqual(@as(i64, 7), try positional_row.as(i64, 0));
+    try std.testing.expectEqualStrings("close", try positional_row.as([]const u8, 1));
+    const named_row = named_rows.next().?;
+    try std.testing.expectEqual(@as(i64, 9), try named_row.as(i64, 0));
+    try std.testing.expectEqualStrings("deinit", try named_row.as([]const u8, 1));
+}
+
 test "postgres live: pool shutdown drains outstanding leases and rows" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

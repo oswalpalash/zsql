@@ -54,6 +54,8 @@ pub fn validate() void {
             "Notification",
             "Pool",
             "Lease",
+            "PooledRows",
+            "PooledStmt",
             "Listener",
             "Savepoint",
             "Migrator",
@@ -62,7 +64,9 @@ pub fn validate() void {
         requireDecls(zsql.drivers.postgres.Notification, .{"deinit"});
         requireDecls(zsql.drivers.postgres.Listener, .{ "listen", "unlisten", "next", "deinit" });
         requireDecls(zsql.drivers.postgres.Conn, .{ "copyIn", "copyOut" });
-        requireDecls(zsql.drivers.postgres.Pool, .{ "copyIn", "copyOut" });
+        requireDecls(zsql.drivers.postgres.Pool, .{ "prepare", "prepareNamed", "copyIn", "copyOut" });
+        requireDecls(zsql.drivers.postgres.PooledRows, .{ "next", "deinit" });
+        requireDecls(zsql.drivers.postgres.PooledStmt, .{ "exec", "query", "execNamed", "queryNamed", "close", "deinit" });
 
         if (zsql.enable_sqlite) {
             requireDriver(zsql.drivers.sqlite.Driver);
