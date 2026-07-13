@@ -130,6 +130,7 @@ pub const DbError = struct {
         if (std.mem.eql(u8, code, "23503")) return error.ForeignKeyViolation;
         if (std.mem.eql(u8, code, "23502")) return error.NotNullViolation;
         if (std.mem.eql(u8, code, "23514")) return error.CheckViolation;
+        if (std.mem.eql(u8, code, "25P02")) return error.TransactionAborted;
         if (std.mem.eql(u8, code, "40001")) return error.SerializationFailure;
         if (std.mem.eql(u8, code, "40P01")) return error.DeadlockDetected;
         if (std.mem.eql(u8, code, "55P03")) return error.Locked;
@@ -292,6 +293,7 @@ test "sqlstate mapping" {
     try std.testing.expect(DbError.errorFromSqlState("23503") == error.ForeignKeyViolation);
     try std.testing.expect(DbError.errorFromSqlState("23502") == error.NotNullViolation);
     try std.testing.expect(DbError.errorFromSqlState("23514") == error.CheckViolation);
+    try std.testing.expect(DbError.errorFromSqlState("25P02") == error.TransactionAborted);
     try std.testing.expect(DbError.errorFromSqlState("40001") == error.SerializationFailure);
     try std.testing.expect(DbError.errorFromSqlState("40P01") == error.DeadlockDetected);
     try std.testing.expect(DbError.errorFromSqlState("28P01") == error.AuthFailed);

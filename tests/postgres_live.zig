@@ -174,6 +174,32 @@ test "postgres live: reusable prepared statement exec query and close" {
     defer second.deinit();
     try std.testing.expectEqualStrings("grace", try (try second.next().?.getName("name")).asText());
 
+    // Server statements are session-scoped: they remain usable across commit
+    // and rollback. An aborted transaction reports a typed error and does not
+    // trigger automatic reprepare inside the failed transaction.
+    try conn.begin();
+    try std.testing.expectError(
+        error.UniqueViolation,
+        insert.exec(&.{ .{ .integer = 1 }, .{ .text = "duplicate" } }),
+    );
+    try std.testing.expectError(error.TransactionAborted, select.query(&.{.{ .integer = 1 }}));
+    try std.testing.expectEqualStrings("25P02", conn.lastError().?.code.?);
+    try conn.rollback();
+
+    try conn.begin();
+    _ = try insert.exec(&.{ .{ .integer = 3 }, .{ .text = "linus" } });
+    try conn.commit();
+    var committed = try select.query(&.{.{ .integer = 3 }});
+    defer committed.deinit();
+    try std.testing.expectEqualStrings("linus", try (try committed.next().?.getName("name")).asText());
+
+    try conn.begin();
+    _ = try insert.exec(&.{ .{ .integer = 4 }, .{ .text = "rolled-back" } });
+    try conn.rollback();
+    var rolled_back = try select.query(&.{.{ .integer = 4 }});
+    defer rolled_back.deinit();
+    try std.testing.expect(rolled_back.next() == null);
+
     var named = try conn.prepareNamed("select name from zsql_prepared where id = :id or id = :id");
     defer named.deinit();
     const parameter_names = named.parameterNames().?;

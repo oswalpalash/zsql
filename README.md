@@ -63,7 +63,10 @@ missing, duplicate, or extra binds before execution.
 An explicit PostgreSQL statement performs one safe automatic reprepare when the
 server reports that its name disappeared (`26000`) or that a cached plan changed
 result shape. Recovery occurs only after idle `ReadyForQuery`; statements are
-never retried from an aborted transaction or for generic SQL errors.
+never retried from an aborted transaction or for generic SQL errors. PostgreSQL
+`25P02` maps to `error.TransactionAborted`, and prepared statements remain
+session-valid after the caller rolls back, commits, or starts another
+transaction.
 
 `postgres.Pool.prepare` / `prepareNamed` return `PooledStmt`, which holds one
 dedicated lease for the statement lifetime. The lease is heap-stable so the
