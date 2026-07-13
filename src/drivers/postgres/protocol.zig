@@ -74,6 +74,9 @@ pub const protocol_version_3: i32 = 196608;
 /// SSLRequest code used before startup when TLS may be negotiated.
 pub const ssl_request_code: i32 = 80877103;
 
+/// CancelRequest code used on a fresh plaintext connection.
+pub const cancel_request_code: i32 = 80877102;
+
 /// Single-byte server reply to SSLRequest.
 pub const SslResponse = enum {
     /// Server will proceed with TLS handshake next.
@@ -126,6 +129,17 @@ pub fn buildSslRequest(allocator: std.mem.Allocator) ![]u8 {
     var out = try allocator.alloc(u8, 8);
     writeI32(out[0..4], 8);
     writeI32(out[4..8], ssl_request_code);
+    return out;
+}
+
+/// Build a CancelRequest packet. PostgreSQL requires this exact 16-byte packet
+/// on a new plaintext connection and sends no response.
+pub fn buildCancelRequest(backend_pid: i32, backend_secret: i32) [16]u8 {
+    var out: [16]u8 = undefined;
+    writeI32(out[0..4], 16);
+    writeI32(out[4..8], cancel_request_code);
+    writeI32(out[8..12], backend_pid);
+    writeI32(out[12..16], backend_secret);
     return out;
 }
 
@@ -471,6 +485,14 @@ test "build startup message encodes user database and encoding" {
     try std.testing.expect(std.mem.indexOf(u8, msg, "appdb") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "client_encoding") != null);
     try std.testing.expectEqual(@as(u8, 0), msg[msg.len - 1]);
+}
+
+test "build cancel request uses the startup backend key" {
+    const msg = buildCancelRequest(0x01020304, 0x11223344);
+    try std.testing.expectEqual(@as(i32, 16), readI32(msg[0..4]));
+    try std.testing.expectEqual(cancel_request_code, readI32(msg[4..8]));
+    try std.testing.expectEqual(@as(i32, 0x01020304), readI32(msg[8..12]));
+    try std.testing.expectEqual(@as(i32, 0x11223344), readI32(msg[12..16]));
 }
 
 test "build and parse frontend query message" {
