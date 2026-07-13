@@ -228,6 +228,10 @@ try conn.enableStmtCache(32);
 try conn.disableStmtCache();
 ```
 
+Failed PostgreSQL Parse attempts and server-side cached-plan invalidations remove
+their client mapping. The next call receives a fresh statement name and Parse,
+preventing permanent `prepared statement does not exist` or `0A000` loops.
+
 SQLite (`-Denable-sqlite=true`) has the same `enableStmtCache` API, caching `sqlite3_stmt` handles.
 Schema-changing SQLite statements and scripts clear cached handles while keeping
 the configured cache enabled, preventing stale result-column metadata after DDL.

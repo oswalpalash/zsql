@@ -126,6 +126,14 @@ pub const StmtCache = struct {
         }
         return false;
     }
+
+    /// Remove a mapping and transfer its owned fields to the caller.
+    pub fn remove(self: *StmtCache, sql: []const u8) ?Entry {
+        for (self.entries.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.sql, sql)) return self.entries.orderedRemove(i);
+        }
+        return null;
+    }
 };
 
 /// Generate a stable, ASCII-safe prepared statement name from a counter.
@@ -169,6 +177,19 @@ test "StmtCache put refresh updates name" {
     try std.testing.expect(try cache.put("q", "new") == null);
     try std.testing.expectEqualStrings("new", cache.get("q").?);
     try std.testing.expectEqual(@as(usize, 1), cache.len());
+}
+
+test "StmtCache remove transfers ownership and preserves other entries" {
+    var cache = try StmtCache.init(std.testing.allocator, 3);
+    defer cache.deinit();
+    try std.testing.expect(try cache.put("a", "n0") == null);
+    try std.testing.expect(try cache.put("b", "n1") == null);
+    const removed = cache.remove("a").?;
+    defer StmtCache.freeEntry(std.testing.allocator, removed);
+    try std.testing.expectEqualStrings("a", removed.sql);
+    try std.testing.expect(!cache.contains("a"));
+    try std.testing.expect(cache.contains("b"));
+    try std.testing.expect(cache.remove("missing") == null);
 }
 
 test "StmtCache rejects zero capacity" {

@@ -448,6 +448,34 @@ test "postgres live: statement cache reuses named prepares" {
     // Same SQL should still be a single cached prepare.
     try std.testing.expectEqual(@as(usize, 1), conn.stmtCacheLen());
 
+    const invalid_sql = "select from where id = $1";
+    try std.testing.expectError(error.InvalidSql, conn.queryParams(invalid_sql, &.{.{ .integer = 1 }}));
+    try std.testing.expectEqual(@as(usize, 1), conn.stmtCacheLen());
+    // A failed Parse must not leave a nonexistent prepared-name mapping.
+    try std.testing.expectError(error.InvalidSql, conn.queryParams(invalid_sql, &.{.{ .integer = 1 }}));
+    try std.testing.expectEqual(@as(usize, 1), conn.stmtCacheLen());
+
+    _ = try conn.exec("create temporary table zsql_cache_shape (id int primary key)");
+    _ = try conn.exec("insert into zsql_cache_shape (id) values (1)");
+    const shape_sql = "select * from zsql_cache_shape where id = $1";
+    var before_shape = try conn.queryParams(shape_sql, &.{.{ .integer = 1 }});
+    defer before_shape.deinit();
+    try std.testing.expectEqual(@as(usize, 1), before_shape.next().?.values.len);
+    try std.testing.expectEqual(@as(usize, 2), conn.stmtCacheLen());
+
+    _ = try conn.exec("alter table zsql_cache_shape add column label text");
+    _ = try conn.exec("update zsql_cache_shape set label = 'fresh' where id = 1");
+    try std.testing.expectError(error.DriverError, conn.queryParams(shape_sql, &.{.{ .integer = 1 }}));
+    try std.testing.expectEqualStrings("0A000", conn.lastError().?.code.?);
+    try std.testing.expectEqual(@as(usize, 1), conn.stmtCacheLen());
+
+    var after_shape = try conn.queryParams(shape_sql, &.{.{ .integer = 1 }});
+    defer after_shape.deinit();
+    const shape_row = after_shape.next().?;
+    try std.testing.expectEqual(@as(usize, 2), shape_row.values.len);
+    try std.testing.expectEqualStrings("fresh", try (try shape_row.value("label")).asText());
+    try std.testing.expectEqual(@as(usize, 2), conn.stmtCacheLen());
+
     try conn.disableStmtCache();
     try std.testing.expectEqual(@as(usize, 0), conn.stmtCacheLen());
 }

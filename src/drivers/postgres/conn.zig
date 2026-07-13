@@ -513,6 +513,7 @@ pub const Conn = struct {
             });
         }
         const result = self.execParamsUnobserved(sql, binds) catch |err| {
+            self.invalidateCachedStatementAfterError(sql, err);
             if (observe) {
                 self.hooks.emitAfter(.{
                     .driver = .postgres,
@@ -747,6 +748,7 @@ pub const Conn = struct {
             return error.ConnectionClosed;
         }
         self.sendExtended(sql, binds, true) catch |err| {
+            self.invalidateCachedStatementAfterError(sql, err);
             if (observe) {
                 self.hooks.emitAfter(.{
                     .driver = .postgres,
@@ -758,6 +760,7 @@ pub const Conn = struct {
             return err;
         };
         const rows = self.collectExtendedRows() catch |err| {
+            self.invalidateCachedStatementAfterError(sql, err);
             if (observe) {
                 self.hooks.emitAfter(.{
                     .driver = .postgres,
@@ -1111,6 +1114,32 @@ pub const Conn = struct {
         }
         try self.writeAll(execute_msg);
         try self.writeAll(sync_msg);
+    }
+
+    fn invalidateCachedStatementAfterError(self: *Conn, sql: []const u8, err: anyerror) void {
+        const cache = if (self.stmt_cache) |*value| value else return;
+        var invalidate = err == error.InvalidSql;
+        var close_server_statement = false;
+        if (self.lastError()) |db_err| {
+            if (db_err.code) |code| {
+                invalidate = invalidate or
+                    std.mem.eql(u8, code, "0A000") or
+                    std.mem.eql(u8, code, "26000") or
+                    std.mem.eql(u8, code, "42P05");
+                close_server_statement = std.mem.eql(u8, code, "0A000") or
+                    std.mem.eql(u8, code, "42P05");
+            }
+        }
+        if (!invalidate) return;
+        if (cache.remove(sql)) |entry| {
+            // Failed Parse attempts and missing names have no server resource.
+            // A plan-shape/duplicate-name error can leave one behind; close it
+            // only from idle state so cleanup cannot interfere with rollback.
+            if (close_server_statement and self.isReusable()) {
+                self.closePrepared(entry.name) catch {};
+            }
+            core.StmtCache.freeEntry(self.allocator, entry);
+        }
     }
 
     fn collectExtendedRows(self: *Conn) !SimpleRows {
