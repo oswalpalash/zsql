@@ -191,18 +191,8 @@ fn cmdMigrateNew(init: std.process.Init, name: []const u8) !void {
 
     const cwd = std.Io.Dir.cwd();
     try cwd.createDirPath(io, "migrations");
-
-    const version = try nextMigrationVersion(io, "migrations");
-    const filename = try std.fmt.allocPrint(allocator, "V{d:0>4}__{s}.sql", .{ version, name });
-    defer allocator.free(filename);
-
-    const path = try std.fmt.allocPrint(allocator, "migrations/{s}", .{filename});
+    const path = try createNextMigrationFile(allocator, cwd, io, "migrations", name);
     defer allocator.free(path);
-
-    try writeFileAtomic(cwd, io, path,
-        \\-- Write forward-only migration SQL below.
-        \\
-    , .create);
 
     const msg = try std.fmt.allocPrint(allocator, "created {s}\n", .{path});
     defer allocator.free(msg);
@@ -517,8 +507,157 @@ test "atomic CLI artifact creation preserves existing destination and cleans tem
     try std.testing.expectEqual(@as(usize, 1), file_count);
 }
 
-fn nextMigrationVersion(io: std.Io, dir_path: []const u8) !u64 {
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return 1;
+const migration_template =
+    \\-- Write forward-only migration SQL below.
+    \\
+;
+
+const max_migration_create_attempts = 32;
+
+fn createNextMigrationFile(
+    allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
+    io: std.Io,
+    dir_path: []const u8,
+    name: []const u8,
+) ![]u8 {
+    return createNextMigrationFileWith(
+        allocator,
+        dir,
+        io,
+        dir_path,
+        name,
+        {},
+        struct {
+            fn create(_: void, target_dir: std.Io.Dir, target_io: std.Io, path: []const u8, bytes: []const u8) !void {
+                try writeFileAtomic(target_dir, target_io, path, bytes, .create);
+            }
+        }.create,
+    );
+}
+
+fn createNextMigrationFileWith(
+    allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
+    io: std.Io,
+    dir_path: []const u8,
+    name: []const u8,
+    context: anytype,
+    comptime createFn: anytype,
+) ![]u8 {
+    for (0..max_migration_create_attempts) |_| {
+        const version = try nextMigrationVersion(dir, io, dir_path);
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/V{d:0>4}__{s}.sql",
+            .{ dir_path, version, name },
+        );
+        createFn(context, dir, io, path, migration_template) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(path);
+                continue;
+            },
+            else => {
+                allocator.free(path);
+                return err;
+            },
+        };
+        return path;
+    }
+    return error.MigrationVersionConflict;
+}
+
+test "migration creation retries when a concurrent creator wins the version" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "migrations");
+
+    const CollisionOnce = struct {
+        collided: bool = false,
+
+        fn create(
+            self: *@This(),
+            dir: std.Io.Dir,
+            io: std.Io,
+            path: []const u8,
+            bytes: []const u8,
+        ) !void {
+            if (!self.collided) {
+                self.collided = true;
+                try writeFileAtomic(dir, io, path, "concurrent migration\n", .create);
+            }
+            try writeFileAtomic(dir, io, path, bytes, .create);
+        }
+    };
+    var collision: CollisionOnce = .{};
+    const path = try createNextMigrationFileWith(
+        std.testing.allocator,
+        tmp.dir,
+        std.testing.io,
+        "migrations",
+        "create_users",
+        &collision,
+        CollisionOnce.create,
+    );
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expect(collision.collided);
+    try std.testing.expectEqualStrings("migrations/V0002__create_users.sql", path);
+    const first = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "migrations/V0001__create_users.sql",
+        std.testing.allocator,
+        .limited(1024),
+    );
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqualStrings("concurrent migration\n", first);
+    const second = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        path,
+        std.testing.allocator,
+        .limited(1024),
+    );
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings(migration_template, second);
+}
+
+test "migration creation bounds repeated version collisions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "migrations");
+
+    const AlwaysCollide = struct {
+        attempts: usize = 0,
+
+        fn create(
+            self: *@This(),
+            _: std.Io.Dir,
+            _: std.Io,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!void {
+            self.attempts += 1;
+            return error.PathAlreadyExists;
+        }
+    };
+    var collisions: AlwaysCollide = .{};
+    try std.testing.expectError(
+        error.MigrationVersionConflict,
+        createNextMigrationFileWith(
+            std.testing.allocator,
+            tmp.dir,
+            std.testing.io,
+            "migrations",
+            "create_users",
+            &collisions,
+            AlwaysCollide.create,
+        ),
+    );
+    try std.testing.expectEqual(max_migration_create_attempts, collisions.attempts);
+}
+
+fn nextMigrationVersion(root: std.Io.Dir, io: std.Io, dir_path: []const u8) !u64 {
+    var dir = root.openDir(io, dir_path, .{ .iterate = true }) catch return 1;
     defer dir.close(io);
 
     var max_version: u64 = 0;
@@ -528,5 +667,5 @@ fn nextMigrationVersion(io: std.Io, dir_path: []const u8) !u64 {
         const id = zsql.migrate.parseFilename(entry.name) catch continue;
         if (id.version > max_version) max_version = id.version;
     }
-    return max_version + 1;
+    return std.math.add(u64, max_version, 1) catch error.MigrationVersionConflict;
 }
