@@ -52,6 +52,9 @@ artifacts do not depend on repository-relative files.
 `zig build version-sync` makes `build.zig.zon` authoritative for release
 metadata and fails if the library/CLI build option drifts; `install-smoke` also
 compares the installed doctor's reported version to that manifest value.
+`zig build package-smoke` snapshots the current worktree through an isolated Git
+index, runs `zig fetch` into a clean cache, extracts the manifest-selected
+payload, and repeats its test, consumer, and install gates from that package.
 
 ### Public names
 

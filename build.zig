@@ -240,6 +240,10 @@ pub fn build(b: *std.Build) void {
     install_smoke.step.dependOn(&version_sync.step);
     const install_smoke_step = b.step("install-smoke", "Install to a clean prefix and run the installed CLI");
     install_smoke_step.dependOn(&install_smoke.step);
+
+    const package_smoke = b.addSystemCommand(&.{ "sh", "scripts/package_smoke.sh", b.graph.zig_exe });
+    const package_smoke_step = b.step("package-smoke", "Fetch and test the manifest-selected clean package payload");
+    package_smoke_step.dependOn(&package_smoke.step);
 }
 
 fn buildSqliteAmalgamation(
