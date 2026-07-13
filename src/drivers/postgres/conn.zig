@@ -1310,6 +1310,9 @@ pub const Conn = struct {
     }
 
     fn collectExtendedRows(self: *Conn, sql: []const u8) !SimpleRows {
+        var synchronized = false;
+        errdefer if (!synchronized) self.drainUntilReady();
+
         var columns: []protocol.FieldDescription = &.{};
         var column_names: std.ArrayListUnmanaged([]u8) = .empty;
         errdefer {
@@ -1352,7 +1355,11 @@ pub const Conn = struct {
                     rows_affected = types.parseCommandTag(tag).rows_affected;
                 },
                 .ready_for_query => {
-                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    synchronized = true;
+                    self.tx_status = protocol.parseReadyForQuery(msg.body) catch {
+                        self.broken = true;
+                        return error.ProtocolError;
+                    };
                     const names = try column_names.toOwnedSlice(self.allocator);
                     column_names = .empty;
                     if (columns.len != 0) {
@@ -1366,12 +1373,9 @@ pub const Conn = struct {
                         .rows_affected = rows_affected,
                     };
                 },
-                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
+                .error_response => return self.failFromErrorResponse(msg.body, false, sql),
                 .parameter_status, .notice_response, .notification_response => {},
-                else => {
-                    self.drainUntilReady();
-                    return error.ProtocolError;
-                },
+                else => return error.ProtocolError,
             }
         }
     }
@@ -1419,6 +1423,9 @@ pub const Conn = struct {
         defer self.allocator.free(packet);
         try self.writeAll(packet);
 
+        var synchronized = false;
+        errdefer if (!synchronized) self.drainUntilReady();
+
         var columns: []protocol.FieldDescription = &.{};
         var column_names: std.ArrayListUnmanaged([]u8) = .empty;
         errdefer {
@@ -1446,7 +1453,6 @@ pub const Conn = struct {
                     // Reject instead of relabeling earlier rows with a later
                     // RowDescription.
                     if (saw_row_description or completed_commands != 0) {
-                        self.drainUntilReady();
                         return error.Unsupported;
                     }
                     saw_row_description = true;
@@ -1468,7 +1474,6 @@ pub const Conn = struct {
                 .command_complete => {
                     completed_commands += 1;
                     if (completed_commands > 1) {
-                        self.drainUntilReady();
                         return error.Unsupported;
                     }
                     const tag = try protocol.parseCommandComplete(msg.body);
@@ -1477,12 +1482,15 @@ pub const Conn = struct {
                 .empty_query_response => {
                     completed_commands += 1;
                     if (completed_commands > 1 or saw_row_description) {
-                        self.drainUntilReady();
                         return error.Unsupported;
                     }
                 },
                 .ready_for_query => {
-                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    synchronized = true;
+                    self.tx_status = protocol.parseReadyForQuery(msg.body) catch {
+                        self.broken = true;
+                        return error.ProtocolError;
+                    };
                     const names = try column_names.toOwnedSlice(self.allocator);
                     column_names = .empty;
                     // Free protocol field metadata; names are owned separately.
@@ -1497,12 +1505,9 @@ pub const Conn = struct {
                         .rows_affected = rows_affected,
                     };
                 },
-                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
+                .error_response => return self.failFromErrorResponse(msg.body, false, sql),
                 .parameter_status, .notice_response, .notification_response => {},
-                else => {
-                    self.drainUntilReady();
-                    return error.ProtocolError;
-                },
+                else => return error.ProtocolError,
             }
         }
     }

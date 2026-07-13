@@ -401,6 +401,9 @@ PostgreSQL `query` accepts one command/result schema per call. Multi-command
 simple-query results return `error.Unsupported` after draining to
 `ReadyForQuery`, avoiding ambiguous flattening or mislabeled columns; use
 separate query calls instead.
+Both simple and extended row collectors drain on any local parse, decode, or
+allocation error before `ReadyForQuery`. If synchronization itself fails, the
+connection is closed so a pool cannot reuse unread protocol state.
 
 `zsql.types.Text`, `Blob`, `Numeric`, and canonical-text `Uuid` decode through
 the same borrowed row path. PostgreSQL `date`, `time`, `timestamp`, and
