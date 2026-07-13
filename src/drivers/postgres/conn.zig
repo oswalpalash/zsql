@@ -468,6 +468,9 @@ pub const Conn = struct {
         defer self.allocator.free(packet);
         try self.writeAll(packet);
 
+        var synchronized = false;
+        errdefer if (!synchronized) self.drainUntilReady();
+
         var rows_affected: u64 = 0;
         while (true) {
             const msg = try self.readMessage();
@@ -480,18 +483,16 @@ pub const Conn = struct {
                 .empty_query_response => {},
                 .parameter_status, .notice_response, .notification_response => {},
                 .ready_for_query => {
-                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    synchronized = true;
+                    self.tx_status = protocol.parseReadyForQuery(msg.body) catch {
+                        self.broken = true;
+                        return error.ProtocolError;
+                    };
                     return .{ .rows_affected = rows_affected };
                 },
-                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
-                .row_description, .data_row => {
-                    self.drainUntilReady();
-                    return error.UnexpectedRow;
-                },
-                else => {
-                    self.drainUntilReady();
-                    return error.ProtocolError;
-                },
+                .error_response => return self.failFromErrorResponse(msg.body, false, sql),
+                .row_description, .data_row => return error.UnexpectedRow,
+                else => return error.ProtocolError,
             }
         }
     }
@@ -662,6 +663,9 @@ pub const Conn = struct {
     }
 
     fn collectExtendedExec(self: *Conn, sql: []const u8) !core.ExecResult {
+        var synchronized = false;
+        errdefer if (!synchronized) self.drainUntilReady();
+
         var rows_affected: u64 = 0;
         while (true) {
             const msg = try self.readMessage();
@@ -674,18 +678,16 @@ pub const Conn = struct {
                     rows_affected = types.parseCommandTag(tag).rows_affected;
                 },
                 .ready_for_query => {
-                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    synchronized = true;
+                    self.tx_status = protocol.parseReadyForQuery(msg.body) catch {
+                        self.broken = true;
+                        return error.ProtocolError;
+                    };
                     return .{ .rows_affected = rows_affected };
                 },
-                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
-                .row_description, .data_row => {
-                    self.drainUntilReady();
-                    return error.UnexpectedRow;
-                },
-                else => {
-                    self.drainUntilReady();
-                    return error.ProtocolError;
-                },
+                .error_response => return self.failFromErrorResponse(msg.body, false, sql),
+                .row_description, .data_row => return error.UnexpectedRow,
+                else => return error.ProtocolError,
             }
         }
     }

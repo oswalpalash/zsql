@@ -287,6 +287,29 @@ test "postgres live: query rejects multiple result schemas and recovers" {
     try std.testing.expectEqual(@as(i64, 3), try (try rows.next().?.value("value")).asInt());
 }
 
+test "postgres live: exec rejects rows and recovers" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, std.testing.io, config);
+    defer conn.deinit();
+
+    try std.testing.expectError(error.UnexpectedRow, conn.exec("select 1"));
+    try conn.ping();
+
+    try std.testing.expectError(
+        error.UnexpectedRow,
+        conn.execParams("select $1::int", &.{.{ .integer = 2 }}),
+    );
+    var rows = try conn.query("select 3::int as value");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 3), try (try rows.next().?.value("value")).asInt());
+}
+
 test "postgres live: queryOneParams enforces cardinality" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
