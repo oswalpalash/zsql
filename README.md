@@ -442,12 +442,23 @@ const email = try row.asName([]const u8, "email");
 const owned_email = try row.asNameOwned(allocator, "email");
 defer allocator.free(owned_email);
 
+// Allocator-owned columns and values (survives Rows/connection teardown):
+var owned_row = try row.getOwned(allocator);
+defer owned_row.deinit();
+
 // Struct mapping (name first, ordinal fallback):
 const user = try row.to(struct { id: i64, email: []const u8 });
 
 // Single-value helper (same rules as Row.as / Row.to):
 const flag = try zsql.decode(bool, try row.get(2));
 ```
+
+Borrowed row values remain valid only until the next row is advanced, the
+statement is reset or finalized, the rows object is deinitialized, or its
+connection/lease is released. Copy a single text/blob with `asOwned` /
+`asNameOwned`, or copy the complete row with `getOwned`, before crossing that
+boundary. Every owned copy records or receives its allocator and must be
+released explicitly.
 
 Postgres `SimpleRow` exposes the same `get` / `getName` / `as` / `asName` / `to` / `getOwned` surface.
 PostgreSQL `bytea` is allocator-owned by `SimpleRows` and decoded to the original
