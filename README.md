@@ -220,7 +220,9 @@ starting a later operation clears stale metadata, including when it succeeds.
 SQLite exposes the same borrowed `Conn.lastError()` shape with its numeric
 extended result code, diagnostic message, and statement text. It duplicates
 connection-owned metadata immediately and never stores bind parameter values;
-a subsequent operation or `Conn.close()` clears the previous diagnostic.
+deferred `Rows.next()` failures update the same move-safe diagnostic state, so
+pooled rows remain inspectable through their lease. A subsequent operation,
+lease release, or `Conn.close()` clears the previous diagnostic.
 
 Optional prepared-statement cache (connection-local, no global state):
 

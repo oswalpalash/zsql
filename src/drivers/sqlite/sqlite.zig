@@ -509,6 +509,64 @@ fn isFatalPoolConnectionError(err: anyerror) bool {
     };
 }
 
+const DiagnosticState = struct {
+    allocator: std.mem.Allocator,
+    refs: usize = 1,
+    last_error: ?core.OwnedDbError = null,
+
+    fn create(allocator: std.mem.Allocator) !*DiagnosticState {
+        const state = try allocator.create(DiagnosticState);
+        state.* = .{ .allocator = allocator };
+        return state;
+    }
+
+    fn retain(self: *DiagnosticState) void {
+        self.refs += 1;
+    }
+
+    fn release(self: *DiagnosticState) void {
+        std.debug.assert(self.refs > 0);
+        self.refs -= 1;
+        if (self.refs != 0) return;
+        self.clear();
+        self.allocator.destroy(self);
+    }
+
+    fn clear(self: *DiagnosticState) void {
+        if (self.last_error) |*owned| {
+            owned.deinit(self.allocator);
+            self.last_error = null;
+        }
+    }
+
+    fn view(self: *const DiagnosticState) ?core.DbError {
+        if (self.last_error) |*owned| return owned.view();
+        return null;
+    }
+
+    fn capture(self: *DiagnosticState, handle: *c.sqlite3, err: anyerror, sql: []const u8) void {
+        self.clear();
+        const message_view = std.mem.span(c.sqlite3_errmsg(handle));
+        const message = self.allocator.dupe(u8, message_view) catch return;
+        const code = std.fmt.allocPrint(self.allocator, "{d}", .{c.sqlite3_extended_errcode(handle)}) catch {
+            self.allocator.free(message);
+            return;
+        };
+        const sql_copy = self.allocator.dupe(u8, sql) catch {
+            self.allocator.free(code);
+            self.allocator.free(message);
+            return;
+        };
+        self.last_error = .{
+            .category = core.DbError.categoryOf(err),
+            .driver = .sqlite,
+            .code = code,
+            .message = message,
+            .sql = sql_copy,
+        };
+    }
+};
+
 pub const Database = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -579,6 +637,7 @@ pub const Database = struct {
         return .{
             .allocator = self.allocator,
             .handle = self.handle,
+            .diagnostics = try DiagnosticState.create(self.allocator),
         };
     }
 };
@@ -588,16 +647,18 @@ pub const Conn = struct {
     handle: *c.sqlite3,
     closed: bool = false,
     transaction_open: bool = false,
-    /// Last allocator-owned SQLite diagnostic; exposed as a borrowed view.
-    last_error: ?core.OwnedDbError = null,
+    /// Stable shared storage so active Rows can report deferred step errors.
+    diagnostics: ?*DiagnosticState,
     /// Optional prepared-statement handle cache for this connection.
     prepared_cache: ?PreparedCache = null,
     /// Connection-local observability hooks (no global registry).
     hooks: core.Hooks = .{},
 
     pub fn close(self: *Conn) void {
+        if (self.closed) return;
         self.disableStmtCache();
-        self.clearLastError();
+        if (self.diagnostics) |diagnostics| diagnostics.release();
+        self.diagnostics = null;
         self.closed = true;
     }
 
@@ -609,37 +670,16 @@ pub const Conn = struct {
     /// Borrowed SQLite error metadata valid until the next operation or close.
     /// Contains statement text but never bind parameter values.
     pub fn lastError(self: *const Conn) ?core.DbError {
-        if (self.last_error) |*owned| return owned.view();
+        if (self.diagnostics) |diagnostics| return diagnostics.view();
         return null;
     }
 
     fn clearLastError(self: *Conn) void {
-        if (self.last_error) |*owned| {
-            owned.deinit(self.allocator);
-            self.last_error = null;
-        }
+        if (self.diagnostics) |diagnostics| diagnostics.clear();
     }
 
     fn captureLastError(self: *Conn, err: anyerror, sql: []const u8) void {
-        self.clearLastError();
-        const message_view = std.mem.span(c.sqlite3_errmsg(self.handle));
-        const message = self.allocator.dupe(u8, message_view) catch return;
-        const code = std.fmt.allocPrint(self.allocator, "{d}", .{c.sqlite3_extended_errcode(self.handle)}) catch {
-            self.allocator.free(message);
-            return;
-        };
-        const sql_copy = self.allocator.dupe(u8, sql) catch {
-            self.allocator.free(code);
-            self.allocator.free(message);
-            return;
-        };
-        self.last_error = .{
-            .category = core.DbError.categoryOf(err),
-            .driver = .sqlite,
-            .code = code,
-            .message = message,
-            .sql = sql_copy,
-        };
+        if (self.diagnostics) |diagnostics| diagnostics.capture(self.handle, err, sql);
     }
 
     /// Create a borrowed cross-task interrupt handle.
@@ -796,7 +836,13 @@ pub const Conn = struct {
             return err;
         };
         errdefer prepared.release();
-        const rows = Rows.initOwned(prepared.stmt, binds, !prepared.from_cache) catch |err| {
+        const rows = Rows.initOwnedWithDiagnostics(
+            prepared.stmt,
+            binds,
+            !prepared.from_cache,
+            self.diagnostics,
+            sql,
+        ) catch |err| {
             self.captureLastError(err, sql);
             if (observe) {
                 self.hooks.emitAfter(.{
@@ -878,7 +924,13 @@ pub const Conn = struct {
             return err;
         };
         errdefer prepared.release();
-        return Rows.initOwnedNamed(prepared.stmt, binds, !prepared.from_cache) catch |err| {
+        return Rows.initOwnedNamedWithDiagnostics(
+            prepared.stmt,
+            binds,
+            !prepared.from_cache,
+            self.diagnostics,
+            sql,
+        ) catch |err| {
             self.captureLastError(err, sql);
             return err;
         };
@@ -1677,6 +1729,8 @@ pub const Rows = struct {
     done: bool = false,
     /// When true, `deinit` finalizes the statement; otherwise only resets it.
     owns_stmt: bool = true,
+    diagnostics: ?*DiagnosticState = null,
+    diagnostic_sql: ?[]u8 = null,
 
     pub fn init(stmt: Stmt, binds: []const core.Value) !Rows {
         return initOwned(stmt, binds, true);
@@ -1687,23 +1741,53 @@ pub const Rows = struct {
     }
 
     pub fn initOwned(stmt: Stmt, binds: []const core.Value, owns_stmt: bool) !Rows {
+        return initOwnedWithDiagnostics(stmt, binds, owns_stmt, null, "");
+    }
+
+    fn initOwnedWithDiagnostics(
+        stmt: Stmt,
+        binds: []const core.Value,
+        owns_stmt: bool,
+        diagnostics: ?*DiagnosticState,
+        sql: []const u8,
+    ) !Rows {
         var owned_stmt = stmt;
         errdefer if (owns_stmt) owned_stmt.close() else owned_stmt.resetForReuse();
 
         try owned_stmt.bindValues(binds);
-        return initBound(owned_stmt, owns_stmt);
+        return initBound(owned_stmt, owns_stmt, diagnostics, sql);
     }
 
     pub fn initOwnedNamed(stmt: Stmt, binds: []const NamedValue, owns_stmt: bool) !Rows {
+        return initOwnedNamedWithDiagnostics(stmt, binds, owns_stmt, null, "");
+    }
+
+    fn initOwnedNamedWithDiagnostics(
+        stmt: Stmt,
+        binds: []const NamedValue,
+        owns_stmt: bool,
+        diagnostics: ?*DiagnosticState,
+        sql: []const u8,
+    ) !Rows {
         var owned_stmt = stmt;
         errdefer if (owns_stmt) owned_stmt.close() else owned_stmt.resetForReuse();
 
         try owned_stmt.bindNamedValues(binds);
-        return initBound(owned_stmt, owns_stmt);
+        return initBound(owned_stmt, owns_stmt, diagnostics, sql);
     }
 
-    fn initBound(owned_stmt: Stmt, owns_stmt: bool) !Rows {
+    fn initBound(
+        owned_stmt: Stmt,
+        owns_stmt: bool,
+        diagnostics: ?*DiagnosticState,
+        sql: []const u8,
+    ) !Rows {
         var stmt = owned_stmt;
+
+        const diagnostic_sql = if (diagnostics != null) try stmt.allocator.dupe(u8, sql) else null;
+        errdefer if (diagnostic_sql) |owned_sql| stmt.allocator.free(owned_sql);
+        if (diagnostics) |state| state.retain();
+        errdefer if (diagnostics) |state| state.release();
 
         const column_count = try sqliteColumnCount(stmt.handle);
         const columns = try stmt.allocator.alloc([]const u8, column_count);
@@ -1721,6 +1805,8 @@ pub const Rows = struct {
             .columns = columns,
             .values = values,
             .owns_stmt = owns_stmt,
+            .diagnostics = diagnostics,
+            .diagnostic_sql = diagnostic_sql,
         };
     }
 
@@ -1732,6 +1818,10 @@ pub const Rows = struct {
         } else {
             self.stmt.resetForReuse();
         }
+        if (self.diagnostic_sql) |sql| self.stmt.allocator.free(sql);
+        if (self.diagnostics) |diagnostics| diagnostics.release();
+        self.diagnostic_sql = null;
+        self.diagnostics = null;
         self.done = true;
     }
 
@@ -1742,7 +1832,10 @@ pub const Rows = struct {
         switch (rc) {
             c.SQLITE_ROW => {
                 for (self.values, 0..) |*value, index| {
-                    value.* = try self.decodeColumn(try sqliteIndex(index));
+                    value.* = self.decodeColumn(try sqliteIndex(index)) catch |err| {
+                        self.captureDeferredError(err);
+                        return err;
+                    };
                 }
                 return try core.Row.init(self.columns, self.values);
             },
@@ -1750,8 +1843,18 @@ pub const Rows = struct {
                 self.done = true;
                 return null;
             },
-            else => return sqliteError(rc),
+            else => {
+                const err = sqliteError(rc);
+                self.captureDeferredError(err);
+                return err;
+            },
         }
+    }
+
+    fn captureDeferredError(self: *Rows, err: anyerror) void {
+        const diagnostics = self.diagnostics orelse return;
+        const db = c.sqlite3_db_handle(self.stmt.handle) orelse return;
+        diagnostics.capture(db, err, self.diagnostic_sql orelse "");
     }
 
     fn decodeColumn(self: *Rows, index: c_int) !core.Value {
@@ -2024,9 +2127,17 @@ test "SQLite InterruptHandle cancels a long query and preserves connection use" 
         try std.testing.io.sleep(.{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake);
         interrupt.request();
         try std.testing.expectError(error.QueryTimeout, query.await(std.testing.io));
+
+        const db_err = conn.lastError() orelse return error.TestExpectedEqual;
+        try std.testing.expect(db_err.driver == .sqlite);
+        try std.testing.expect(db_err.category == .connection);
+        try std.testing.expectEqualStrings("9", db_err.code.?);
+        try std.testing.expect(std.mem.indexOf(u8, db_err.message, "interrupted") != null);
+        try std.testing.expect(std.mem.indexOf(u8, db_err.sql.?, "with recursive counter") != null);
     }
 
     try conn.ping();
+    try std.testing.expectEqual(@as(?core.DbError, null), conn.lastError());
 }
 
 test "SQLite queryAll collects owned rows" {
@@ -2938,6 +3049,12 @@ test "SQLite pooled rows return interrupted healthy connections to idle" {
     try std.testing.io.sleep(.{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake);
     interrupt.request();
     try std.testing.expectError(error.QueryTimeout, query.await(std.testing.io));
+
+    const db_err = (try rows.lease.conn()).lastError() orelse return error.TestExpectedEqual;
+    try std.testing.expect(db_err.driver == .sqlite);
+    try std.testing.expect(db_err.category == .connection);
+    try std.testing.expectEqualStrings("9", db_err.code.?);
+    try std.testing.expect(std.mem.indexOf(u8, db_err.sql.?, "with recursive counter") != null);
     rows.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
