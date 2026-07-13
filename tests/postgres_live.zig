@@ -659,9 +659,12 @@ test "postgres live: inspected schema survives connection teardown" {
     var conn = try pg.Conn.open(allocator, std.testing.io, config);
     errdefer conn.deinit();
 
-    _ = try conn.exec("create temporary table zsql_owned_schema (id bigint primary key, note text)");
+    _ = try conn.exec("drop table if exists zsql_owned_schema");
+    errdefer _ = conn.exec("drop table if exists zsql_owned_schema") catch {};
+    _ = try conn.exec("create table zsql_owned_schema (id bigint primary key, note text)");
     const schema = try conn.inspectSchema(allocator);
     defer pg.freeInspectedSchema(allocator, schema);
+    _ = try conn.exec("drop table zsql_owned_schema");
     conn.deinit();
 
     var found = false;

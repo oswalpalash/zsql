@@ -482,7 +482,7 @@ test "atomic CLI artifact replacement swaps complete contents" {
 }
 
 test "atomic CLI artifact creation preserves existing destination and cleans temporary file" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(std.testing.io, .{
