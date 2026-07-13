@@ -60,6 +60,8 @@ before moving or deinitializing that `Conn`. `Conn.prepareNamed` rewrites named
 placeholders once and copies their names; `Stmt.execNamed` / `queryNamed` reject
 missing, duplicate, or extra binds before execution. Named statements allocate
 their ordering scratch once during prepare and reuse it on every call.
+PostgreSQL Bind packets are sized exactly and encoded in one allocation rather
+than allocating a temporary buffer for every non-null value.
 
 An explicit PostgreSQL statement performs one safe automatic reprepare when the
 server reports that its name disappeared (`26000`) or that a cached plan changed

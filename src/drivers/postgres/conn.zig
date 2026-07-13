@@ -1230,27 +1230,7 @@ pub const Conn = struct {
     }
 
     fn sendBound(self: *Conn, stmt_name: []const u8, binds: []const core.Value, describe_portal: bool) !void {
-        var encoded: std.ArrayListUnmanaged(?[]u8) = .empty;
-        defer {
-            for (encoded.items) |item| {
-                if (item) |bytes| self.allocator.free(bytes);
-            }
-            encoded.deinit(self.allocator);
-        }
-        try encoded.ensureTotalCapacity(self.allocator, binds.len);
-        for (binds) |value| {
-            try encoded.append(self.allocator, try types.encodeText(self.allocator, value));
-        }
-
-        // Build ?[]const u8 view for bind message.
-        var views = try self.allocator.alloc(?[]const u8, encoded.items.len);
-        defer self.allocator.free(views);
-        for (encoded.items, 0..) |item, i| views[i] = item;
-
-        const bind_msg = if (stmt_name.len == 0)
-            try protocol.buildBindMessage(self.allocator, views)
-        else
-            try protocol.buildBindMessageNamed(self.allocator, stmt_name, views);
+        const bind_msg = try buildValueBindMessage(self.allocator, stmt_name, binds);
         defer self.allocator.free(bind_msg);
         const execute_msg = try protocol.buildExecuteMessage(self.allocator);
         defer self.allocator.free(execute_msg);
@@ -2074,6 +2054,83 @@ fn listenSql(allocator: std.mem.Allocator, command: []const u8, channel: []const
     }
     try out.append(allocator, '"');
     return out.toOwnedSlice(allocator);
+}
+
+/// Build a complete Bind packet directly from `Value`s. The exact wire size is
+/// computed first, so the returned packet is the only allocation.
+fn buildValueBindMessage(
+    allocator: std.mem.Allocator,
+    statement_name: []const u8,
+    binds: []const core.Value,
+) ![]u8 {
+    if (std.mem.indexOfScalar(u8, statement_name, 0) != null) return error.InvalidArguments;
+    const bind_count = std.math.cast(u16, binds.len) orelse return error.InvalidBindValue;
+
+    // tag + length + empty portal C string + statement C string + parameter
+    // format count + parameter count + result format count.
+    var total: usize = 13;
+    total = std.math.add(usize, total, statement_name.len) catch return error.InvalidBindValue;
+    for (binds) |value| {
+        total = std.math.add(usize, total, 4) catch return error.InvalidBindValue;
+        if (try types.encodedTextLen(value)) |len| {
+            _ = std.math.cast(i32, len) orelse return error.InvalidBindValue;
+            total = std.math.add(usize, total, len) catch return error.InvalidBindValue;
+        }
+    }
+    const message_len = std.math.cast(i32, total - 1) orelse return error.InvalidBindValue;
+
+    const out = try allocator.alloc(u8, total);
+    errdefer allocator.free(out);
+    out[0] = @intFromEnum(protocol.FrontendTag.bind);
+    protocol.writeI32(out[1..5], message_len);
+    var offset: usize = 5;
+    out[offset] = 0; // unnamed portal
+    offset += 1;
+    @memcpy(out[offset .. offset + statement_name.len], statement_name);
+    offset += statement_name.len;
+    out[offset] = 0;
+    offset += 1;
+    std.mem.writeInt(i16, out[offset..][0..2], 0, .big); // all params text
+    offset += 2;
+    std.mem.writeInt(u16, out[offset..][0..2], bind_count, .big);
+    offset += 2;
+    for (binds) |value| {
+        if (try types.encodedTextLen(value)) |len| {
+            protocol.writeI32(out[offset..][0..4], @intCast(len));
+            offset += 4;
+            try types.encodeTextInto(out[offset .. offset + len], value);
+            offset += len;
+        } else {
+            protocol.writeI32(out[offset..][0..4], -1);
+            offset += 4;
+        }
+    }
+    std.mem.writeInt(i16, out[offset..][0..2], 0, .big); // all results text
+    offset += 2;
+    std.debug.assert(offset == out.len);
+    return out;
+}
+
+test "value bind packet matches protocol builder with one allocation" {
+    const values = [_]core.Value{
+        .{ .boolean = true },
+        .{ .integer = -42 },
+        .{ .real = 1.5 },
+        .{ .text = "hello" },
+        .{ .blob = "\xab" },
+        .{ .null = {} },
+    };
+    const encoded = [_]?[]const u8{ "t", "-42", "1.5", "hello", "\\xab", null };
+    const expected = try protocol.buildBindMessageNamed(std.testing.allocator, "zsql_ps_7", &encoded);
+    defer std.testing.allocator.free(expected);
+    const actual = try buildValueBindMessage(std.testing.allocator, "zsql_ps_7", &values);
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualSlices(u8, expected, actual);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const one_allocation = try buildValueBindMessage(failing.allocator(), "zsql_ps_7", &values);
+    defer failing.allocator().free(one_allocation);
+    try std.testing.expect(!failing.has_induced_failure);
 }
 
 test "notification parser and listen quoting are strict" {

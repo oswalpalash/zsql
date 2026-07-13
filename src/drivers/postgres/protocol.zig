@@ -205,7 +205,7 @@ pub fn buildBindMessageNamed(
     try appendCString(&body, allocator, ""); // portal
     try appendCString(&body, allocator, statement_name);
     try appendI16(&body, allocator, 0); // param format count (all text)
-    try appendI16(&body, allocator, try castI16(binds.len));
+    try appendI16(&body, allocator, try castCountI16(binds.len));
     for (binds) |bind| {
         if (bind) |bytes| {
             try appendI32(&body, allocator, try castI32(bytes.len));
@@ -259,8 +259,10 @@ pub fn buildSyncMessage(allocator: std.mem.Allocator) ![]u8 {
     return buildMessage(allocator, .sync, &.{});
 }
 
-fn castI16(value: usize) !i16 {
-    return std.math.cast(i16, value) orelse error.InvalidBindValue;
+/// Encode a logical unsigned protocol count through the signed storage helper.
+fn castCountI16(value: usize) !i16 {
+    const unsigned = std.math.cast(u16, value) orelse return error.InvalidBindValue;
+    return @bitCast(unsigned);
 }
 
 fn castI32(value: usize) !i32 {
@@ -605,6 +607,8 @@ test "build extended query messages" {
     try std.testing.expectEqual(@as(u8, 'S'), close_msg[5]);
 
     try std.testing.expect(std.mem.indexOf(u8, bind_msg, "42") != null);
+    try std.testing.expectEqual(@as(i16, -1), try castCountI16(std.math.maxInt(u16)));
+    try std.testing.expectError(error.InvalidBindValue, castCountI16(@as(usize, std.math.maxInt(u16)) + 1));
 
     const describe = try buildDescribePortalMessage(std.testing.allocator);
     defer std.testing.allocator.free(describe);

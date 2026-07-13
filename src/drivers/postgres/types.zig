@@ -24,25 +24,60 @@ pub const TypeOid = enum(u32) {
 /// Allocator-owned text is returned for non-null values (including booleans and
 /// numbers). Callers must free each non-null slice.
 pub fn encodeText(allocator: std.mem.Allocator, value: core.Value) !?[]u8 {
+    const len = (try encodedTextLen(value)) orelse return null;
+    const out = try allocator.alloc(u8, len);
+    errdefer allocator.free(out);
+    try encodeTextInto(out, value);
+    return out;
+}
+
+/// Exact PostgreSQL text-format byte count, or null for SQL NULL.
+pub fn encodedTextLen(value: core.Value) !?usize {
     return switch (value) {
         .null => null,
-        .boolean => |b| try allocator.dupe(u8, if (b) "t" else "f"),
-        .integer => |n| try std.fmt.allocPrint(allocator, "{d}", .{n}),
-        .real => |n| try std.fmt.allocPrint(allocator, "{d}", .{n}),
-        .text => |t| try allocator.dupe(u8, t),
-        .blob => |b| blk: {
-            // Hex bytea text format: \x + hex digits
-            var out = try allocator.alloc(u8, 2 + b.len * 2);
-            out[0] = '\\';
-            out[1] = 'x';
-            const hex_charset = "0123456789abcdef";
-            for (b, 0..) |byte, i| {
-                out[2 + i * 2] = hex_charset[byte >> 4];
-                out[2 + i * 2 + 1] = hex_charset[byte & 15];
-            }
-            break :blk out;
+        .boolean => 1,
+        .integer => |n| blk: {
+            var scratch: [32]u8 = undefined;
+            break :blk (try std.fmt.bufPrint(&scratch, "{d}", .{n})).len;
         },
+        .real => |n| blk: {
+            var scratch: [128]u8 = undefined;
+            break :blk (try std.fmt.bufPrint(&scratch, "{d}", .{n})).len;
+        },
+        .text => |text| text.len,
+        .blob => |blob| std.math.add(
+            usize,
+            2,
+            std.math.mul(usize, blob.len, 2) catch return error.InvalidBindValue,
+        ) catch return error.InvalidBindValue,
     };
+}
+
+/// Encode one non-null value into an exactly-sized caller buffer.
+/// Passing SQL NULL requires an empty destination and writes no bytes.
+pub fn encodeTextInto(dest: []u8, value: core.Value) !void {
+    const expected = (try encodedTextLen(value)) orelse {
+        if (dest.len != 0) return error.InvalidArguments;
+        return;
+    };
+    if (dest.len != expected) return error.InvalidArguments;
+
+    switch (value) {
+        .null => unreachable,
+        .boolean => |boolean| dest[0] = if (boolean) 't' else 'f',
+        .integer => |integer| _ = std.fmt.bufPrint(dest, "{d}", .{integer}) catch return error.InvalidArguments,
+        .real => |real| _ = std.fmt.bufPrint(dest, "{d}", .{real}) catch return error.InvalidArguments,
+        .text => |text| @memcpy(dest, text),
+        .blob => |blob| {
+            dest[0] = '\\';
+            dest[1] = 'x';
+            const hex_charset = "0123456789abcdef";
+            for (blob, 0..) |byte, index| {
+                dest[2 + index * 2] = hex_charset[byte >> 4];
+                dest[2 + index * 2 + 1] = hex_charset[byte & 15];
+            }
+        },
+    }
 }
 
 /// Decode a text-format field into a `core.Value`.
@@ -145,4 +180,11 @@ test "encode text binds" {
     const blob = (try encodeText(std.testing.allocator, .{ .blob = "A" })).?;
     defer std.testing.allocator.free(blob);
     try std.testing.expectEqualStrings("\\x41", blob);
+
+    var into: [4]u8 = undefined;
+    try encodeTextInto(&into, .{ .blob = "A" });
+    try std.testing.expectEqualStrings("\\x41", &into);
+    try std.testing.expectEqual(@as(?usize, 4), try encodedTextLen(.{ .blob = "A" }));
+    try std.testing.expect((try encodedTextLen(.{ .null = {} })) == null);
+    try std.testing.expectError(error.InvalidArguments, encodeTextInto(into[0..3], .{ .blob = "A" }));
 }
