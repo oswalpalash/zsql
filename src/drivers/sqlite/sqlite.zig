@@ -323,10 +323,11 @@ pub const Pool = struct {
     pub fn queryOne(self: *Pool, sql: []const u8, binds: []const core.Value) !core.OwnedRow {
         var lease = try self.acquire();
         errdefer if (lease.open) lease.discard() catch {};
-        const owned = (try lease.conn()).queryOne(sql, binds) catch |err| {
+        var owned = (try lease.conn()).queryOne(sql, binds) catch |err| {
             lease.finishAfterError(err);
             return err;
         };
+        errdefer owned.deinit();
         try lease.release();
         return owned;
     }
@@ -340,6 +341,7 @@ pub const Pool = struct {
             lease.finishAfterError(err);
             return err;
         };
+        errdefer core.OwnedRow.freeSlice(self.allocator, owned);
         try lease.release();
         return owned;
     }
@@ -431,7 +433,14 @@ pub const Lease = struct {
         }
 
         if (self.pool.idle.items.len < self.pool.effectiveMaxIdle()) {
-            try self.pool.idle.append(self.pool.allocator, self.db);
+            self.pool.idle.append(self.pool.allocator, self.db) catch |err| {
+                self.conn_value.close();
+                self.db.deinit();
+                self.pool.open_count -|= 1;
+                self.open = false;
+                self.pool.notifyAvailable();
+                return err;
+            };
             self.conn_value.close();
         } else {
             self.conn_value.close();
@@ -2998,6 +3007,72 @@ test "SQLite pool timed acquire unblocks after concurrent release" {
 
     try std.testing.expect(ctx.ok.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), ctx.err_len);
+}
+
+test "SQLite lease release consumes connection when idle growth is OOM" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var pool = try Pool.init(failing.allocator(), std.testing.io, .{
+        .max_open = 1,
+        .max_idle = 1,
+    });
+    defer pool.deinit();
+
+    var lease = try pool.acquire();
+    try (try lease.conn()).ping();
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, lease.release());
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(!lease.open);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().leased);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try pool.ping();
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+}
+
+test "SQLite owned pool results unwind when release observes shutdown" {
+    const CloseOnQuery = struct {
+        pool: *Pool,
+        closed: bool = false,
+
+        fn after(raw: ?*anyopaque, _: core.QueryEnd) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.closed) return;
+            self.closed = true;
+            self.pool.deinit();
+        }
+
+        fn hooks(self: *@This()) core.Hooks {
+            return .{ .ctx = self, .after_query = after };
+        }
+    };
+
+    {
+        var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
+        defer pool.deinit();
+        _ = try pool.exec("create table release_one (id integer primary key)", &.{});
+        _ = try pool.exec("insert into release_one (id) values (1)", &.{});
+        var state = CloseOnQuery{ .pool = &pool };
+        pool.config.hooks = state.hooks();
+        try std.testing.expectError(
+            error.PoolClosed,
+            pool.queryOne("select id from release_one", &.{}),
+        );
+    }
+
+    {
+        var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
+        defer pool.deinit();
+        _ = try pool.exec("create table release_all (id integer primary key)", &.{});
+        _ = try pool.exec("insert into release_all (id) values (1), (2)", &.{});
+        var state = CloseOnQuery{ .pool = &pool };
+        pool.config.hooks = state.hooks();
+        try std.testing.expectError(
+            error.PoolClosed,
+            pool.queryAll("select id from release_all order by id", &.{}),
+        );
+    }
 }
 
 test "SQLite pool queryOne returns single owned row" {

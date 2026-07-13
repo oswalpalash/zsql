@@ -260,10 +260,11 @@ pub const Pool = struct {
     pub fn queryOneParams(self: *Pool, sql: []const u8, binds: []const core.Value) !core.OwnedRow {
         var lease = try self.acquire();
         errdefer if (lease.open) lease.discard() catch {};
-        const owned = (try lease.conn()).queryOneParams(sql, binds) catch |err| {
+        var owned = (try lease.conn()).queryOneParams(sql, binds) catch |err| {
             lease.finishAfterError(err);
             return err;
         };
+        errdefer owned.deinit();
         try lease.release();
         return owned;
     }
@@ -277,6 +278,7 @@ pub const Pool = struct {
             lease.finishAfterError(err);
             return err;
         };
+        errdefer core.OwnedRow.freeSlice(self.allocator, owned);
         try lease.release();
         return owned;
     }

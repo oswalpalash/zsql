@@ -419,6 +419,65 @@ test "postgres live: pool queryAllParams collects owned rows" {
     try pool.ping();
 }
 
+test "postgres live: owned pool results unwind when release observes shutdown" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa_state.deinit() == .ok);
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+
+    const CloseOnQuery = struct {
+        pool: *pg.Pool,
+        closed: bool = false,
+
+        fn after(raw: ?*anyopaque, _: zsql.QueryEnd) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.closed) return;
+            self.closed = true;
+            self.pool.deinit();
+        }
+
+        fn hooks(self: *@This()) zsql.Hooks {
+            return .{ .ctx = self, .after_query = after };
+        }
+    };
+
+    {
+        var pool = try pg.Pool.init(allocator, std.testing.io, .{
+            .database = config,
+            .max_open = 1,
+            .max_idle = 1,
+        });
+        defer pool.deinit();
+        var state = CloseOnQuery{ .pool = &pool };
+        pool.config.hooks = state.hooks();
+        try std.testing.expectError(
+            error.PoolClosed,
+            pool.queryOneParams("select 1::int as id", &.{}),
+        );
+    }
+
+    {
+        var pool = try pg.Pool.init(allocator, std.testing.io, .{
+            .database = config,
+            .max_open = 1,
+            .max_idle = 1,
+        });
+        defer pool.deinit();
+        var state = CloseOnQuery{ .pool = &pool };
+        pool.config.hooks = state.hooks();
+        try std.testing.expectError(
+            error.PoolClosed,
+            pool.queryAllParams(
+                "select id from (values (1), (2)) as rows(id) order by id",
+                &.{},
+            ),
+        );
+    }
+}
+
 test "postgres live: pool withTx commits and rolls back" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
