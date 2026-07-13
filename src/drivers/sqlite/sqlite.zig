@@ -975,7 +975,10 @@ pub const Conn = struct {
     /// Caller owns the returned schema graph; free with `freeInspectedSchema`.
     pub fn inspectSchema(self: *Conn, allocator: std.mem.Allocator) !core.inspect.Schema {
         var tables_list: std.ArrayListUnmanaged(core.inspect.Table) = .empty;
-        errdefer freeInspectedTables(allocator, tables_list.items);
+        errdefer {
+            freeInspectedTableItems(allocator, tables_list.items);
+            tables_list.deinit(allocator);
+        }
 
         var table_rows = try self.query(
             \\select name from sqlite_master
@@ -1020,6 +1023,7 @@ pub const Conn = struct {
             }
 
             const columns = try cols.toOwnedSlice(allocator);
+            errdefer core.inspect.freeColumns(allocator, @constCast(columns));
 
             // Indexes via PRAGMA index_list / index_info (table name from catalog).
             var idx_sql_buf: [256]u8 = undefined;
@@ -1054,20 +1058,30 @@ pub const Conn = struct {
                 }
                 while (try info_rows.next()) |info_row| {
                     const cname = try allocator.dupe(u8, try (try info_row.value("name")).asText());
+                    errdefer allocator.free(cname);
                     try col_names.append(allocator, cname);
                 }
 
+                const owned_index_name = try allocator.dupe(u8, iname);
+                errdefer allocator.free(owned_index_name);
+                const owned_index_columns = try col_names.toOwnedSlice(allocator);
+                errdefer {
+                    for (owned_index_columns) |column_name| allocator.free(column_name);
+                    allocator.free(owned_index_columns);
+                }
                 try indexes.append(allocator, .{
-                    .name = try allocator.dupe(u8, iname),
+                    .name = owned_index_name,
                     .unique = unique,
-                    .columns = try col_names.toOwnedSlice(allocator),
+                    .columns = owned_index_columns,
                 });
             }
 
+            const owned_indexes = try indexes.toOwnedSlice(allocator);
+            errdefer core.inspect.freeIndexes(allocator, @constCast(owned_indexes));
             try tables_list.append(allocator, .{
                 .name = owned_name,
                 .columns = columns,
-                .indexes = try indexes.toOwnedSlice(allocator),
+                .indexes = owned_indexes,
             });
         }
 
@@ -1216,6 +1230,11 @@ pub fn freeInspectedSchema(allocator: std.mem.Allocator, schema: core.inspect.Sc
 }
 
 fn freeInspectedTables(allocator: std.mem.Allocator, tables: []core.inspect.Table) void {
+    freeInspectedTableItems(allocator, tables);
+    allocator.free(tables);
+}
+
+fn freeInspectedTableItems(allocator: std.mem.Allocator, tables: []core.inspect.Table) void {
     for (tables) |table| {
         if (table.schema) |schema_name| allocator.free(schema_name);
         allocator.free(table.name);
@@ -1231,7 +1250,6 @@ fn freeInspectedTables(allocator: std.mem.Allocator, tables: []core.inspect.Tabl
         }
         allocator.free(@constCast(table.indexes));
     }
-    allocator.free(tables);
 }
 
 pub fn ensureMigrationTable(conn: *Conn) !void {
@@ -2285,6 +2303,24 @@ test "SQLite inspectSchema exports tables and columns" {
         }
     }
     try std.testing.expect(found_email_idx);
+}
+
+test "SQLite inspectSchema releases every partial graph on allocation failure" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table inspect_alloc_a (id integer primary key, note text)", &.{});
+    _ = try conn.exec("create unique index inspect_alloc_a_note on inspect_alloc_a(note)", &.{});
+    _ = try conn.exec("create table inspect_alloc_b (id integer primary key)", &.{});
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, connection: *Conn) !void {
+            const schema = try connection.inspectSchema(allocator);
+            defer freeInspectedSchema(allocator, schema);
+        }
+    }.run, .{&conn});
 }
 
 test "SQLite opens memory database and rejects row-returning exec" {

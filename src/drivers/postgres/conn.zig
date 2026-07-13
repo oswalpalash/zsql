@@ -1115,7 +1115,10 @@ pub const Conn = struct {
         if (self.closed) return error.ConnectionClosed;
 
         var tables_list: std.ArrayListUnmanaged(core.inspect.Table) = .empty;
-        errdefer freeInspectedTables(allocator, tables_list.items);
+        errdefer {
+            freeInspectedTableItems(allocator, tables_list.items);
+            tables_list.deinit(allocator);
+        }
 
         var table_rows = try self.query(core.inspect.postgres_list_tables_sql);
         defer table_rows.deinit();
@@ -1156,9 +1159,13 @@ pub const Conn = struct {
                 const ctype = try (try col_row.value("udt_name")).asText();
                 const nullable_text = try (try col_row.value("is_nullable")).asText();
                 const pk_text = try (try col_row.value("is_primary_key")).asText();
+                const owned_column_name = try allocator.dupe(u8, cname);
+                errdefer allocator.free(owned_column_name);
+                const owned_type_name = try allocator.dupe(u8, ctype);
+                errdefer allocator.free(owned_type_name);
                 try owned_info.append(allocator, .{
-                    .name = try allocator.dupe(u8, cname),
-                    .type_name = try allocator.dupe(u8, ctype),
+                    .name = owned_column_name,
+                    .type_name = owned_type_name,
                     .is_nullable = std.ascii.eqlIgnoreCase(nullable_text, "YES"),
                     .primary_key = std.ascii.eqlIgnoreCase(pk_text, "YES"),
                 });
@@ -1233,10 +1240,15 @@ pub const Conn = struct {
 
             if (current_name == null or !std.mem.eql(u8, current_name.?, iname)) {
                 if (current_name) |prev| {
+                    const owned_columns = try current_cols.toOwnedSlice(allocator);
+                    errdefer {
+                        for (owned_columns) |column_name| allocator.free(column_name);
+                        allocator.free(owned_columns);
+                    }
                     try indexes.append(allocator, .{
                         .name = prev,
                         .unique = current_unique,
-                        .columns = try current_cols.toOwnedSlice(allocator),
+                        .columns = owned_columns,
                     });
                     current_name = null;
                     current_cols = .empty;
@@ -1244,13 +1256,20 @@ pub const Conn = struct {
                 current_name = try allocator.dupe(u8, iname);
                 current_unique = unique;
             }
-            try current_cols.append(allocator, try allocator.dupe(u8, cname));
+            const owned_column_name = try allocator.dupe(u8, cname);
+            errdefer allocator.free(owned_column_name);
+            try current_cols.append(allocator, owned_column_name);
         }
         if (current_name) |prev| {
+            const owned_columns = try current_cols.toOwnedSlice(allocator);
+            errdefer {
+                for (owned_columns) |column_name| allocator.free(column_name);
+                allocator.free(owned_columns);
+            }
             try indexes.append(allocator, .{
                 .name = prev,
                 .unique = current_unique,
-                .columns = try current_cols.toOwnedSlice(allocator),
+                .columns = owned_columns,
             });
             current_name = null;
             current_cols = .empty;
@@ -2059,6 +2078,11 @@ pub fn freeInspectedSchema(allocator: std.mem.Allocator, schema: core.inspect.Sc
 }
 
 fn freeInspectedTables(allocator: std.mem.Allocator, tables: []core.inspect.Table) void {
+    freeInspectedTableItems(allocator, tables);
+    allocator.free(tables);
+}
+
+fn freeInspectedTableItems(allocator: std.mem.Allocator, tables: []core.inspect.Table) void {
     for (tables) |table| {
         if (table.schema) |schema_name| allocator.free(schema_name);
         allocator.free(table.name);
@@ -2074,7 +2098,6 @@ fn freeInspectedTables(allocator: std.mem.Allocator, tables: []core.inspect.Tabl
         }
         allocator.free(@constCast(table.indexes));
     }
-    allocator.free(tables);
 }
 
 const OwnedSimpleRow = struct {
