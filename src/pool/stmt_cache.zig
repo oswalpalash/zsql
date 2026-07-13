@@ -45,11 +45,9 @@ pub const StmtCache = struct {
                 self.entries.items[i].hits += 1;
                 if (i + 1 != self.entries.items.len) {
                     const moved = self.entries.orderedRemove(i);
-                    self.entries.append(self.allocator, moved) catch {
-                        // Restore on OOM so the entry is not lost.
-                        self.entries.insert(self.allocator, i, moved) catch {};
-                        return moved.name;
-                    };
+                    // orderedRemove preserves capacity, so LRU promotion must
+                    // never allocate or lose ownership on an impossible OOM.
+                    self.entries.appendAssumeCapacity(moved);
                     return self.entries.items[self.entries.items.len - 1].name;
                 }
                 return entry.name;
@@ -75,7 +73,7 @@ pub const StmtCache = struct {
                 self.entries.items[i].hits += 1;
                 if (i + 1 != self.entries.items.len) {
                     const moved = self.entries.orderedRemove(i);
-                    try self.entries.append(self.allocator, moved);
+                    self.entries.appendAssumeCapacity(moved);
                 }
                 return null;
             }
@@ -88,9 +86,7 @@ pub const StmtCache = struct {
         errdefer if (evicted) |e| {
             // Restore on failure so the cache is not left short a slot without
             // the caller receiving the entry to close/free.
-            self.entries.insert(self.allocator, 0, e) catch {
-                freeEntry(self.allocator, e);
-            };
+            self.entries.insertAssumeCapacity(0, e);
             evicted = null;
         };
 
@@ -167,6 +163,20 @@ test "StmtCache LRU eviction returns entry" {
     try std.testing.expect(cache.contains("a"));
     try std.testing.expect(cache.contains("c"));
     try std.testing.expect(!cache.contains("b"));
+    try std.testing.expectEqual(@as(usize, 2), cache.len());
+}
+
+test "StmtCache LRU promotion is allocation-free" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var cache = try StmtCache.init(failing.allocator(), 2);
+    defer cache.deinit();
+    try std.testing.expect(try cache.put("a", "n0") == null);
+    try std.testing.expect(try cache.put("b", "n1") == null);
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectEqualStrings("n0", cache.get("a").?);
+    try std.testing.expect(try cache.put("b", "n1") == null);
+    try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 2), cache.len());
 }
 
