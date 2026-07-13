@@ -107,9 +107,11 @@ pub const StmtCache = struct {
         allocator.free(entry.name);
     }
 
-    /// Remove and return all entries (for connection teardown / Close messages).
-    pub fn drain(self: *StmtCache) ![]Entry {
-        return try self.entries.toOwnedSlice(self.allocator);
+    /// Remove and transfer the oldest entry without allocating.
+    /// The caller must release it with `freeEntry`.
+    pub fn takeOldest(self: *StmtCache) ?Entry {
+        if (self.entries.items.len == 0) return null;
+        return self.entries.orderedRemove(0);
     }
 
     pub fn len(self: *const StmtCache) usize {
@@ -178,6 +180,25 @@ test "StmtCache LRU promotion is allocation-free" {
     try std.testing.expect(try cache.put("b", "n1") == null);
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 2), cache.len());
+}
+
+test "StmtCache teardown extraction is allocation-free" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var cache = try StmtCache.init(failing.allocator(), 2);
+    defer cache.deinit();
+    try std.testing.expect(try cache.put("a", "n0") == null);
+    try std.testing.expect(try cache.put("b", "n1") == null);
+
+    failing.fail_index = failing.alloc_index;
+    const first = cache.takeOldest().?;
+    defer StmtCache.freeEntry(failing.allocator(), first);
+    const second = cache.takeOldest().?;
+    defer StmtCache.freeEntry(failing.allocator(), second);
+    try std.testing.expectEqualStrings("a", first.sql);
+    try std.testing.expectEqualStrings("b", second.sql);
+    try std.testing.expect(cache.takeOldest() == null);
+    try std.testing.expectEqual(@as(usize, 0), cache.len());
+    try std.testing.expect(!failing.has_induced_failure);
 }
 
 test "StmtCache put refresh updates name" {

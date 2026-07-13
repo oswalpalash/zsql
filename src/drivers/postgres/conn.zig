@@ -405,22 +405,17 @@ pub const Conn = struct {
         self.stmt_cache = try core.StmtCache.init(self.allocator, max_entries);
     }
 
-    /// Disable the statement cache and Close any named prepares on the server.
+    /// Disable the statement cache and best-effort Close its named server
+    /// prepares. Client-owned cache memory is released without allocating, so
+    /// this remains leak-free during OOM teardown.
     pub fn disableStmtCache(self: *Conn) !void {
         if (self.stmt_cache) |*cache| {
-            const entries = try cache.drain();
-            defer {
-                for (entries) |e| core.StmtCache.freeEntry(self.allocator, e);
-                self.allocator.free(entries);
+            while (cache.takeOldest()) |entry| {
+                if (!self.closed) self.closePrepared(entry.name) catch {};
+                core.StmtCache.freeEntry(self.allocator, entry);
             }
-            // drain leaves cache.entries empty; free list storage.
             cache.deinit();
             self.stmt_cache = null;
-            if (!self.closed) {
-                for (entries) |e| {
-                    self.closePrepared(e.name) catch {};
-                }
-            }
         }
     }
 

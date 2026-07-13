@@ -285,6 +285,8 @@ try conn.disableStmtCache();
 Explicit and cached PostgreSQL statements share a session-monotonic generated
 name namespace. Enabling, disabling, or resizing the cache never reuses names
 that may still belong to an open explicit `Stmt`.
+Cache disable and connection teardown extract client-owned entries without
+allocating; server Close messages remain best-effort during teardown.
 
 Failed PostgreSQL Parse attempts and server-side cached-plan invalidations remove
 their client mapping. The next call receives a fresh statement name and Parse,
