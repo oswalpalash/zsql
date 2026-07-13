@@ -144,11 +144,17 @@ put it into failed state, where `begin`/`commit` return
 `Savepoint.rollback` is also valid in PostgreSQL's failed state and performs
 `ROLLBACK TO` followed by `RELEASE`, restoring the outer transaction for use.
 
-Pool acquire timeout: `0` = non-blocking, `std.math.maxInt(u64)` = wait forever (condition), any other value = timed wait (event signal on release).
+Pool acquire timeout: `0` = non-blocking, `std.math.maxInt(u64)` = wait forever
+(condition), any other value = deadline-based wait with ≤1 ms polling.
 
 Pools retain synchronized connections after recoverable SQL errors and discard
 closed, protocol-broken, or transaction-busy leases. A lease released with an
 open transaction is never returned to another borrower.
+
+`Pool.deinit()` closes idle connections and wakes blocked acquirers with
+`error.PoolClosed`. Already-issued leases and pooled rows remain usable; they
+close their connection instead of returning it when released. The `Pool` value
+must remain alive until those outstanding owners are deinitialized.
 
 TLS uses Zig's `std.crypto.tls.Client` (no OpenSSL). Behavior by `sslmode`:
 

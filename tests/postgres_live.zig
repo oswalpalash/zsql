@@ -528,6 +528,39 @@ test "postgres live: pool acquire release" {
     try std.testing.expectEqual(@as(usize, 0), stats.leased);
 }
 
+test "postgres live: pool shutdown drains outstanding leases and rows" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var pool = try pg.Pool.init(allocator, io, .{
+        .database = config,
+        .max_open = 2,
+        .max_idle = 2,
+    });
+    defer pool.deinit();
+
+    var lease = try pool.acquire();
+    defer if (lease.open) lease.discard() catch {};
+    var rows = try pool.queryParams("select 7::int as n", &.{});
+    defer rows.deinit();
+    pool.deinit();
+
+    try (try lease.conn()).ping();
+    const row = rows.next() orelse return error.NoRows;
+    try std.testing.expectEqual(@as(i64, 7), try (try row.value("n")).asInt());
+    rows.deinit();
+    try std.testing.expectError(error.PoolClosed, lease.release());
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
+    try std.testing.expectError(error.PoolClosed, pool.acquire());
+    pool.deinit();
+}
+
 test "postgres live: pool retains recoverable errors and discards unsafe releases" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

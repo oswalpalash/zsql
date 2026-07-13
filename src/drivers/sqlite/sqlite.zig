@@ -138,8 +138,6 @@ pub const Pool = struct {
     mutex: std.Io.Mutex = .init,
     /// Signaled on release/discard so infinite waiters (`maxInt` timeout) wake.
     available: std.Io.Condition = .init,
-    /// Sticky signal for finite timed waiters (reset under the mutex when consumed).
-    slot_event: std.Io.Event = .unset,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: PoolConfig) !Pool {
         if (config.max_open == 0) return error.InvalidArguments;
@@ -154,14 +152,19 @@ pub const Pool = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.closed) return;
-        std.debug.assert(self.open_count == self.idle.items.len);
+        self.closed = true;
 
+        const idle_count = self.idle.items.len;
         for (self.idle.items) |*db| {
             db.deinit();
         }
         self.idle.deinit(self.allocator);
-        self.open_count = 0;
-        self.closed = true;
+        self.idle = .empty;
+        self.open_count -= idle_count;
+
+        // Existing leases close themselves when returned. Infinite waiters are
+        // broadcast; finite waiters observe `closed` within their ≤1ms poll.
+        self.available.broadcast(self.io);
     }
 
     /// Acquire a lease using `PoolConfig.acquire_timeout_ns`.
@@ -244,28 +247,16 @@ pub const Pool = struct {
     /// Assumes `mutex` is held; re-locks before returning.
     fn waitForSlotTimed(self: *Pool, deadline: std.Io.Clock.Timestamp) !void {
         while (true) {
+            if (self.closed) return error.PoolClosed;
             if (self.idle.items.len > 0 or self.open_count < self.config.max_open) return;
             const remaining = deadline.durationFromNow(self.io);
             if (remaining.raw.nanoseconds <= 0) return error.PoolTimeout;
 
-            // Consume a pending signal under the lock so we do not spin on is_set.
-            if (self.slot_event.isSet()) {
-                self.slot_event.reset();
-                continue;
-            }
-
+            const sleep_ns = @min(remaining.raw.nanoseconds, std.time.ns_per_ms);
             self.mutex.unlock(self.io);
-            self.slot_event.waitTimeout(self.io, .{
-                .duration = .{
-                    .raw = .{ .nanoseconds = remaining.raw.nanoseconds },
-                    .clock = .awake,
-                },
-            }) catch {
+            self.io.sleep(.{ .nanoseconds = sleep_ns }, .awake) catch |err| {
                 self.mutex.lockUncancelable(self.io);
-                // Timeout: one last capacity check for races with release.
-                if (self.idle.items.len > 0 or self.open_count < self.config.max_open) return;
-                if (deadline.durationFromNow(self.io).raw.nanoseconds <= 0) return error.PoolTimeout;
-                continue;
+                return err;
             };
             self.mutex.lockUncancelable(self.io);
         }
@@ -273,7 +264,6 @@ pub const Pool = struct {
 
     fn notifyAvailable(self: *Pool) void {
         self.available.signal(self.io);
-        self.slot_event.set(self.io);
     }
 
     /// Execute a statement under a short-lived lease that is released on success
@@ -3215,6 +3205,53 @@ test "SQLite pool validates closed lifetime" {
 
     pool.deinit();
     try std.testing.expectError(error.PoolClosed, pool.acquire());
+}
+
+fn waitForSqlitePoolLease(pool: *Pool) anyerror!Lease {
+    return pool.acquireWithTimeout(std.math.maxInt(u64));
+}
+
+fn waitForTimedSqlitePoolLease(pool: *Pool) anyerror!Lease {
+    return pool.acquireWithTimeout(5 * std.time.ns_per_s);
+}
+
+test "SQLite pool shutdown drains outstanding leases and wakes waiters" {
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
+    defer pool.deinit();
+
+    var lease = try pool.acquire();
+    defer if (lease.open) lease.discard() catch {};
+    var waiter = std.testing.io.async(waitForSqlitePoolLease, .{&pool});
+    defer _ = waiter.cancel(std.testing.io) catch {};
+    var timed_waiter = std.testing.io.async(waitForTimedSqlitePoolLease, .{&pool});
+    defer _ = timed_waiter.cancel(std.testing.io) catch {};
+    var second_timed_waiter = std.testing.io.async(waitForTimedSqlitePoolLease, .{&pool});
+    defer _ = second_timed_waiter.cancel(std.testing.io) catch {};
+    try std.testing.io.sleep(.{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake);
+
+    pool.deinit();
+    try std.testing.expectError(error.PoolClosed, waiter.await(std.testing.io));
+    try std.testing.expectError(error.PoolClosed, timed_waiter.await(std.testing.io));
+    try std.testing.expectError(error.PoolClosed, second_timed_waiter.await(std.testing.io));
+    try (try lease.conn()).ping();
+    try std.testing.expectError(error.PoolClosed, lease.release());
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
+    try std.testing.expectError(error.PoolClosed, pool.acquire());
+    pool.deinit();
+}
+
+test "SQLite pooled rows can finish after pool shutdown" {
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
+    defer pool.deinit();
+
+    var rows = try pool.query("select 7 as n", &.{});
+    defer rows.deinit();
+    pool.deinit();
+
+    const row = (try rows.next()) orelse return error.NoRows;
+    try std.testing.expectEqual(@as(i64, 7), try (try row.value("n")).asInt());
+    rows.deinit();
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
 }
 
 test "SQLite migration table starts with empty status" {

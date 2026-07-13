@@ -34,7 +34,8 @@ pub const PoolStats = struct {
 /// Thread-safe PostgreSQL connection pool.
 ///
 /// Connections are established with `Conn.open` using the pool's `Io` and
-/// config. Leases must be released or discarded before `Pool.deinit`.
+/// config. `deinit` closes idle connections and marks the pool closed; existing
+/// leases remain usable and close their connection when released.
 pub const Pool = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -44,7 +45,6 @@ pub const Pool = struct {
     closed: bool = false,
     mutex: Io.Mutex = .init,
     available: Io.Condition = .init,
-    slot_event: Io.Event = .unset,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, config: PoolConfig) !Pool {
         if (config.max_open == 0) return error.InvalidArguments;
@@ -59,11 +59,15 @@ pub const Pool = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.closed) return;
-        std.debug.assert(self.open_count == self.idle.items.len);
+        self.closed = true;
+
+        const idle_count = self.idle.items.len;
         for (self.idle.items) |*c| c.deinit();
         self.idle.deinit(self.allocator);
-        self.open_count = 0;
-        self.closed = true;
+        self.idle = .empty;
+        self.open_count -= idle_count;
+
+        self.available.broadcast(self.io);
     }
 
     pub fn acquire(self: *Pool) !Lease {
@@ -138,26 +142,16 @@ pub const Pool = struct {
 
     fn waitForSlotTimed(self: *Pool, deadline: Io.Clock.Timestamp) !void {
         while (true) {
+            if (self.closed) return error.PoolClosed;
             if (self.idle.items.len > 0 or self.open_count < self.config.max_open) return;
             const remaining = deadline.durationFromNow(self.io);
             if (remaining.raw.nanoseconds <= 0) return error.PoolTimeout;
 
-            if (self.slot_event.isSet()) {
-                self.slot_event.reset();
-                continue;
-            }
-
+            const sleep_ns = @min(remaining.raw.nanoseconds, std.time.ns_per_ms);
             self.mutex.unlock(self.io);
-            self.slot_event.waitTimeout(self.io, .{
-                .duration = .{
-                    .raw = .{ .nanoseconds = remaining.raw.nanoseconds },
-                    .clock = .awake,
-                },
-            }) catch {
+            self.io.sleep(.{ .nanoseconds = sleep_ns }, .awake) catch |err| {
                 self.mutex.lockUncancelable(self.io);
-                if (self.idle.items.len > 0 or self.open_count < self.config.max_open) return;
-                if (deadline.durationFromNow(self.io).raw.nanoseconds <= 0) return error.PoolTimeout;
-                continue;
+                return err;
             };
             self.mutex.lockUncancelable(self.io);
         }
@@ -165,7 +159,6 @@ pub const Pool = struct {
 
     fn notifyAvailable(self: *Pool) void {
         self.available.signal(self.io);
-        self.slot_event.set(self.io);
     }
 
     pub fn exec(self: *Pool, sql: []const u8) !core.ExecResult {
