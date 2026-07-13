@@ -191,7 +191,7 @@ pub fn checkQuery(options: struct {
                 .star => {
                     if (proj.qualifier) |q| {
                         // table.* — qualifier must resolve to a known table/alias in scope.
-                        _ = findTableRef(resolve_scope, q) orelse return error.UnknownTable;
+                        _ = findTableRefSql(resolve_scope, q) orelse return error.UnknownTable;
                     }
                 },
                 .column, .count, .min, .max => _ = try resolveProjectionColumn(options.schema, resolve_scope, proj),
@@ -243,7 +243,7 @@ fn resolveOutputRefs(
             var alias_projection: ?Projection = null;
             for (projections) |projection| {
                 if (projection.alias) |alias| {
-                    if (std.mem.eql(u8, alias, ref.column)) {
+                    if (sqlIdentsEql(alias, ref.column)) {
                         alias_matches += 1;
                         alias_projection = projection;
                     }
@@ -256,9 +256,9 @@ fn resolveOutputRefs(
             }
         }
         if (ref.qualifier) |qualifier| {
-            _ = try resolveQualified(schema, scope, qualifier, ref.column);
+            _ = try resolveQualifiedSql(schema, scope, qualifier, ref.column);
         } else {
-            _ = try resolveField(schema, scope, ref.column);
+            _ = try resolveUnqualifiedSql(schema, scope, ref.column);
         }
     }
 }
@@ -283,7 +283,7 @@ fn resolveProjectedField(
     for (projections) |projection| {
         if (projection.kind != .star) continue;
         if (projection.qualifier) |star_qualifier| {
-            const table_ref = findTableRef(scope, star_qualifier) orelse return error.UnknownTable;
+            const table_ref = findTableRefSql(scope, star_qualifier) orelse return error.UnknownTable;
             if (field_qualifier) |qualifier| {
                 const field_ref = findTableRef(scope, qualifier) orelse return error.RowFieldNotProjected;
                 if (!std.mem.eql(u8, field_ref.name, table_ref.name)) continue;
@@ -309,30 +309,30 @@ fn resolveProjectedField(
 fn resolveProjectionColumn(schema: inspect.Schema, scope: []const TableRef, projection: Projection) CheckError!inspect.Column {
     return switch (projection.kind) {
         .column => if (projection.qualifier) |qualifier|
-            (try resolveQualified(schema, scope, qualifier, projection.column)).col
+            (try resolveQualifiedSql(schema, scope, qualifier, projection.column)).col
         else
-            (try resolveField(schema, scope, projection.column)).col,
+            (try resolveUnqualifiedSql(schema, scope, projection.column)).col,
         .count, .min, .max => try resolveAggregateProjection(schema, scope, projection),
         .star => unreachable,
     };
 }
 
 fn resolveAggregateProjection(schema: inspect.Schema, scope: []const TableRef, projection: Projection) CheckError!inspect.Column {
-    const source = if (std.mem.eql(u8, projection.column, "*"))
+    const source = if (sqlIdentEql(projection.column, "*"))
         null
     else if (projection.qualifier) |qualifier|
-        try resolveQualified(schema, scope, qualifier, projection.column)
+        try resolveQualifiedSql(schema, scope, qualifier, projection.column)
     else
-        try resolveField(schema, scope, projection.column);
+        try resolveUnqualifiedSql(schema, scope, projection.column);
 
     return switch (projection.kind) {
         .count => .{
-            .name = projection.alias orelse "count",
+            .name = "count",
             .type_name = "INT8",
             .nullable = false,
         },
         .min, .max => .{
-            .name = projection.alias orelse if (projection.kind == .min) "min" else "max",
+            .name = if (projection.kind == .min) "min" else "max",
             .type_name = source.?.col.type_name,
             // Empty input, or an all-null nullable input, produces SQL NULL.
             .nullable = true,
@@ -350,25 +350,25 @@ fn projectionMatchesField(projection: Projection, field_name: []const u8) bool {
     switch (projection.kind) {
         .count, .min, .max => {
             const alias = projection.alias orelse return false;
-            return std.mem.eql(u8, alias, field_name);
+            return sqlIdentEql(alias, field_name);
         },
         .column, .star => {},
     }
-    if (projection.alias) |alias| return std.mem.eql(u8, alias, field_name);
+    if (projection.alias) |alias| return sqlIdentEql(alias, field_name);
     if (std.mem.indexOfScalar(u8, field_name, '.')) |dot| {
         const qualifier = projection.qualifier orelse return false;
-        return std.mem.eql(u8, qualifier, field_name[0..dot]) and
-            std.mem.eql(u8, projection.column, field_name[dot + 1 ..]);
+        return sqlIdentEql(qualifier, field_name[0..dot]) and
+            sqlIdentEql(projection.column, field_name[dot + 1 ..]);
     }
-    return std.mem.eql(u8, projection.column, field_name);
+    return sqlIdentEql(projection.column, field_name);
 }
 
 fn resolveProjectionRefs(schema: inspect.Schema, scope: []const TableRef, refs: []const Projection) CheckError!void {
     for (refs) |ref| {
         if (ref.qualifier) |q| {
-            _ = try resolveQualified(schema, scope, q, ref.column);
+            _ = try resolveQualifiedSql(schema, scope, q, ref.column);
         } else {
-            _ = try resolveField(schema, scope, ref.column);
+            _ = try resolveUnqualifiedSql(schema, scope, ref.column);
         }
     }
 }
@@ -458,11 +458,51 @@ fn resolveUnqualified(schema: inspect.Schema, scope: []const TableRef, col_name:
     return found orelse error.UnknownColumn;
 }
 
+fn resolveQualifiedSql(
+    schema: inspect.Schema,
+    scope: []const TableRef,
+    qualifier: []const u8,
+    column: []const u8,
+) CheckError!ResolvedColumn {
+    const ref = findTableRefSql(scope, qualifier) orelse {
+        if (findTableSql(schema, qualifier)) |table| {
+            const col = findColumnSql(table, column) orelse return error.UnknownColumn;
+            return .{ .table = table, .col = col };
+        }
+        return error.UnknownTable;
+    };
+    const table = findTable(schema, ref.name) orelse return error.UnknownTable;
+    const col = findColumnSql(table, column) orelse return error.UnknownColumn;
+    return .{ .table = table, .col = col };
+}
+
+fn resolveUnqualifiedSql(schema: inspect.Schema, scope: []const TableRef, column: []const u8) CheckError!ResolvedColumn {
+    var found: ?ResolvedColumn = null;
+    for (scope) |ref| {
+        const table = findTable(schema, ref.name) orelse continue;
+        if (findColumnSql(table, column)) |col| {
+            if (found != null) return error.AmbiguousColumn;
+            found = .{ .table = table, .col = col };
+        }
+    }
+    return found orelse error.UnknownColumn;
+}
+
 fn findTableRef(scope: []const TableRef, qual: []const u8) ?TableRef {
     for (scope) |ref| {
         if (std.mem.eql(u8, ref.name, qual)) return ref;
         if (ref.alias) |a| {
-            if (std.mem.eql(u8, a, qual)) return ref;
+            if (sqlIdentEql(a, qual)) return ref;
+        }
+    }
+    return null;
+}
+
+fn findTableRefSql(scope: []const TableRef, qualifier: []const u8) ?TableRef {
+    for (scope) |ref| {
+        if (sqlIdentEql(qualifier, ref.name)) return ref;
+        if (ref.alias) |alias| {
+            if (sqlIdentsEql(alias, qualifier)) return ref;
         }
     }
     return null;
@@ -483,9 +523,23 @@ fn findTable(schema: inspect.Schema, name: []const u8) ?inspect.Table {
     return null;
 }
 
+fn findTableSql(schema: inspect.Schema, name: []const u8) ?inspect.Table {
+    for (schema.tables) |table| {
+        if (sqlIdentEql(name, table.name)) return table;
+    }
+    return null;
+}
+
 fn findColumn(table: inspect.Table, name: []const u8) ?inspect.Column {
     for (table.columns) |col| {
         if (std.mem.eql(u8, col.name, name)) return col;
+    }
+    return null;
+}
+
+fn findColumnSql(table: inspect.Table, name: []const u8) ?inspect.Column {
+    for (table.columns) |col| {
+        if (sqlIdentEql(name, col.name)) return col;
     }
     return null;
 }
@@ -711,13 +765,21 @@ const Scanner = struct {
         if (c == '"' or c == '`' or c == '[') {
             const open = c;
             const close: u8 = if (open == '[') ']' else open;
-            const start = self.index + 1;
+            const start = self.index;
             self.index += 1;
-            while (self.index < self.sql.len and self.sql[self.index] != close) : (self.index += 1) {}
-            if (self.index >= self.sql.len) return error.InvalidSql;
-            const slice = self.sql[start..self.index];
-            self.index += 1;
-            return slice;
+            while (self.index < self.sql.len) {
+                if (self.sql[self.index] != close) {
+                    self.index += 1;
+                    continue;
+                }
+                if (self.index + 1 < self.sql.len and self.sql[self.index + 1] == close) {
+                    self.index += 2;
+                    continue;
+                }
+                self.index += 1;
+                return self.sql[start..self.index];
+            }
+            return error.InvalidSql;
         }
         if (!(std.ascii.isAlphabetic(c) or c == '_')) return null;
         const start = self.index;
@@ -750,6 +812,71 @@ const Scanner = struct {
         return (tmp.matchKeyword(kw) catch false);
     }
 };
+
+fn sqlIdentClose(raw: []const u8) ?u8 {
+    if (raw.len < 2) return null;
+    const close: u8 = switch (raw[0]) {
+        '"' => '"',
+        '`' => '`',
+        '[' => ']',
+        else => return null,
+    };
+    return if (raw[raw.len - 1] == close) close else null;
+}
+
+const SqlIdentIterator = struct {
+    raw: []const u8,
+    index: usize,
+    end: usize,
+    close: ?u8,
+
+    fn init(raw: []const u8) SqlIdentIterator {
+        const close = sqlIdentClose(raw);
+        return .{
+            .raw = raw,
+            .index = if (close != null) 1 else 0,
+            .end = if (close != null) raw.len - 1 else raw.len,
+            .close = close,
+        };
+    }
+
+    fn next(self: *SqlIdentIterator) ?u8 {
+        if (self.index >= self.end) return null;
+        const byte = self.raw[self.index];
+        self.index += 1;
+        if (self.close != null and byte == self.close.? and
+            self.index < self.end and self.raw[self.index] == self.close.?)
+        {
+            self.index += 1;
+        }
+        return byte;
+    }
+};
+
+fn sqlIdentEql(encoded: []const u8, decoded: []const u8) bool {
+    var it = SqlIdentIterator.init(encoded);
+    var index: usize = 0;
+    while (it.next()) |byte| {
+        if (index >= decoded.len or decoded[index] != byte) return false;
+        index += 1;
+    }
+    return index == decoded.len;
+}
+
+fn sqlIdentsEql(a: []const u8, b: []const u8) bool {
+    var a_it = SqlIdentIterator.init(a);
+    var b_it = SqlIdentIterator.init(b);
+    while (true) {
+        const a_byte = a_it.next();
+        const b_byte = b_it.next();
+        if (a_byte != b_byte) return false;
+        if (a_byte == null) return true;
+    }
+}
+
+fn sqlIdentKeywordEql(encoded: []const u8, keyword: []const u8) bool {
+    return sqlIdentClose(encoded) == null and std.ascii.eqlIgnoreCase(encoded, keyword);
+}
 
 /// Advance to a keyword at statement parenthesis depth zero. Quoted strings,
 /// dollar-quoted bodies, identifiers, and comments are handled by Scanner.
@@ -857,7 +984,7 @@ fn parseFromJoinTables(
             if (sc.peek() == '(') return error.UnknownTable;
             break;
         };
-        if (std.mem.eql(u8, table_name, "*")) return error.InvalidSql;
+        if (sqlIdentEql(table_name, "*")) return error.InvalidSql;
 
         // Optional AS alias / bare alias
         var alias: ?[]const u8 = null;
@@ -895,9 +1022,9 @@ fn parseFromJoinTables(
 
         // CTE/subquery-derived relation shapes are opaque. Reject them rather
         // than falling back to unrelated schema tables and claiming success.
-        if (findTable(schema, table_name) != null) {
+        if (findTableSql(schema, table_name)) |table| {
             if (count >= max_tables) return error.TooManyTables;
-            buf[count] = .{ .name = table_name, .alias = alias };
+            buf[count] = .{ .name = table.name, .alias = alias };
             count += 1;
         } else return error.UnknownTable;
     }
@@ -963,16 +1090,16 @@ fn validateUsingClause(
     while (true) {
         try sc.skipTrivia();
         const column = try sc.readIdentOrStar() orelse return error.InvalidSql;
-        if (std.mem.eql(u8, column, "*")) return error.InvalidSql;
+        if (sqlIdentEql(column, "*")) return error.InvalidSql;
         if (clause_count >= max_projections) return error.TooManyProjections;
         for (clause_columns[0..clause_count]) |previous| {
-            if (std.mem.eql(u8, previous, column)) return error.InvalidSql;
+            if (sqlIdentsEql(previous, column)) return error.InvalidSql;
         }
         clause_columns[clause_count] = column;
         clause_count += 1;
 
         const left_exposures = usingLeftExposureCount(schema, tables[0 .. tables.len - 1], merges[0..merge_count.*], column);
-        if (left_exposures == 0 or findColumn(right, column) == null) return error.UnknownColumn;
+        if (left_exposures == 0 or findColumnSql(right, column) == null) return error.UnknownColumn;
         if (left_exposures > 1) return error.AmbiguousColumn;
         try recordUsingMerge(merges, merge_count, column);
 
@@ -996,10 +1123,10 @@ fn usingLeftExposureCount(
     var physical_count: usize = 0;
     for (left) |ref| {
         const table = findTable(schema, ref.name) orelse continue;
-        if (findColumn(table, column) != null) physical_count += 1;
+        if (findColumnSql(table, column) != null) physical_count += 1;
     }
     for (merges) |merge| {
-        if (std.mem.eql(u8, merge.column, column)) {
+        if (sqlIdentsEql(merge.column, column)) {
             return physical_count -| merge.reductions;
         }
     }
@@ -1012,7 +1139,7 @@ fn recordUsingMerge(
     column: []const u8,
 ) CheckError!void {
     for (merges[0..merge_count.*]) |*merge| {
-        if (std.mem.eql(u8, merge.column, column)) {
+        if (sqlIdentsEql(merge.column, column)) {
             merge.reductions += 1;
             return;
         }
@@ -1081,13 +1208,13 @@ fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) Ch
         } else {
             // first may be *, table, or column
             const projection_index = count;
-            if (std.mem.eql(u8, first.?, "*")) {
+            if (sqlIdentEql(first.?, "*")) {
                 buf[count] = .{ .column = "*", .kind = .star };
                 count += 1;
             } else if (sc.peek() == '.') {
                 sc.advance();
                 const second = try sc.readIdentOrStar() orelse return error.InvalidSql;
-                if (std.mem.eql(u8, second, "*")) {
+                if (sqlIdentEql(second, "*")) {
                     buf[count] = .{ .column = "*", .qualifier = first.?, .kind = .star };
                 } else {
                     buf[count] = .{ .column = second, .qualifier = first.? };
@@ -1117,9 +1244,9 @@ fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) Ch
 }
 
 fn projectionFunctionKind(name: []const u8) ?ProjectionKind {
-    if (std.ascii.eqlIgnoreCase(name, "count")) return .count;
-    if (std.ascii.eqlIgnoreCase(name, "min")) return .min;
-    if (std.ascii.eqlIgnoreCase(name, "max")) return .max;
+    if (sqlIdentKeywordEql(name, "count")) return .count;
+    if (sqlIdentKeywordEql(name, "min")) return .min;
+    if (sqlIdentKeywordEql(name, "max")) return .max;
     return null;
 }
 
@@ -1132,14 +1259,14 @@ fn parseAggregateProjection(sc: *Scanner, kind: ProjectionKind) CheckError!?Proj
     const first = try sc.readIdentOrStar() orelse return null;
 
     var projection = Projection{ .column = first, .kind = kind };
-    if (std.mem.eql(u8, first, "*")) {
+    if (sqlIdentEql(first, "*")) {
         if (kind != .count or distinct) return null;
     } else {
         try sc.skipTrivia();
         if (sc.peek() == '.') {
             sc.advance();
             const second = try sc.readIdentOrStar() orelse return null;
-            if (std.mem.eql(u8, second, "*")) return null;
+            if (sqlIdentEql(second, "*")) return null;
             projection.qualifier = first;
             projection.column = second;
         }
@@ -1163,7 +1290,7 @@ fn parseProjectionAlias(sc: *Scanner, projection: *Projection) CheckError!void {
     try sc.skipTrivia();
     if (try sc.matchKeyword("as")) {
         const alias = try sc.readIdentOrStar() orelse return error.InvalidSql;
-        if (std.mem.eql(u8, alias, "*")) return error.InvalidSql;
+        if (sqlIdentEql(alias, "*")) return error.InvalidSql;
         projection.alias = alias;
         return;
     }
@@ -1172,7 +1299,7 @@ fn parseProjectionAlias(sc: *Scanner, projection: *Projection) CheckError!void {
     const save = sc.index;
     if (!sc.startsWithKeyword("from") and sc.peek() != ',' and sc.peek() != ';') {
         if (try sc.readIdentOrStar()) |alias| {
-            if (std.mem.eql(u8, alias, "*")) return error.InvalidSql;
+            if (sqlIdentEql(alias, "*")) return error.InvalidSql;
             projection.alias = alias;
         } else {
             sc.index = save;
@@ -1290,7 +1417,7 @@ fn isSqlNoiseIdent(name: []const u8) bool {
         "xml",
     };
     for (keywords) |kw| {
-        if (std.ascii.eqlIgnoreCase(name, kw)) return true;
+        if (sqlIdentKeywordEql(name, kw)) return true;
     }
     return false;
 }
@@ -1398,12 +1525,12 @@ fn collectColumnRefs(sc: *Scanner, buf: *[max_projections]Projection, start_coun
             if (sc.index < sc.sql.len) sc.advance();
             continue;
         }
-        if (std.mem.eql(u8, first.?, "*")) continue;
+        if (sqlIdentEql(first.?, "*")) continue;
 
         try sc.skipTrivia();
 
         // CAST(x AS type) / AS type-name: skip the type token after AS.
-        if (std.ascii.eqlIgnoreCase(first.?, "as")) {
+        if (sqlIdentKeywordEql(first.?, "as")) {
             _ = try sc.readIdentOrStar();
             try sc.skipTrivia();
             if (sc.peek() == '(') try skipParenGroup(sc); // varchar(255)
@@ -1420,7 +1547,7 @@ fn collectColumnRefs(sc: *Scanner, buf: *[max_projections]Projection, start_coun
                 count = try collectParenExpr(sc, buf, count);
                 continue;
             }
-            if (std.mem.eql(u8, second, "*") or isSqlNoiseIdent(second)) continue;
+            if (sqlIdentEql(second, "*") or isSqlNoiseIdent(second)) continue;
             if (isSqlNoiseIdent(first.?)) continue;
             if (count >= max_projections) return error.TooManyProjections;
             buf[count] = .{ .column = second, .qualifier = first.? };
@@ -2119,6 +2246,65 @@ test "checkQuery resolves quoted table aliases and columns" {
         .schema = schema,
         .check_projections = true,
     }));
+}
+
+test "checkQuery decodes doubled quoted identifier delimiters" {
+    const schema = inspect.Schema{ .tables = &.{
+        .{ .name = "weird\"table", .columns = &.{
+            .{ .name = "say\"hi", .type_name = "TEXT", .nullable = false },
+            .{ .name = "from", .type_name = "TEXT", .nullable = false },
+        } },
+        .{ .name = "tick`table", .columns = &.{.{ .name = "value`name", .type_name = "TEXT", .nullable = false }} },
+        .{ .name = "left_table", .columns = &.{.{ .name = "shared\"id", .type_name = "INTEGER", .nullable = false }} },
+        .{ .name = "right_table", .columns = &.{.{ .name = "shared\"id", .type_name = "INTEGER", .nullable = false }} },
+    } };
+
+    try checkQuery(.{
+        .sql =
+        \\select "a""b"."say""hi" as "out""name"
+        \\from "weird""table" as "a""b"
+        \\where "a""b"."say""hi" is not null
+        \\group by "out""name"
+        \\order by "out""name"
+        ,
+        .schema = schema,
+        .row = &.{.{ .name = "out\"name", .type_name = "TEXT" }},
+        .check_projections = true,
+        .check_where = true,
+        .check_group_by = true,
+        .check_order_by = true,
+    });
+    try checkQuery(.{
+        .sql = "select `t``a`.`value``name` as `result``name` from `tick``table` `t``a`",
+        .schema = schema,
+        .row = &.{.{ .name = "result`name", .type_name = "TEXT" }},
+    });
+    try checkQuery(.{
+        .sql = "select \"where\".\"from\" as \"order\" from \"weird\"\"table\" as \"where\" group by \"order\"",
+        .schema = schema,
+        .row = &.{.{ .name = "order", .type_name = "TEXT" }},
+        .check_group_by = true,
+    });
+    try checkQuery(.{
+        .sql = "select l.\"shared\"\"id\" from left_table l join right_table r using (\"shared\"\"id\")",
+        .schema = schema,
+        .row = &.{.{ .name = "l.shared\"id", .type_name = "INTEGER" }},
+        .check_join_on = true,
+    });
+
+    try std.testing.expectError(error.AmbiguousProjection, checkQuery(.{
+        .sql = "select \"say\"\"hi\" as same, \"from\" as \"same\" from \"weird\"\"table\" group by same",
+        .schema = schema,
+        .check_group_by = true,
+    }));
+    try std.testing.expectError(error.InvalidSql, checkQuery(.{
+        .sql = "select \"say\"\"hi from \"weird\"\"table\"",
+        .schema = schema,
+        .check_projections = true,
+    }));
+
+    try std.testing.expect(sqlIdentEql("[bracket]]name]", "bracket]name"));
+    try std.testing.expect(sqlIdentsEql("[bracket]]name]", "\"bracket]name\""));
 }
 
 test "checkQuery ignores postgres literals and nested comments in WHERE" {

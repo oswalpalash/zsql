@@ -522,6 +522,11 @@ being checked. CTE bodies and CTE-derived relation shapes remain opaque, so
 their internal expressions and output columns are not inferred; using a
 CTE/subquery as an outer relation returns `UnknownTable`.
 
+Quoted table, column, and alias names remain allocation-free encoded slices in
+the checker. Double-quoted (`"a""b"`), backtick (`` `a``b` ``), and bracket
+(`[a]]b]`) delimiter escapes are decoded during comparison, so exact inspected
+schema names work across projections, clauses, aggregates, and JOIN USING.
+
 ### CLI
 
 Migration applies are transactional and serialized per driver. If migration SQL
