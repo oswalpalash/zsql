@@ -377,6 +377,13 @@ pub const Conn = struct {
         return null;
     }
 
+    /// Copy the last database diagnostic so it can outlive this connection.
+    /// The caller owns the result and must call `deinit` with `allocator`.
+    pub fn lastErrorOwned(self: *const Conn, allocator: std.mem.Allocator) !?core.OwnedDbError {
+        const owned = try core.OwnedDbError.from(allocator, self.lastError() orelse return null);
+        return owned;
+    }
+
     /// True when this session is synchronized, idle, and safe for pool reuse.
     pub fn isReusable(self: *const Conn) bool {
         return !self.closed and !self.broken and self.tx_status == .idle;

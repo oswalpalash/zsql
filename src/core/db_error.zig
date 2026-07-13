@@ -175,10 +175,11 @@ fn writeOptionalField(
 
 /// Allocator-owned copy of `DbError` string fields for connection-level storage.
 ///
-/// Callers that need metadata after an operation returns should use
-/// `Conn.lastError()` (borrowed from this storage) rather than parsing server
-/// messages themselves. zsql never copies bind arguments into this storage;
-/// database-provided diagnostic text may itself quote stored/input data.
+/// Connections use this for their diagnostic storage. `Conn.lastError()`
+/// returns a borrowed view; callers that need an independent lifetime can use
+/// `Conn.lastErrorOwned()` or `OwnedDbError.from()`. zsql never copies bind
+/// arguments into this storage; database-provided diagnostic text may itself
+/// quote stored/input data.
 pub const OwnedDbError = struct {
     category: ErrorCategory,
     driver: DriverKind,
@@ -237,6 +238,28 @@ pub const OwnedDbError = struct {
         };
     }
 
+    /// Deep-copy borrowed database diagnostics with an explicit allocator.
+    /// The returned value is independent of the originating connection and
+    /// must be released with `deinit` using the same allocator.
+    pub fn from(allocator: std.mem.Allocator, source: DbError) !OwnedDbError {
+        var owned: OwnedDbError = .{
+            .category = source.category,
+            .driver = source.driver,
+            .message = try allocator.dupe(u8, source.message),
+        };
+        errdefer owned.deinit(allocator);
+
+        if (source.code) |v| owned.code = try allocator.dupe(u8, v);
+        if (source.detail) |v| owned.detail = try allocator.dupe(u8, v);
+        if (source.hint) |v| owned.hint = try allocator.dupe(u8, v);
+        if (source.schema) |v| owned.schema = try allocator.dupe(u8, v);
+        if (source.table) |v| owned.table = try allocator.dupe(u8, v);
+        if (source.column) |v| owned.column = try allocator.dupe(u8, v);
+        if (source.constraint) |v| owned.constraint = try allocator.dupe(u8, v);
+        if (source.sql) |v| owned.sql = try allocator.dupe(u8, v);
+        return owned;
+    }
+
     /// Duplicate optional string fields from a PostgreSQL ErrorResponse map.
     pub fn fromPostgresFields(
         allocator: std.mem.Allocator,
@@ -244,25 +267,19 @@ pub const OwnedDbError = struct {
         zig_err: anyerror,
         sql: ?[]const u8,
     ) !OwnedDbError {
-        const message = try allocator.dupe(u8, fields.message orelse @errorName(zig_err));
-        errdefer allocator.free(message);
-
-        var owned: OwnedDbError = .{
+        return from(allocator, .{
             .category = DbError.categoryOf(zig_err),
             .driver = .postgres,
-            .message = message,
-        };
-        errdefer owned.deinit(allocator);
-
-        if (fields.code) |v| owned.code = try allocator.dupe(u8, v);
-        if (fields.detail) |v| owned.detail = try allocator.dupe(u8, v);
-        if (fields.hint) |v| owned.hint = try allocator.dupe(u8, v);
-        if (fields.schema) |v| owned.schema = try allocator.dupe(u8, v);
-        if (fields.table) |v| owned.table = try allocator.dupe(u8, v);
-        if (fields.column) |v| owned.column = try allocator.dupe(u8, v);
-        if (fields.constraint) |v| owned.constraint = try allocator.dupe(u8, v);
-        if (sql) |v| owned.sql = try allocator.dupe(u8, v);
-        return owned;
+            .code = fields.code,
+            .message = fields.message orelse @errorName(zig_err),
+            .detail = fields.detail,
+            .hint = fields.hint,
+            .schema = fields.schema,
+            .table = fields.table,
+            .column = fields.column,
+            .constraint = fields.constraint,
+            .sql = sql,
+        });
     }
 };
 
@@ -339,6 +356,50 @@ test "OwnedDbError duplicates postgres fields without secrets" {
     try std.testing.expect(std.mem.indexOf(u8, text, "ada@example.com") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "insert into") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "users_email_key") != null);
+}
+
+fn copyCompleteDbError(allocator: std.mem.Allocator) !void {
+    const source: DbError = .{
+        .category = .constraint,
+        .driver = .sqlite,
+        .code = "2067",
+        .message = "UNIQUE constraint failed: users.email",
+        .detail = "detail",
+        .hint = "hint",
+        .schema = "main",
+        .table = "users",
+        .column = "email",
+        .constraint = "users_email_key",
+        .sql = "insert into users (email) values (?)",
+    };
+    var owned = try OwnedDbError.from(allocator, source);
+    defer owned.deinit(allocator);
+}
+
+test "OwnedDbError deep-copies borrowed diagnostics and cleans up on OOM" {
+    var message = [_]u8{ 'd', 'u', 'p', 'l', 'i', 'c', 'a', 't', 'e' };
+    var sql = [_]u8{ 's', 'e', 'l', 'e', 'c', 't', ' ', '?' };
+    const source: DbError = .{
+        .category = .constraint,
+        .driver = .sqlite,
+        .code = "2067",
+        .message = &message,
+        .table = "users",
+        .column = "email",
+        .sql = &sql,
+    };
+    var owned = try OwnedDbError.from(std.testing.allocator, source);
+    defer owned.deinit(std.testing.allocator);
+
+    message[0] = 'X';
+    sql[0] = 'X';
+    const view = owned.view();
+    try std.testing.expectEqualStrings("duplicate", view.message);
+    try std.testing.expectEqualStrings("select ?", view.sql.?);
+    try std.testing.expectEqualStrings("users", view.table.?);
+    try std.testing.expectEqualStrings("email", view.column.?);
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, copyCompleteDbError, .{});
 }
 
 test "DbError default and safe formatting omit sensitive diagnostics" {

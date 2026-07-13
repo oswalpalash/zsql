@@ -13,6 +13,31 @@ const std = @import("std");
 const zsql = @import("zsql");
 const pg = zsql.drivers.postgres;
 
+test "postgres live: owned diagnostics survive connection teardown" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa_state.deinit() == .ok);
+    const allocator = gpa_state.allocator();
+
+    var owned_error = owned: {
+        const url_str = try requireUrl(allocator);
+        defer allocator.free(url_str);
+        var config = try pg.parseUrl(allocator, url_str);
+        defer config.deinit();
+        var conn = try pg.Conn.open(allocator, std.testing.io, config);
+        defer conn.deinit();
+
+        try std.testing.expectError(error.InvalidSql, conn.exec("select from"));
+        break :owned (try conn.lastErrorOwned(allocator)) orelse return error.TestExpectedEqual;
+    };
+    defer owned_error.deinit(allocator);
+
+    const db_error = owned_error.view();
+    try std.testing.expectEqualStrings("42601", db_error.code.?);
+    try std.testing.expectEqualStrings("select from", db_error.sql.?);
+    try std.testing.expect(db_error.category == .invalid_sql);
+    try std.testing.expect(db_error.driver == .postgres);
+}
+
 fn requireUrl(allocator: std.mem.Allocator) ![]u8 {
     return std.process.Environ.getAlloc(std.testing.environ, allocator, "ZSQL_PG_URL") catch return error.SkipZigTest;
 }

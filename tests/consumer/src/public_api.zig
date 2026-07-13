@@ -91,7 +91,7 @@ fn requireDriver(comptime D: type) void {
     const Migrator = zsql.Migrator(D);
 
     requireDecls(Database, .{ "open", "deinit" });
-    requireDecls(Connection, .{ "exec", "query", "prepare", "begin" });
+    requireDecls(Connection, .{ "exec", "query", "prepare", "begin", "lastError", "lastErrorOwned" });
     requireDecls(Statement, .{ "close", "exec", "query" });
     requireDecls(Rows, .{ "next", "deinit" });
     requireDecls(Row, .{ "get", "getName", "getOwned", "to" });

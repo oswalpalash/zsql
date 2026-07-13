@@ -87,8 +87,8 @@ chooses and adds one.
 - `zsql.Hooks`, `zsql.QueryStart`, `zsql.QueryEnd` (connection-local observability)
 - `zsql.StmtCache` (connection-local prepared-statement name LRU)
 - `zsql.inspect`, `zsql.check`
-- `zsql.drivers.sqlite` (`-Denable-sqlite=true`): full open/exec/query/bind/tx/savepoint/pool/migrator/schema inspect, borrowed `InterruptHandle`, and `Conn.lastError()`
-- `zsql.drivers.postgres`: native (no libpq) URL parse, SCRAM-SHA-256 / SCRAM-SHA-256-PLUS / MD5 / cleartext, simple + extended query, tx/savepoints, pool, schema inspect, owned `CancelHandle`, `Conn.lastError()`, optional `enableStmtCache`
+- `zsql.drivers.sqlite` (`-Denable-sqlite=true`): full open/exec/query/bind/tx/savepoint/pool/migrator/schema inspect, borrowed `InterruptHandle`, and borrowed/owned `Conn.lastError*()` diagnostics
+- `zsql.drivers.postgres`: native (no libpq) URL parse, SCRAM-SHA-256 / SCRAM-SHA-256-PLUS / MD5 / cleartext, simple + extended query, tx/savepoints, pool, schema inspect, owned `CancelHandle`, borrowed/owned `Conn.lastError*()` diagnostics, optional `enableStmtCache`
 
 Use a driver’s explicit marker for the generic façade, e.g.
 `zsql.Database(zsql.drivers.sqlite.Driver)` or
@@ -317,6 +317,18 @@ starting a later operation clears stale metadata, including when it succeeds.
 For SQL operations it also owns the exact statement template sent to PostgreSQL
 in `db_err.sql`; bind arguments are never interpolated into that text. Server
 fields such as `detail` remain verbatim and may themselves quote data values.
+
+To retain diagnostics across another operation, lease release, or connection
+teardown, request an allocator-owned copy:
+
+```zig
+var owned_error = (try conn.lastErrorOwned(allocator)) orelse return error.NoRows;
+defer owned_error.deinit(allocator);
+const stable_error = owned_error.view();
+```
+
+`zsql.OwnedDbError.from(allocator, db_err)` provides the same deep-copy
+operation for any borrowed `DbError` view.
 
 Format rich errors with `{f}` (or call `formatSafe`) for logs. The safe format
 keeps the driver, category, code, and escaped object identifiers while omitting
