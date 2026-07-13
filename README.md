@@ -699,6 +699,8 @@ select the same next version, the loser rescans and retries up to a fixed bound
 instead of leaving a partial file or immediately surfacing the filename race.
 The four-digit version field is minimum padding, not a ceiling; exhaustion at
 `u64` maximum returns `MigrationVersionConflict` instead of wrapping to zero.
+Atomic replacement preserves an existing regular file's permissions, so
+regenerating a private schema artifact does not silently broaden its access.
 
 Generated struct files import `zsql` themselves, map supported SQL domain types
 to `zsql.types.*`, and preserve database nullability with optional Zig fields.

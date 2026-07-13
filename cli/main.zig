@@ -82,7 +82,17 @@ fn writeFileAtomic(
     mode: AtomicWriteMode,
 ) !void {
     const replace = mode == .replace;
-    var atomic_file = try dir.createFileAtomic(io, sub_path, .{ .replace = replace });
+    const permissions: std.Io.File.Permissions = if (replace) permissions: {
+        const stat = dir.statFile(io, sub_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => break :permissions .default_file,
+            else => return err,
+        };
+        break :permissions if (stat.kind == .file) stat.permissions else .default_file;
+    } else .default_file;
+    var atomic_file = try dir.createFileAtomic(io, sub_path, .{
+        .permissions = permissions,
+        .replace = replace,
+    });
     defer atomic_file.deinit(io);
 
     try atomic_file.file.writeStreamingAll(io, bytes);
@@ -469,6 +479,24 @@ test "atomic CLI artifact replacement swaps complete contents" {
     );
     defer std.testing.allocator.free(contents);
     try std.testing.expectEqualStrings("new schema\n", contents);
+}
+
+test "atomic CLI artifact replacement preserves existing file permissions" {
+    if (!std.Io.File.Permissions.has_executable_bit) return;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const original = try tmp.dir.createFile(std.testing.io, "schema.zon", .{
+        .permissions = .fromMode(0o600),
+    });
+    try original.writeStreamingAll(std.testing.io, "old schema\n");
+    original.close(std.testing.io);
+
+    const before = try tmp.dir.statFile(std.testing.io, "schema.zon", .{});
+    try writeFileAtomic(tmp.dir, std.testing.io, "schema.zon", "new schema\n", .replace);
+    const after = try tmp.dir.statFile(std.testing.io, "schema.zon", .{});
+
+    try std.testing.expectEqual(before.permissions, after.permissions);
 }
 
 test "atomic CLI artifact creation preserves existing destination and cleans temporary file" {
