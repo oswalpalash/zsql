@@ -151,7 +151,7 @@ pub fn checkQuery(options: struct {
     const resolve_scope = if (scope.len != 0)
         scope
     else
-        schemaAsScope(options.schema, &table_buf);
+        try schemaAsScope(options.schema, &table_buf);
 
     var proj_buf: [max_projections]Projection = undefined;
     const projs = if (check_projections or check_order_by or options.row.len != 0)
@@ -302,12 +302,12 @@ fn resolveProjectionRefs(schema: inspect.Schema, scope: []const TableRef, refs: 
     }
 }
 
-fn schemaAsScope(schema: inspect.Schema, buf: *[max_tables]TableRef) []const TableRef {
-    const n = @min(schema.tables.len, max_tables);
-    for (schema.tables[0..n], 0..) |t, i| {
+fn schemaAsScope(schema: inspect.Schema, buf: *[max_tables]TableRef) CheckError![]const TableRef {
+    if (schema.tables.len > max_tables) return error.TooManyTables;
+    for (schema.tables, 0..) |t, i| {
         buf[i] = .{ .name = t.name };
     }
-    return buf[0..n];
+    return buf[0..schema.tables.len];
 }
 
 fn resolveTableScope(
@@ -707,7 +707,7 @@ fn parseFromJoinTables(sql: []const u8, schema: inspect.Schema, buf: *[max_table
     } else return buf[0..0];
 
     // After FROM: table [alias] [, table [alias]]* [JOIN table [alias] ...]*
-    while (sc.index < sc.sql.len and count < max_tables) {
+    while (sc.index < sc.sql.len) {
         try sc.skipTrivia();
         // Stop at WHERE / GROUP / ORDER / LIMIT / HAVING / UNION / RETURNING / ;
         if (sc.startsWithKeyword("where") or
@@ -1653,6 +1653,34 @@ test "checkQuery join scope with from_tables and qualified columns" {
         .from_tables = &.{ "users", "posts" },
         .row = &.{.{ .name = "email", .type_name = "TEXT" }},
     });
+}
+
+test "checkQuery rejects oversized implicit schema scope" {
+    const column = [_]inspect.Column{.{ .name = "id", .type_name = "INTEGER", .nullable = false }};
+    var tables: [max_tables + 1]inspect.Table = undefined;
+    for (&tables) |*table| {
+        table.* = .{ .name = "table", .columns = &column };
+    }
+
+    try std.testing.expectError(error.TooManyTables, checkQuery(.{
+        .sql = "select id",
+        .schema = .{ .tables = &tables },
+        .row = &.{.{ .name = "id", .type_name = "INTEGER" }},
+    }));
+
+    try std.testing.expectError(error.TooManyTables, checkQuery(.{
+        .sql =
+        \\select t1.id from table t1
+        \\join table t2 on true join table t3 on true join table t4 on true
+        \\join table t5 on true join table t6 on true join table t7 on true
+        \\join table t8 on true join table t9 on true join table t10 on true
+        \\join table t11 on true join table t12 on true join table t13 on true
+        \\join table t14 on true join table t15 on true join table t16 on true
+        \\join table t17 on true
+        ,
+        .schema = .{ .tables = tables[0..1] },
+        .row = &.{.{ .name = "id", .type_name = "INTEGER" }},
+    }));
 }
 
 test "checkQuery auto-extracts FROM/JOIN tables and aliases" {

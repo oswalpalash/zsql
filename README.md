@@ -475,6 +475,8 @@ type and nullability checks. Qualified and unqualified stars are supported;
 an output name supplied by more than one projection is rejected as ambiguous.
 `ORDER BY` may refer to a unique projection alias. Complex expression
 projections remain outside this bounded checker and are skipped.
+Checker table scope is capped at 16 tables; explicit, extracted, and implicit
+scope overflow returns `TooManyTables` rather than truncating validation.
 
 Placeholder validation is exact for anonymous `?`, SQLite indexed `?NNN`,
 PostgreSQL indexed `$N`, and named `:name` / `@name` / `$name` forms. Repeated
