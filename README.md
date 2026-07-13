@@ -156,6 +156,10 @@ startup (integer milliseconds; `0` disables). Server cancellations map to
 `error.QueryTimeout`. You can also call `conn.setStatementTimeoutMs(ms)` at
 runtime.
 
+`connect_timeout=<seconds>` bounds the complete connection setup, including
+DNS, TCP, TLS, startup, authentication, and session settings. Expiry returns
+`error.ConnectionTimeout`; `0` or omission means no connection deadline.
+
 Failed commands map SQLSTATE into fine-grained errors (`UniqueViolation`, `ForeignKeyViolation`, …) and store rich metadata on the connection:
 
 ```zig

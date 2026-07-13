@@ -9,7 +9,7 @@ coverage; PostgreSQL rows marked live also run against PostgreSQL 16 in CI.
 | Capability | Status | Public evidence | Test or example evidence |
 | --- | --- | --- | --- |
 | SQLite driver | Complete | `zsql.drivers.sqlite` | `zig build test -Denable-sqlite=true` |
-| Native PostgreSQL driver | Complete | `zsql.drivers.postgres` | `zig build test-postgres` (live in CI) |
+| Native PostgreSQL driver | Complete | `zsql.drivers.postgres`; full-open `connect_timeout` | timeout unit tests; `zig build test-postgres` (live in CI) |
 | Prepared statements | Complete | SQLite `Conn.prepare`; PostgreSQL extended protocol and optional statement cache | driver unit tests and live PostgreSQL tests |
 | Safe parameter binding | Complete | positional and named bind APIs on both drivers | driver tests; `tests/postgres_live.zig` |
 | Typed row decoding | Complete | `Row.as`, `Row.asName`, `Row.to`, `zsql.decode` | core and driver tests |

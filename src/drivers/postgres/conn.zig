@@ -72,6 +72,19 @@ pub const Conn = struct {
     pub fn open(allocator: std.mem.Allocator, io: Io, config: url.Config) !Conn {
         if (config.user.len == 0) return error.InvalidArguments;
 
+        const timeout_secs = config.connect_timeout_secs orelse 0;
+        if (timeout_secs == 0) return openUntimed(allocator, io, config);
+        return withTimeout(
+            Conn,
+            io,
+            Io.Duration.fromSeconds(timeout_secs),
+            openUntimed,
+            .{ allocator, io, config },
+            deinitConn,
+        );
+    }
+
+    fn openUntimed(allocator: std.mem.Allocator, io: Io, config: url.Config) !Conn {
         return switch (config.ssl_mode) {
             .disable, .allow => openPlain(allocator, io, config),
             .prefer => openPrefer(allocator, io, config),
@@ -79,6 +92,10 @@ pub const Conn = struct {
             .verify_ca => openRequireTls(allocator, io, config, .ca),
             .verify_full => openRequireTls(allocator, io, config, .full),
         };
+    }
+
+    fn deinitConn(conn: *Conn) void {
+        conn.deinit();
     }
 
     fn attachPeerCert(conn: *Conn, config: url.Config) !void {
@@ -1508,6 +1525,83 @@ pub const Conn = struct {
         return mapWriteError(self.writer.err);
     }
 };
+
+/// Run an allocator/resource-owning operation with a deadline. A select is
+/// used instead of `IpAddress.ConnectOptions.timeout` because Zig 0.16's
+/// threaded and kqueue backends do not implement that option. Cancelation is
+/// propagated through DNS, TCP, TLS, startup, and authentication I/O.
+fn withTimeout(
+    comptime T: type,
+    io: Io,
+    duration: Io.Duration,
+    function: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(function)),
+    comptime cleanup: *const fn (*T) void,
+) !T {
+    const Result = union(enum) {
+        completed: anyerror!T,
+        timeout: void,
+    };
+
+    var result_buffer: [2]Result = undefined;
+    var select: Io.Select(Result) = .init(io, &result_buffer);
+    select.async(.completed, function, args);
+    select.async(.timeout, timeoutAfter, .{ io, duration });
+    defer while (select.cancel()) |pending| switch (pending) {
+        .completed => |result| if (result) |value| {
+            var owned = value;
+            cleanup(&owned);
+        } else |_| {},
+        .timeout => {},
+    };
+
+    return switch (try select.await()) {
+        .completed => |result| try result,
+        .timeout => error.ConnectionTimeout,
+    };
+}
+
+fn timeoutAfter(io: Io, duration: Io.Duration) void {
+    Io.sleep(io, duration, .awake) catch {};
+}
+
+const TimeoutTestResource = struct {
+    value: u8,
+};
+
+fn timeoutTestFast(value: u8) anyerror!TimeoutTestResource {
+    return .{ .value = value };
+}
+
+fn timeoutTestSlow(io: Io) anyerror!TimeoutTestResource {
+    try io.sleep(.{ .nanoseconds = std.time.ns_per_s }, .awake);
+    return .{ .value = 1 };
+}
+
+fn cleanupTimeoutTestResource(_: *TimeoutTestResource) void {}
+
+test "withTimeout returns completed resources" {
+    const resource = try withTimeout(
+        TimeoutTestResource,
+        std.testing.io,
+        Io.Duration.fromSeconds(1),
+        timeoutTestFast,
+        .{42},
+        cleanupTimeoutTestResource,
+    );
+    try std.testing.expectEqual(@as(u8, 42), resource.value);
+}
+
+test "withTimeout cancels slow operations at the deadline" {
+    try std.testing.expectError(error.ConnectionTimeout, withTimeout(
+        TimeoutTestResource,
+        std.testing.io,
+        Io.Duration.fromMilliseconds(2),
+        timeoutTestSlow,
+        .{std.testing.io},
+        cleanupTimeoutTestResource,
+    ));
+}
 
 fn connectStream(io: Io, host: []const u8, port: u16) !net.Stream {
     if (net.IpAddress.parse(host, port)) |addr| {
