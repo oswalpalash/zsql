@@ -587,7 +587,7 @@ test "postgres live: pool commits after savepoint recovery" {
             var sp = try conn.savepoint();
             try std.testing.expectError(error.InvalidSql, conn.exec("select from"));
             try sp.rollback();
-            _ = try conn.exec("select 1");
+            _ = try conn.exec("do $$ begin null; end $$");
         }
     }.run);
     try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
