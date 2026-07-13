@@ -1326,6 +1326,11 @@ pub fn migrationStatus(allocator: std.mem.Allocator, conn: *Conn) !MigrationStat
     };
 }
 
+fn collectMigrationStatusForAllocationTest(allocator: std.mem.Allocator, conn: *Conn) !void {
+    var status = try migrationStatus(allocator, conn);
+    defer status.deinit();
+}
+
 pub fn validateMigrationStatus(conn: *Conn, migrations: []const core.migrate.MigrationFile) !void {
     var status = try migrationStatus(conn.allocator, conn);
     defer status.deinit();
@@ -3743,6 +3748,40 @@ test "SQLite migrator wrapper applies and reports status" {
     try std.testing.expectEqual(@as(usize, 1), status.records.len);
     try std.testing.expectEqual(@as(u64, 1), status.records[0].version);
     try std.testing.expect(!status.records[0].dirty);
+}
+
+test "SQLite migration status survives teardown and cleans every partial allocation" {
+    var db = try Database.open(std.testing.allocator, .{});
+    errdefer db.deinit();
+    var conn = try db.connect();
+    errdefer conn.close();
+    try ensureMigrationTable(&conn);
+
+    const first = core.migrate.checksumSql("create table first (id integer)");
+    const second = core.migrate.checksumSql("create table second (id integer)");
+    _ = try conn.exec(
+        \\insert into zsql_migrations
+        \\  (version, name, checksum, applied_at, execution_ms, dirty)
+        \\values
+        \\  (1, 'first', ?, '2026-01-01T00:00:00Z', 3, 0),
+        \\  (2, 'second', ?, '2026-01-02T00:00:00Z', 5, 1)
+    , &.{ .{ .text = &first }, .{ .text = &second } });
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        collectMigrationStatusForAllocationTest,
+        .{&conn},
+    );
+
+    var status = try migrationStatus(std.testing.allocator, &conn);
+    defer status.deinit();
+    conn.close();
+    db.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), status.records.len);
+    try std.testing.expectEqualStrings("first", status.records[0].name);
+    try std.testing.expectEqualStrings("2026-01-02T00:00:00Z", status.records[1].applied_at);
+    try std.testing.expect(status.records[1].dirty);
 }
 
 test "SQLite migration apply skips already applied migrations" {

@@ -382,6 +382,11 @@ const schema = try conn.inspectSchema(allocator);
 defer zsql.drivers.postgres.freeInspectedSchema(allocator, schema);
 ```
 
+Inspected schema graphs and `Migrator.status(allocator)` results deep-copy all
+catalog and migration-history strings. They remain valid after the originating
+connection or database is deinitialized and must be released with the
+documented schema cleanup function or `MigrationStatus.deinit`.
+
 ### PostgreSQL extensions
 
 LISTEN/NOTIFY keeps a dedicated pool lease until the listener is deinitialized:

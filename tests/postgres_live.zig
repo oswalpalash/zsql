@@ -42,6 +42,11 @@ fn requireUrl(allocator: std.mem.Allocator) ![]u8 {
     return std.process.Environ.getAlloc(std.testing.environ, allocator, "ZSQL_PG_URL") catch return error.SkipZigTest;
 }
 
+fn collectPostgresMigrationStatus(allocator: std.mem.Allocator, migrator: pg.Migrator) !void {
+    var status = try migrator.status(allocator);
+    defer status.deinit();
+}
+
 fn runCancelableQuery(conn: *pg.Conn) anyerror!zsql.ExecResult {
     return conn.exec("do $$ begin perform pg_sleep(10); end $$");
 }
@@ -626,13 +631,48 @@ test "postgres live: migrator applies pending files" {
     const second = try migrator.apply(&migrations);
     try std.testing.expectEqual(@as(usize, 0), second.applied);
 
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        collectPostgresMigrationStatus,
+        .{migrator},
+    );
     var status = try migrator.status(allocator);
     defer status.deinit();
-    try std.testing.expectEqual(@as(usize, 1), status.records.len);
-    try std.testing.expect(!status.records[0].dirty);
 
     _ = try conn.exec("drop table if exists zsql_mig_demo");
     _ = try conn.exec("drop table if exists zsql_migrations");
+    conn.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), status.records.len);
+    try std.testing.expectEqualStrings("create_demo", status.records[0].name);
+    try std.testing.expect(!status.records[0].dirty);
+}
+
+test "postgres live: inspected schema survives connection teardown" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa_state.deinit() == .ok);
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, std.testing.io, config);
+    errdefer conn.deinit();
+
+    _ = try conn.exec("create temporary table zsql_owned_schema (id bigint primary key, note text)");
+    const schema = try conn.inspectSchema(allocator);
+    defer pg.freeInspectedSchema(allocator, schema);
+    conn.deinit();
+
+    var found = false;
+    for (schema.tables) |table| {
+        if (std.mem.eql(u8, table.name, "zsql_owned_schema")) {
+            found = true;
+            try std.testing.expectEqual(@as(usize, 2), table.columns.len);
+            try std.testing.expectEqualStrings("id", table.columns[0].name);
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "postgres live: failed migration persists dirty state after rollback" {
