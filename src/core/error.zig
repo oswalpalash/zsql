@@ -32,6 +32,8 @@ pub const Error = error{
     /// Statement or query exceeded a driver/server timeout (when reported).
     QueryTimeout,
     TransactionClosed,
+    /// PostgreSQL transaction is in failed state and must be rolled back.
+    TransactionAborted,
     SavepointClosed,
     PoolClosed,
     PoolExhausted,

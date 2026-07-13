@@ -132,6 +132,12 @@ try pg_pool.withTx({}, struct {
 }.run);
 ```
 
+Transaction state is explicit: starting a nested transaction returns
+`error.ConnectionBusy`; committing or rolling back while idle returns
+`error.TransactionClosed`. PostgreSQL commands rejected inside a transaction
+put it into failed state, where `begin`/`commit` return
+`error.TransactionAborted` until `rollback` restores the session.
+
 Pool acquire timeout: `0` = non-blocking, `std.math.maxInt(u64)` = wait forever (condition), any other value = timed wait (event signal on release).
 
 Pools retain synchronized connections after recoverable SQL errors and discard

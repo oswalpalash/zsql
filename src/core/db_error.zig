@@ -64,6 +64,7 @@ pub const DbError = struct {
             error.CheckViolation,
             => .constraint,
             error.TransactionClosed,
+            error.TransactionAborted,
             error.SavepointClosed,
             error.SerializationFailure,
             error.DeadlockDetected,
@@ -206,6 +207,7 @@ test "category mapping covers core errors" {
     try std.testing.expect(DbError.categoryOf(error.ConstraintViolation) == .constraint);
     try std.testing.expect(DbError.categoryOf(error.UniqueViolation) == .constraint);
     try std.testing.expect(DbError.categoryOf(error.DeadlockDetected) == .transaction);
+    try std.testing.expect(DbError.categoryOf(error.TransactionAborted) == .transaction);
     try std.testing.expect(DbError.categoryOf(error.AuthFailed) == .auth);
     try std.testing.expect(DbError.categoryOf(error.PoolTimeout) == .pool);
     try std.testing.expect(DbError.categoryOf(error.QueryTimeout) == .connection);

@@ -513,6 +513,33 @@ test "postgres live: statement_timeout maps to QueryTimeout" {
     try std.testing.expectEqual(@as(i64, 1), try rows.next().?.as(i64, 0));
 }
 
+test "postgres live: transaction state rejects nested idle and aborted misuse" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, io, config);
+    defer conn.deinit();
+
+    try std.testing.expectError(error.TransactionClosed, conn.commit());
+    try std.testing.expectError(error.TransactionClosed, conn.rollback());
+    try conn.begin();
+    try std.testing.expectError(error.ConnectionBusy, conn.begin());
+    try std.testing.expectError(error.InvalidSql, conn.exec("select from"));
+    try std.testing.expectError(error.TransactionAborted, conn.commit());
+    try std.testing.expectError(error.TransactionAborted, conn.begin());
+    try conn.rollback();
+
+    try conn.begin();
+    try conn.commit();
+    try conn.ping();
+}
+
 test "postgres live: CancelHandle cancels an active query" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

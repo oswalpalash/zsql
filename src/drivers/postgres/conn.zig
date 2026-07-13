@@ -820,14 +820,28 @@ pub const Conn = struct {
     }
 
     pub fn begin(self: *Conn) !void {
+        if (self.closed) return error.ConnectionClosed;
+        switch (self.tx_status) {
+            .idle => {},
+            .in_transaction => return error.ConnectionBusy,
+            .failed => return error.TransactionAborted,
+        }
         _ = try self.exec("begin");
     }
 
     pub fn commit(self: *Conn) !void {
+        if (self.closed) return error.ConnectionClosed;
+        switch (self.tx_status) {
+            .idle => return error.TransactionClosed,
+            .in_transaction => {},
+            .failed => return error.TransactionAborted,
+        }
         _ = try self.exec("commit");
     }
 
     pub fn rollback(self: *Conn) !void {
+        if (self.closed) return error.ConnectionClosed;
+        if (self.tx_status == .idle) return error.TransactionClosed;
         _ = try self.exec("rollback");
     }
 

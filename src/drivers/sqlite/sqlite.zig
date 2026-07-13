@@ -2215,6 +2215,21 @@ test "SQLite transaction rollback discards changes" {
     try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
 }
 
+test "SQLite rejects nested begin and closed transaction reuse" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    var tx = try conn.begin();
+    try std.testing.expectError(error.ConnectionBusy, conn.begin());
+    try tx.rollback();
+    try std.testing.expectError(error.TransactionClosed, tx.commit());
+
+    var next = try conn.begin();
+    try next.commit();
+}
+
 test "SQLite rollbackIfOpen rolls back once" {
     var db = try Database.open(std.testing.allocator, .{});
     defer db.deinit();
