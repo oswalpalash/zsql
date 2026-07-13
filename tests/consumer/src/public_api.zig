@@ -51,12 +51,16 @@ pub fn validate() void {
             "Stmt",
             "SimpleRows",
             "SimpleRow",
+            "Notification",
             "Pool",
             "Lease",
+            "Listener",
             "Savepoint",
             "Migrator",
             "Driver",
         });
+        requireDecls(zsql.drivers.postgres.Notification, .{"deinit"});
+        requireDecls(zsql.drivers.postgres.Listener, .{ "listen", "unlisten", "next", "deinit" });
 
         if (zsql.enable_sqlite) {
             requireDriver(zsql.drivers.sqlite.Driver);

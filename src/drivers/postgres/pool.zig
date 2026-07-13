@@ -326,6 +326,16 @@ pub const Listener = struct {
 
     pub fn deinit(self: *Listener) void {
         if (self.closed) return;
+        const connection = self.lease.conn() catch {
+            self.lease.discard() catch {};
+            self.closed = true;
+            return;
+        };
+        connection.unlistenAll() catch {
+            self.lease.discard() catch {};
+            self.closed = true;
+            return;
+        };
         self.lease.release() catch self.lease.discard() catch {};
         self.closed = true;
     }

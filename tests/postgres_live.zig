@@ -670,7 +670,7 @@ test "postgres live: asynchronous notifications preserve session reuse" {
     defer config.deinit();
 
     var listener = try pg.Conn.open(allocator, std.testing.io, config);
-    defer listener.deinit();
+    errdefer listener.deinit();
     var sender = try pg.Conn.open(allocator, std.testing.io, config);
     defer sender.deinit();
 
@@ -678,11 +678,54 @@ test "postgres live: asynchronous notifications preserve session reuse" {
     _ = try sender.exec("notify zsql_live_events, 'ready'");
     var notification = try listener.nextNotification();
     defer notification.deinit(allocator);
-    try std.testing.expectEqualStrings("zsql_live_events", notification.channel);
-    try std.testing.expectEqualStrings("ready", notification.payload);
 
     try listener.unlisten("zsql_live_events");
     try listener.ping();
+    listener.deinit();
+
+    try std.testing.expectEqualStrings("zsql_live_events", notification.channel);
+    try std.testing.expectEqualStrings("ready", notification.payload);
+}
+
+test "postgres live: pooled listener clears subscriptions before reuse" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa_state.deinit() == .ok);
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+
+    var pool = try pg.Pool.init(allocator, std.testing.io, .{
+        .database = config,
+        .max_open = 1,
+        .max_idle = 1,
+    });
+    defer pool.deinit();
+    var sender = try pg.Conn.open(allocator, std.testing.io, config);
+    defer sender.deinit();
+
+    var listener = try pool.listen();
+    errdefer listener.deinit();
+    try listener.listen("zsql_pool_events");
+    _ = try sender.exec("notify zsql_pool_events, 'owned'");
+    var notification = try listener.next();
+    defer notification.deinit(allocator);
+    listener.deinit();
+
+    try std.testing.expectEqualStrings("zsql_pool_events", notification.channel);
+    try std.testing.expectEqualStrings("owned", notification.payload);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().leased);
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+
+    var lease = try pool.acquire();
+    defer if (lease.open) lease.discard() catch {};
+    var rows = try (try lease.conn()).query(
+        "select count(*)::bigint as n from pg_listening_channels()",
+    );
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 0), try rows.next().?.as(i64, 0));
+    try lease.release();
 }
 
 test "postgres live: statement cache reuses named prepares" {

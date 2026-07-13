@@ -824,6 +824,12 @@ pub const Conn = struct {
         _ = try self.exec(sql);
     }
 
+    /// Remove every LISTEN subscription using fixed trusted SQL. Pool listeners
+    /// call this before returning their connection to idle use.
+    pub fn unlistenAll(self: *Conn) !void {
+        _ = try self.exec("unlisten *");
+    }
+
     /// Wait for the next asynchronous PostgreSQL notification.
     /// The returned channel and payload are allocator-owned.
     pub fn nextNotification(self: *Conn) !Notification {
@@ -2345,10 +2351,15 @@ test "value bind packet matches protocol builder with one allocation" {
 }
 
 test "notification parser and listen quoting are strict" {
-    const body = [_]u8{ 0, 0, 0, 7, 'e', 'v', 'e', 'n', 't', 's', 0, '{', '}', 0 };
+    var body = [_]u8{ 0, 0, 0, 7, 'e', 'v', 'e', 'n', 't', 's', 0, '{', '}', 0 };
     var notification = try Notification.parse(std.testing.allocator, &body);
     defer notification.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(i32, 7), notification.pid);
+    try std.testing.expectEqualStrings("events", notification.channel);
+    try std.testing.expectEqualStrings("{}", notification.payload);
+
+    body[4] = 'X';
+    body[11] = 'X';
     try std.testing.expectEqualStrings("events", notification.channel);
     try std.testing.expectEqualStrings("{}", notification.payload);
 
@@ -2356,6 +2367,20 @@ test "notification parser and listen quoting are strict" {
     defer std.testing.allocator.free(sql);
     try std.testing.expectEqualStrings("listen \"a\"\"b\"", sql);
     try std.testing.expectError(error.InvalidArguments, listenSql(std.testing.allocator, "listen", ""));
+}
+
+fn parseNotificationForAllocationTest(allocator: std.mem.Allocator) !void {
+    const body = [_]u8{ 0, 0, 0, 7, 'e', 'v', 'e', 'n', 't', 's', 0, '{', '}', 0 };
+    var notification = try Notification.parse(allocator, &body);
+    defer notification.deinit(allocator);
+}
+
+test "notification parser cleans every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseNotificationForAllocationTest,
+        .{},
+    );
 }
 
 fn orderedNamedBinds(
