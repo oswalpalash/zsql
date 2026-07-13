@@ -4,8 +4,10 @@ const params = @import("../core/params.zig");
 
 pub const CheckError = error{
     PlaceholderCountMismatch,
+    MixedPlaceholderStyles,
     UnknownNamedParameter,
     ExtraNamedParameter,
+    DuplicateNamedParameter,
     UnknownTable,
     UnknownColumn,
     AmbiguousColumn,
@@ -97,7 +99,18 @@ pub fn checkQuery(options: struct {
     const check_order_by = options.check_order_by or level_value >= @intFromEnum(CheckLevel.result_types);
     const summary = params.summarize(options.sql) catch return error.InvalidSql;
 
+    if (summary.named != 0 and (summary.positional != 0 or summary.indexed != 0)) {
+        return error.MixedPlaceholderStyles;
+    }
+
     if (summary.named > 0) {
+        for (options.args, 0..) |arg, index| {
+            for (options.args[0..index]) |previous| {
+                if (std.mem.eql(u8, previous.name, arg.name)) {
+                    return error.DuplicateNamedParameter;
+                }
+            }
+        }
         var it = params.Iterator.init(options.sql);
         while (it.next() catch return error.InvalidSql) |ph| {
             if (ph.style != .named) continue;
@@ -123,7 +136,7 @@ pub fn checkQuery(options: struct {
             }
             if (!used) return error.ExtraNamedParameter;
         }
-    } else if (options.args.len != 0) {
+    } else {
         if (summary.expectedBindCount() != options.args.len) return error.PlaceholderCountMismatch;
     }
 
@@ -1133,6 +1146,7 @@ pub fn checkedQuery(comptime options: anytype) type {
     const check_where_value: bool = if (@hasField(@TypeOf(options), "check_where")) options.check_where else false;
     const check_join_on_value: bool = if (@hasField(@TypeOf(options), "check_join_on")) options.check_join_on else false;
     const check_order_by_value: bool = if (@hasField(@TypeOf(options), "check_order_by")) options.check_order_by else false;
+    const level_value: CheckLevel = if (@hasField(@TypeOf(options), "level")) options.level else .none;
 
     const args_value: []const ArgSpec = comptime blk: {
         if (!@hasField(@TypeOf(options), "args")) break :blk &.{};
@@ -1201,6 +1215,7 @@ pub fn checkedQuery(comptime options: anytype) type {
         pub const check_where = check_where_value;
         pub const check_join_on = check_join_on_value;
         pub const check_order_by = check_order_by_value;
+        pub const level = level_value;
 
         pub fn validate(schema: inspect.Schema) CheckError!void {
             try checkQuery(.{
@@ -1210,6 +1225,7 @@ pub fn checkedQuery(comptime options: anytype) type {
                 .row = row,
                 .from_table = from_table,
                 .from_tables = from_tables,
+                .level = level,
                 .check_projections = check_projections,
                 .check_where = check_where,
                 .check_join_on = check_join_on,
@@ -1284,6 +1300,42 @@ test "checkQuery validates named params and columns" {
         .schema = schema,
         .from_table = "users",
         .row = &.{.{ .name = "bio", .nullable = false }},
+    }));
+}
+
+test "checkQuery enforces exact placeholder contracts" {
+    const schema: inspect.Schema = .{ .tables = &.{} };
+
+    try std.testing.expectError(error.PlaceholderCountMismatch, checkQuery(.{
+        .sql = "select ?",
+        .schema = schema,
+    }));
+
+    try checkQuery(.{
+        .sql = "select $1, $1, $3",
+        .schema = schema,
+        .args = &.{ .{ .name = "one" }, .{ .name = "two" }, .{ .name = "three" } },
+    });
+    try std.testing.expectError(error.PlaceholderCountMismatch, checkQuery(.{
+        .sql = "select ?3, ?",
+        .schema = schema,
+        .args = &.{ .{ .name = "one" }, .{ .name = "two" }, .{ .name = "three" } },
+    }));
+    try checkQuery(.{
+        .sql = "select ?3, ?",
+        .schema = schema,
+        .args = &.{ .{ .name = "one" }, .{ .name = "two" }, .{ .name = "three" }, .{ .name = "four" } },
+    });
+
+    try std.testing.expectError(error.MixedPlaceholderStyles, checkQuery(.{
+        .sql = "select :id, ?",
+        .schema = schema,
+        .args = &.{.{ .name = "id" }},
+    }));
+    try std.testing.expectError(error.DuplicateNamedParameter, checkQuery(.{
+        .sql = "select :id",
+        .schema = schema,
+        .args = &.{ .{ .name = "id" }, .{ .name = "id" } },
     }));
 }
 
@@ -1573,6 +1625,12 @@ test "check level enables result-shape validation" {
         .schema = schema,
         .level = .result_shape,
     }));
+
+    const checked = checkedQuery(.{
+        .sql = "select missing from users",
+        .level = .result_shape,
+    });
+    try std.testing.expectError(error.UnknownColumn, checked.validate(schema));
 }
 
 test "checkedQuery supports from_tables and check_projections" {

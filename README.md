@@ -464,9 +464,16 @@ try get_user.validate(schema);
 ```
 
 Use `.level = .result_shape` or `.result_types` when a single progressive
-validation policy is preferable to individual clause flags. `result_shape`
-checks projections; `result_types` additionally enables WHERE/HAVING, JOIN ON,
-and ORDER BY reference validation.
+validation policy is preferable to individual clause flags; both `checkQuery`
+and `checkedQuery` preserve it. `result_shape` checks projections;
+`result_types` additionally enables WHERE/HAVING, JOIN ON, and ORDER BY
+reference validation.
+
+Placeholder validation is exact for anonymous `?`, SQLite indexed `?NNN`,
+PostgreSQL indexed `$N`, and named `:name` / `@name` / `$name` forms. Repeated
+indexes share one bind slot, anonymous indexes advance after explicit indexes,
+and mixed named/positional styles or duplicate named argument specs are
+rejected before runtime.
 
 When `from_table` / `from_tables` are omitted, `checkQuery` best-effort extracts
 `FROM` / `JOIN` table names and aliases from the SQL. `check_where`,

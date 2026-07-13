@@ -72,11 +72,20 @@ pub const Summary = struct {
     indexed: usize = 0,
     named: usize = 0,
     highest_index: usize = 0,
+    bind_count_overflow: bool = false,
 
     pub fn observe(self: *Summary, placeholder: Placeholder) void {
         self.total += 1;
         switch (placeholder.style) {
-            .positional => self.positional += 1,
+            .positional => {
+                self.positional += 1;
+                // Anonymous parameters receive the next index after every
+                // explicit index observed so far (SQLite's wire semantics).
+                self.highest_index = std.math.add(usize, self.highest_index, 1) catch blk: {
+                    self.bind_count_overflow = true;
+                    break :blk std.math.maxInt(usize);
+                };
+            },
             .indexed => {
                 self.indexed += 1;
                 self.highest_index = @max(self.highest_index, placeholder.index.?);
@@ -86,7 +95,12 @@ pub const Summary = struct {
     }
 
     pub fn expectedBindCount(self: Summary) usize {
-        return @max(self.total, self.highest_index);
+        // Named parameters need name-aware de-duplication and are validated by
+        // the caller; retain the historical occurrence count for summaries
+        // containing names. For anonymous / indexed parameters, highest_index
+        // is the actual number of bind slots, including gaps and repeats.
+        if (self.named != 0) return @max(self.total, self.highest_index);
+        return self.highest_index;
     }
 };
 
@@ -95,6 +109,7 @@ pub fn summarize(sql: []const u8) !Summary {
     var summary: Summary = .{};
     while (try iter.next()) |placeholder| {
         summary.observe(placeholder);
+        if (summary.bind_count_overflow) return error.InvalidSql;
     }
     return summary;
 }
@@ -134,8 +149,11 @@ pub const Iterator = struct {
                 '$' => {
                     // PostgreSQL dollar-quoted string literals can legally
                     // contain text that looks like bind markers. Recognize
-                    // them before considering `$name` a named parameter.
+                    // them before considering `$1` indexed or `$name` named.
                     if (try self.skipDollarQuoted()) continue;
+                    if (self.peek(1)) |next_byte| {
+                        if (std.ascii.isDigit(next_byte)) return try self.parseDollarIndexed(start);
+                    }
                     if (try self.parseNamed(start, c)) |placeholder| return placeholder;
                 },
                 ':', '@' => if (try self.parseNamed(start, c)) |placeholder| return placeholder,
@@ -165,6 +183,22 @@ pub const Iterator = struct {
         const index = try std.fmt.parseInt(usize, text, 10);
         if (index == 0) return error.InvalidSql;
 
+        return .{
+            .offset = start,
+            .len = self.index - start,
+            .style = .indexed,
+            .index = index,
+        };
+    }
+
+    fn parseDollarIndexed(self: *Iterator, start: usize) !Placeholder {
+        self.index += 1;
+        const digits_start = self.index;
+        while (self.index < self.sql.len and std.ascii.isDigit(self.sql[self.index])) {
+            self.index += 1;
+        }
+        const index = try std.fmt.parseInt(usize, self.sql[digits_start..self.index], 10);
+        if (index == 0) return error.InvalidSql;
         return .{
             .offset = start,
             .len = self.index - start,
@@ -319,7 +353,7 @@ test "summarize counts placeholders outside quotes and comments" {
 }
 
 test "iterator exposes placeholder slices" {
-    var iter = Iterator.init("select :id, ?42, $name");
+    var iter = Iterator.init("select :id, ?42, $name, $7");
 
     const first = (try iter.next()).?;
     try std.testing.expectEqual(@as(usize, 7), first.offset);
@@ -334,13 +368,35 @@ test "iterator exposes placeholder slices" {
     try std.testing.expectEqual(PlaceholderStyle.named, third.style);
     try std.testing.expectEqualStrings("name", third.name);
 
+    const fourth = (try iter.next()).?;
+    try std.testing.expectEqual(PlaceholderStyle.indexed, fourth.style);
+    try std.testing.expectEqual(@as(?usize, 7), fourth.index);
+
     try std.testing.expectEqual(@as(?Placeholder, null), try iter.next());
+}
+
+test "summary models repeated and mixed indexed bind slots" {
+    const sqlite = try summarize("select ?3, ?, ?3");
+    try std.testing.expectEqual(@as(usize, 3), sqlite.total);
+    try std.testing.expectEqual(@as(usize, 1), sqlite.positional);
+    try std.testing.expectEqual(@as(usize, 2), sqlite.indexed);
+    try std.testing.expectEqual(@as(usize, 4), sqlite.expectedBindCount());
+
+    const postgres = try summarize("select $1, $1, $3");
+    try std.testing.expectEqual(@as(usize, 3), postgres.total);
+    try std.testing.expectEqual(@as(usize, 3), postgres.indexed);
+    try std.testing.expectEqual(@as(usize, 3), postgres.expectedBindCount());
+
+    var sql_buf: [64]u8 = undefined;
+    const overflow_sql = try std.fmt.bufPrint(&sql_buf, "select ?{d}, ?", .{std.math.maxInt(usize)});
+    try std.testing.expectError(error.InvalidSql, summarize(overflow_sql));
 }
 
 test "parser rejects invalid terminated sql fragments" {
     try std.testing.expectError(error.InvalidSql, summarize("select 'unterminated"));
     try std.testing.expectError(error.InvalidSql, summarize("select /* missing close"));
     try std.testing.expectError(error.InvalidSql, summarize("select ?0"));
+    try std.testing.expectError(error.InvalidSql, summarize("select $0"));
 }
 
 test "postgres casts are not named parameters" {
