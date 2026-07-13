@@ -71,6 +71,11 @@ live server behavior remains the explicit final service-backed gate:
 ZSQL_PG_URL='postgres://…' zig build test-postgres
 ```
 
+The owner-facing [release checklist](RELEASE_CHECKLIST.md) defines version,
+license, live-service, tag-payload, and post-release evidence. The repository
+currently has no license, so a public tag remains blocked until the owner
+chooses and adds one.
+
 ### Public names
 
 - `zsql.Database(D)`, `zsql.Connection(D)`, `zsql.Statement(D)`, `zsql.ResultRows(D)`, `zsql.ResultRow(D)`

@@ -25,6 +25,7 @@ package_root="$tmp/package/$package_hash"
 test -f "$package_root/scripts/check_version_sync.sh"
 test -f "$package_root/scripts/install_smoke.sh"
 test -f "$package_root/tests/consumer/build.zig.zon"
+test -f "$package_root/RELEASE_CHECKLIST.md"
 
 (
     cd "$package_root"
