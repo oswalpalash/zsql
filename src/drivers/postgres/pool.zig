@@ -399,7 +399,16 @@ pub const Lease = struct {
         }
 
         if (self.pool.idle.items.len < self.pool.effectiveMaxIdle()) {
-            try self.pool.idle.append(self.pool.allocator, self.conn_value);
+            self.pool.idle.append(self.pool.allocator, self.conn_value) catch |err| {
+                // Release always consumes the lease. If idle storage cannot
+                // grow, close allocation-free instead of transferring a
+                // cleanup obligation back to the caller.
+                self.conn_value.deinit();
+                self.pool.open_count -|= 1;
+                self.open = false;
+                self.pool.notifyAvailable();
+                return err;
+            };
         } else {
             self.conn_value.deinit();
             self.pool.open_count -|= 1;

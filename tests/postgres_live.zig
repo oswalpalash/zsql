@@ -867,6 +867,37 @@ test "postgres live: pool acquire release" {
     try std.testing.expectEqual(@as(usize, 0), stats.leased);
 }
 
+test "postgres live: lease release consumes connection when idle growth is OOM" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa_state.deinit() == .ok);
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var pool = try pg.Pool.init(failing.allocator(), std.testing.io, .{
+        .database = config,
+        .max_open = 1,
+        .max_idle = 1,
+    });
+    defer pool.deinit();
+
+    var lease = try pool.acquire();
+    try (try lease.conn()).ping();
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, lease.release());
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(!lease.open);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().leased);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try pool.ping();
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+}
+
 test "postgres live: pooled prepared statement owns a stable lease" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

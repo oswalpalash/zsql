@@ -242,6 +242,9 @@ Pool acquire timeout: `0` = non-blocking, `std.math.maxInt(u64)` = wait forever
 Pools retain synchronized connections after recoverable SQL errors and discard
 closed, protocol-broken, or transaction-busy leases. A lease released with an
 open transaction is never returned to another borrower.
+`Lease.release` always consumes the lease; if the idle list cannot grow under
+allocation pressure, it closes the connection and returns `OutOfMemory`
+without leaving a second cleanup obligation on the caller.
 
 `Pool.deinit()` closes idle connections and wakes blocked acquirers with
 `error.PoolClosed`. Already-issued leases and pooled rows remain usable; they
