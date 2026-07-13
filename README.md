@@ -58,7 +58,9 @@ metadata and fails if the library/CLI build option drifts; `install-smoke` also
 compares the installed doctor's reported version to that manifest value.
 `zig build package-smoke` snapshots the current worktree through an isolated Git
 index, runs `zig fetch` into a clean cache, extracts the manifest-selected
-payload, and repeats its test, consumer, and install gates from that package.
+payload, and repeats its test, consumer, and install gates from that package. A
+representative static `aarch64-linux-musl` bundled-SQLite cross-build also proves
+that the fetched payload retained its target-portable sources and C dependency.
 
 Before tagging, run the complete deterministic release contract:
 
