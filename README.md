@@ -529,6 +529,9 @@ zig build check-sql
 zig build run-postgres-pool-example # skips cleanly if ZSQL_PG_URL unset
 ```
 
+Generated struct files import `zsql` themselves, map supported SQL domain types
+to `zsql.types.*`, and preserve database nullability with optional Zig fields.
+
 ## Development
 
 ```sh

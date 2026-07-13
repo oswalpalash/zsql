@@ -1,6 +1,7 @@
 const std = @import("std");
 const inspect = @import("inspect.zig");
 const params = @import("../core/params.zig");
+const sql_types = @import("../core/types.zig");
 
 pub const CheckError = error{
     PlaceholderCountMismatch,
@@ -1175,7 +1176,7 @@ pub fn checkedQuery(comptime options: anytype) type {
             for (fields, 0..) |field, i| {
                 out[i] = .{
                     .name = field.name,
-                    .type_name = zigTypeName(field.type),
+                    .type_name = checkedZigTypeName(field.name, field.type),
                     .nullable = zigTypeNullable(field.type),
                 };
             }
@@ -1251,8 +1252,18 @@ fn zigTypeName(comptime T: type) ?[]const u8 {
     if (base == i64 or base == u64 or base == isize or base == usize) return "INT8";
     if (base == f32) return "FLOAT4";
     if (base == f64) return "FLOAT8";
-    if (base == []const u8 or base == []u8) return "TEXT";
+    if (base == []const u8 or base == sql_types.Text) return "TEXT";
+    if (base == sql_types.Blob) return "BLOB";
+    if (base == sql_types.Numeric) return "NUMERIC";
+    if (base == sql_types.Uuid) return "UUID";
+    if (@typeInfo(base) == .@"enum") return "TEXT";
     return null;
+}
+
+fn checkedZigTypeName(comptime field_name: []const u8, comptime T: type) []const u8 {
+    return zigTypeName(T) orelse @compileError(
+        "checkedQuery row field `" ++ field_name ++ "` uses unsupported type `" ++ @typeName(T) ++ "`",
+    );
 }
 
 test "checkQuery validates named params and columns" {
@@ -1404,6 +1415,26 @@ test "checkedQuery accepts typed argument and row structs" {
         .args = .{ .id = i64 },
         .row = struct { id: i64, email: []const u8, bio: ?[]const u8 },
         .from_table = "users",
+    });
+    try q.validate(schema);
+}
+
+test "typed checkedQuery validates zsql domain wrappers" {
+    const schema = inspect.Schema{ .tables = &.{.{ .name = "documents", .columns = &.{
+        .{ .name = "body", .type_name = "text", .nullable = false },
+        .{ .name = "payload", .type_name = "bytea", .nullable = true },
+        .{ .name = "amount", .type_name = "numeric", .nullable = false },
+        .{ .name = "external_id", .type_name = "uuid", .nullable = false },
+    } }} };
+    const q = checkedQuery(.{
+        .sql = "select body, payload, amount, external_id from documents",
+        .row = struct {
+            body: sql_types.Text,
+            payload: ?sql_types.Blob,
+            amount: sql_types.Numeric,
+            external_id: sql_types.Uuid,
+        },
+        .from_table = "documents",
     });
     try q.validate(schema);
 }

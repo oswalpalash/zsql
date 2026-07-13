@@ -17,8 +17,8 @@ coverage; PostgreSQL rows marked live also run against PostgreSQL 16 in CI.
 | Connection pooling | Complete | `Pool(D)`, `Lease(D)`, health-aware release, shutdown draining/wakeup, stats and timeouts | SQLite recovery/lifecycle tests; PostgreSQL live tests |
 | Transactions and savepoints | Complete | explicit nested/idle/aborted states; PostgreSQL `25P02` mapping; prepared-statement transition safety; failed-state savepoint recovery; `Tx(D)`, `Savepoint(D)`, `withTx` | SQLite state tests and PostgreSQL direct/prepared/pool live tests |
 | Migrations | Complete | transactional apply, durable dirty failures, checksum-guarded API/CLI repair; `Migrator(D).up`, `.status` | SQLite repair workflow, PostgreSQL live repair tests, CLI parser tests, migration example |
-| Schema inspection | Complete | driver `inspectSchema`; CLI `inspect` | inspector tests and PostgreSQL live tests |
-| Optional offline query checks | Complete within documented bounded scope | `zsql.check`, `zsql.checkedQuery`; exact named/anonymous/SQLite/PostgreSQL indexed bind contracts | parser/shape/type tests; `zig build check-sql` |
+| Schema inspection | Complete | driver `inspectSchema`; CLI `inspect`; self-contained nullable struct generation | inspector/codegen tests and PostgreSQL live tests |
+| Optional offline query checks | Complete within documented bounded scope | `zsql.check`, `zsql.checkedQuery`; exact bind contracts; typed zsql domain wrappers | parser/shape/type tests; `zig build check-sql` |
 | Query builder | Complete | `QueryBuilder`, `ident`, `identPath`, `bind`, `rawUnsafe` | core unit tests |
 | Rich database errors | Complete | fine-grained constraints; owned SQL templates; safe default formatting; explicit sensitive diagnostics; next-operation-bounded SQLite/PostgreSQL `lastError`; move-safe SQLite row-step diagnostics | safe-format unit tests; SQLite redaction/deferred-row tests; PostgreSQL live lifetime/constraint tests |
 | Driver extension contract | Complete | `zsql.validateDriver`, concrete connection/row/ownership selectors, concrete dialect APIs | compile-time SQLite/PostgreSQL façade tests |
