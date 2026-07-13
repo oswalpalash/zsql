@@ -32,23 +32,52 @@ pub const checkedQuery = @import("check/checker.zig").checkedQuery;
 pub const StmtCache = @import("pool/stmt_cache.zig").StmtCache;
 pub const formatStmtName = @import("pool/stmt_cache.zig").formatStmtName;
 
+/// Compile-time capability contract for driver markers used by the generic
+/// ownership façade. This validates lifecycle primitives, not SQL signatures or
+/// dialect behavior; concrete driver APIs remain available for those details.
+pub fn validateDriver(comptime D: type) void {
+    comptime {
+        requireDecls(D, .{ "Database", "Pool", "Lease", "Tx", "Savepoint", "Migrator" });
+        requireDecls(D.Database, .{ "open", "deinit" });
+        requireDecls(D.Pool, .{ "init", "deinit", "acquire" });
+        requireDecls(D.Lease, .{ "conn", "release", "discard" });
+        requireDecls(D.Tx, .{ "commit", "rollback", "rollbackIfOpen" });
+        requireDecls(D.Savepoint, .{ "release", "rollback", "rollbackIfOpen" });
+        requireDecls(D.Migrator, .{ "init", "up", "status", "repairDirty" });
+    }
+}
+
+fn requireDecls(comptime T: type, comptime names: anytype) void {
+    inline for (names) |name| {
+        if (!@hasDecl(T, name)) {
+            @compileError(@typeName(T) ++ " is missing required zsql driver declaration `" ++ name ++ "`");
+        }
+    }
+}
+
 /// Driver-selected concrete types. These normalize ownership entry points, not SQL dialects.
 pub fn Database(comptime D: type) type {
+    validateDriver(D);
     return D.Database;
 }
 pub fn Pool(comptime D: type) type {
+    validateDriver(D);
     return D.Pool;
 }
 pub fn Lease(comptime D: type) type {
+    validateDriver(D);
     return D.Lease;
 }
 pub fn Tx(comptime D: type) type {
+    validateDriver(D);
     return D.Tx;
 }
 pub fn Savepoint(comptime D: type) type {
+    validateDriver(D);
     return D.Savepoint;
 }
 pub fn Migrator(comptime D: type) type {
+    validateDriver(D);
     return D.Migrator;
 }
 const options = @import("zsql_options");
@@ -101,6 +130,7 @@ test {
 
 test "driver facade resolves concrete capability types" {
     comptime {
+        validateDriver(drivers.postgres.Driver);
         _ = Database(drivers.postgres.Driver);
         _ = Pool(drivers.postgres.Driver);
         _ = Lease(drivers.postgres.Driver);
@@ -108,6 +138,7 @@ test "driver facade resolves concrete capability types" {
         _ = Savepoint(drivers.postgres.Driver);
         _ = Migrator(drivers.postgres.Driver);
         if (options.enable_sqlite) {
+            validateDriver(drivers.sqlite.Driver);
             _ = Database(drivers.sqlite.Driver);
             _ = Pool(drivers.sqlite.Driver);
             _ = Lease(drivers.sqlite.Driver);

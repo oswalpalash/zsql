@@ -27,8 +27,8 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 ### Public names
 
 - `zsql.Database(D)`, `zsql.Pool(D)`, `zsql.Lease(D)`, `zsql.Tx(D)`, `zsql.Savepoint(D)`, `zsql.Migrator(D)`
-- `zsql.Conn`, `zsql.Stmt`, `zsql.Rows`, `zsql.Row` (driver-agnostic core adapters)
-- `zsql.Rows`, `zsql.Row`, `zsql.OwnedRow`, `zsql.Value`, `zsql.OwnedValue`, `zsql.decode`
+- `zsql.Conn`, `zsql.Stmt`, `zsql.Rows`, `zsql.Row` (driver-agnostic parsing/decoding primitives; use concrete driver types for database I/O)
+- `zsql.OwnedRow`, `zsql.Value`, `zsql.OwnedValue`, `zsql.decode`
 - `zsql.ExecResult`, `zsql.Error`, `zsql.DbError`, `zsql.OwnedDbError`
 - `zsql.QueryBuilder`, `zsql.params`, `zsql.migrate`
 - `zsql.Hooks`, `zsql.QueryStart`, `zsql.QueryEnd` (connection-local observability)
@@ -40,7 +40,12 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 Use a driver’s explicit marker for the generic façade, e.g.
 `zsql.Database(zsql.drivers.sqlite.Driver)` or
 `zsql.Pool(zsql.drivers.postgres.Driver)`. The façade selects concrete driver
-types; it does not attempt to normalize SQL dialects.
+types and compile-time validates their lifecycle capabilities; driver authors
+can call `zsql.validateDriver(MyDriver)` directly. It does not normalize SQL
+dialects or erase useful ownership differences: SQLite `Database` owns the
+database handle and creates lightweight `Conn` wrappers, while PostgreSQL
+`Database` is the network `Conn` itself, so their `open` signatures remain
+driver-specific.
 
 ### SQLite
 
