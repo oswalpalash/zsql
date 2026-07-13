@@ -65,6 +65,13 @@ server reports that its name disappeared (`26000`) or that a cached plan changed
 result shape. Recovery occurs only after idle `ReadyForQuery`; statements are
 never retried from an aborted transaction or for generic SQL errors.
 
+`postgres.Pool.prepare` / `prepareNamed` return `PooledStmt`, which holds one
+dedicated lease for the statement lifetime. The lease is heap-stable so the
+statement's connection pointer remains valid even when `PooledStmt` moves.
+Closing or deinitializing the statement always happens before releasing or
+discarding its lease; a pool shutdown lets the statement finish, then closes
+the connection instead of returning it to idle.
+
 ### SQLite
 
 ```sh

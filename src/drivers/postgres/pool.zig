@@ -194,6 +194,17 @@ pub const Pool = struct {
         return result;
     }
 
+    /// Prepare a reusable statement on a dedicated lease. The lease remains
+    /// held until `PooledStmt.close` / `deinit`.
+    pub fn prepare(self: *Pool, sql: []const u8) !PooledStmt {
+        return PooledStmt.init(self, sql, false);
+    }
+
+    /// Named-placeholder variant of `prepare`.
+    pub fn prepareNamed(self: *Pool, sql: []const u8) !PooledStmt {
+        return PooledStmt.init(self, sql, true);
+    }
+
     /// Holds a lease until `PooledRows.deinit`.
     pub fn queryParams(self: *Pool, sql: []const u8, binds: []const core.Value) !PooledRows {
         var lease = try self.acquire();
@@ -413,6 +424,88 @@ pub const PooledRows = struct {
         self.lease.release() catch {
             self.lease.discard() catch {};
         };
+        self.closed = true;
+    }
+};
+
+/// Reusable PostgreSQL statement coupled to a stable heap-owned pool lease.
+/// This prevents the statement's borrowed connection pointer from dangling
+/// when the `PooledStmt` value itself moves.
+pub const PooledStmt = struct {
+    allocator: std.mem.Allocator,
+    lease: *Lease,
+    stmt: conn_mod.Stmt,
+    closed: bool = false,
+
+    fn init(pool: *Pool, sql: []const u8, named: bool) !PooledStmt {
+        const lease = try pool.allocator.create(Lease);
+        errdefer pool.allocator.destroy(lease);
+        lease.* = try pool.acquire();
+        errdefer lease.discard() catch {};
+
+        const stmt = if (named)
+            try (try lease.conn()).prepareNamed(sql)
+        else
+            try (try lease.conn()).prepare(sql);
+        return .{
+            .allocator = pool.allocator,
+            .lease = lease,
+            .stmt = stmt,
+        };
+    }
+
+    pub fn parameterCount(self: *const PooledStmt) usize {
+        return if (self.closed) 0 else self.stmt.parameterCount();
+    }
+
+    pub fn parameterOids(self: *const PooledStmt) []const i32 {
+        return if (self.closed) &.{} else self.stmt.parameterOids();
+    }
+
+    pub fn parameterNames(self: *const PooledStmt) ?[]const []const u8 {
+        return if (self.closed) null else self.stmt.parameterNames();
+    }
+
+    pub fn exec(self: *PooledStmt, binds: []const core.Value) !core.ExecResult {
+        if (self.closed) return error.StatementClosed;
+        return self.stmt.exec(binds);
+    }
+
+    pub fn query(self: *PooledStmt, binds: []const core.Value) !conn_mod.SimpleRows {
+        if (self.closed) return error.StatementClosed;
+        return self.stmt.query(binds);
+    }
+
+    pub fn execNamed(self: *PooledStmt, binds: []const core.params.NamedValue) !core.ExecResult {
+        if (self.closed) return error.StatementClosed;
+        return self.stmt.execNamed(binds);
+    }
+
+    pub fn queryNamed(self: *PooledStmt, binds: []const core.params.NamedValue) !conn_mod.SimpleRows {
+        if (self.closed) return error.StatementClosed;
+        return self.stmt.queryNamed(binds);
+    }
+
+    pub fn close(self: *PooledStmt) !void {
+        if (self.closed) return error.StatementClosed;
+        try self.stmt.close();
+        self.lease.release() catch |err| {
+            self.lease.discard() catch {};
+            self.finish();
+            return err;
+        };
+        self.finish();
+    }
+
+    pub fn deinit(self: *PooledStmt) void {
+        if (self.closed) return;
+        self.stmt.deinit();
+        self.lease.release() catch self.lease.discard() catch {};
+        self.finish();
+    }
+
+    fn finish(self: *PooledStmt) void {
+        self.allocator.destroy(self.lease);
         self.closed = true;
     }
 };

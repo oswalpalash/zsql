@@ -30,6 +30,7 @@ pub const Savepoint = conn.Savepoint;
 pub const Pool = pool.Pool;
 pub const Lease = pool.Lease;
 pub const PooledRows = pool.PooledRows;
+pub const PooledStmt = pool.PooledStmt;
 pub const Listener = pool.Listener;
 pub const PoolConfig = pool.PoolConfig;
 pub const PoolStats = pool.PoolStats;

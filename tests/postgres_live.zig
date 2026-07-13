@@ -596,6 +596,45 @@ test "postgres live: pool acquire release" {
     try std.testing.expectEqual(@as(usize, 0), stats.leased);
 }
 
+test "postgres live: pooled prepared statement owns a stable lease" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var pool = try pg.Pool.init(allocator, std.testing.io, .{
+        .database = config,
+        .max_open = 1,
+        .max_idle = 1,
+    });
+    defer pool.deinit();
+
+    var stmt = try pool.prepareNamed("select :n::int as n");
+    defer stmt.deinit();
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().leased);
+    try std.testing.expectError(error.PoolExhausted, pool.acquire());
+    try std.testing.expectEqualStrings("n", stmt.parameterNames().?[0]);
+    var first = try stmt.queryNamed(&.{.{ .name = "n", .value = .{ .integer = 7 } }});
+    defer first.deinit();
+    try std.testing.expectEqual(@as(i64, 7), try first.next().?.as(i64, 0));
+    var second = try stmt.queryNamed(&.{.{ .name = "n", .value = .{ .integer = 9 } }});
+    defer second.deinit();
+    try std.testing.expectEqual(@as(i64, 9), try second.next().?.as(i64, 0));
+    try stmt.close();
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+
+    var shutdown_stmt = try pool.prepare("select $1::int as n");
+    defer shutdown_stmt.deinit();
+    pool.deinit();
+    var after_shutdown = try shutdown_stmt.query(&.{.{ .integer = 11 }});
+    defer after_shutdown.deinit();
+    try std.testing.expectEqual(@as(i64, 11), try after_shutdown.next().?.as(i64, 0));
+    shutdown_stmt.deinit();
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
+}
+
 test "postgres live: pool shutdown drains outstanding leases and rows" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
