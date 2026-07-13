@@ -1015,7 +1015,7 @@ test "postgres live: CancelHandle cancels an active query" {
     var config = try pg.parseUrl(allocator, url_str);
     defer config.deinit();
     var conn = try pg.Conn.open(allocator, io, config);
-    defer conn.deinit();
+    errdefer conn.deinit();
     var cancel = try conn.createCancelHandle(allocator);
     defer cancel.deinit();
 
@@ -1026,9 +1026,15 @@ test "postgres live: CancelHandle cancels an active query" {
     try std.testing.expectError(error.QueryTimeout, query.await(io));
 
     // Canceling a statement must leave the original session synchronized.
-    var rows = try conn.query("select 1::int as n");
-    defer rows.deinit();
-    try std.testing.expectEqual(@as(i64, 1), try rows.next().?.as(i64, 0));
+    {
+        var rows = try conn.query("select 1::int as n");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(i64, 1), try rows.next().?.as(i64, 0));
+    }
+
+    // Endpoint and key storage are independent, so handle teardown remains
+    // valid after the originating connection has released all of its memory.
+    conn.deinit();
 }
 
 test "postgres live: SimpleRow as/to decode" {

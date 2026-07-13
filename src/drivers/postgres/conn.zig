@@ -360,14 +360,14 @@ pub const Conn = struct {
         if (self.closed) return error.ConnectionClosed;
         const backend_pid = self.backend_pid orelse return error.ProtocolError;
         const backend_secret = self.backend_secret orelse return error.ProtocolError;
-        return .{
-            .allocator = allocator,
-            .io = self.io,
-            .host = try allocator.dupe(u8, self.server_host),
-            .port = self.server_port,
-            .backend_pid = backend_pid,
-            .backend_secret = backend_secret,
-        };
+        return CancelHandle.init(
+            allocator,
+            self.io,
+            self.server_host,
+            self.server_port,
+            backend_pid,
+            backend_secret,
+        );
     }
 
     /// Borrowed view of the last ErrorResponse metadata, if any.
@@ -1883,6 +1883,24 @@ pub const CancelHandle = struct {
     backend_pid: i32,
     backend_secret: i32,
 
+    fn init(
+        allocator: std.mem.Allocator,
+        io: Io,
+        host: []const u8,
+        port: u16,
+        backend_pid: i32,
+        backend_secret: i32,
+    ) !CancelHandle {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .host = try allocator.dupe(u8, host),
+            .port = port,
+            .backend_pid = backend_pid,
+            .backend_secret = backend_secret,
+        };
+    }
+
     pub fn deinit(self: *CancelHandle) void {
         self.backend_pid = 0;
         self.backend_secret = 0;
@@ -1947,6 +1965,35 @@ test "CancelHandle rejects a non-positive request deadline" {
         error.InvalidArguments,
         handle.requestWithTimeout(Io.Duration.zero),
     );
+}
+
+fn allocateCancelHandle(allocator: std.mem.Allocator) !void {
+    var handle = try CancelHandle.init(
+        allocator,
+        std.testing.io,
+        "postgres.internal",
+        5432,
+        123,
+        456,
+    );
+    defer handle.deinit();
+}
+
+test "CancelHandle owns its endpoint and cleans up allocation failures" {
+    var host = [_]u8{ 'd', 'b', '.', 'l', 'o', 'c', 'a', 'l' };
+    var handle = try CancelHandle.init(
+        std.testing.allocator,
+        std.testing.io,
+        &host,
+        5432,
+        123,
+        456,
+    );
+    defer handle.deinit();
+
+    host[0] = 'X';
+    try std.testing.expectEqualStrings("db.local", handle.host);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocateCancelHandle, .{});
 }
 
 /// Run an allocator/resource-owning operation with a deadline. A select is

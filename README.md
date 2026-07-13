@@ -298,6 +298,9 @@ try cancel.request(); // five-second request deadline
 The interrupted query returns `error.QueryTimeout`, and the original connection
 drains through `ReadyForQuery` before it is reused. Use
 `requestWithTimeout(duration)` to choose a different cancellation deadline.
+The handle owns its endpoint and backend key copy, so it may be deinitialized
+after the connection; sending a request still requires the originating server
+session to be open.
 
 Failed commands map SQLSTATE into fine-grained errors (`UniqueViolation`, `ForeignKeyViolation`, …) and store rich metadata on the connection:
 
