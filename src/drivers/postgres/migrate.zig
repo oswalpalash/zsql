@@ -155,11 +155,16 @@ pub const Migrator = struct {
         defer st.deinit();
 
         try self.conn.begin();
-        errdefer self.conn.rollbackIfOpen();
+        var active_migration: ?core.migrate.MigrationFile = null;
+        errdefer {
+            self.conn.rollbackIfOpen();
+            if (active_migration) |migration| self.persistDirty(migration) catch {};
+        }
 
         var applied: usize = 0;
         for (migrations) |migration| {
             if (findRecord(st.records, migration.id.version) != null) continue;
+            active_migration = migration;
             if (std.mem.trim(u8, migration.sql, " \t\r\n").len == 0) return error.InvalidSql;
 
             // Mark dirty before executing migration SQL.
@@ -189,11 +194,27 @@ pub const Migrator = struct {
                     .{ .integer = try toI64(migration.id.version) },
                 },
             );
+            active_migration = null;
             applied += 1;
         }
 
         try self.conn.commit();
         return .{ .applied = applied };
+    }
+
+    fn persistDirty(self: Migrator, migration: core.migrate.MigrationFile) !void {
+        _ = try self.conn.execParams(
+            \\insert into zsql_migrations (version, name, checksum, dirty)
+            \\values ($1, $2, $3, true)
+            \\on conflict(version) do update set
+            \\  name = excluded.name,
+            \\  checksum = excluded.checksum,
+            \\  dirty = true
+        , &.{
+            .{ .integer = try toI64(migration.id.version) },
+            .{ .text = migration.id.name },
+            .{ .text = &migration.checksum },
+        });
     }
 
     /// Alias for `apply` matching the public API target (`Migrator.up`).

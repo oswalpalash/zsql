@@ -1138,11 +1138,16 @@ pub fn applyMigrations(conn: *Conn, migrations: []const core.migrate.MigrationFi
     defer status.deinit();
 
     var tx = try conn.beginImmediate();
-    defer tx.rollbackIfOpen();
+    var active_migration: ?core.migrate.MigrationFile = null;
+    errdefer {
+        tx.rollbackIfOpen();
+        if (active_migration) |migration| persistDirtyMigration(conn, migration) catch {};
+    }
 
     var applied: usize = 0;
     for (migrations) |migration| {
         if (findMigrationRecord(status.records, migration.id.version) != null) continue;
+        active_migration = migration;
         if (std.mem.trim(u8, migration.sql, " \t\r\n").len == 0) return error.InvalidSql;
 
         _ = try tx.exec(
@@ -1166,11 +1171,27 @@ pub fn applyMigrations(conn: *Conn, migrations: []const core.migrate.MigrationFi
             .{ .integer = elapsed_ms },
             .{ .integer = try sqliteVersion(migration.id.version) },
         });
+        active_migration = null;
         applied += 1;
     }
 
     try tx.commit();
     return .{ .applied = applied };
+}
+
+fn persistDirtyMigration(conn: *Conn, migration: core.migrate.MigrationFile) !void {
+    _ = try conn.exec(
+        \\insert into zsql_migrations (version, name, checksum, dirty)
+        \\values (?, ?, ?, 1)
+        \\on conflict(version) do update set
+        \\  name = excluded.name,
+        \\  checksum = excluded.checksum,
+        \\  dirty = 1
+    , &.{
+        .{ .integer = try sqliteVersion(migration.id.version) },
+        .{ .text = migration.id.name },
+        .{ .text = &migration.checksum },
+    });
 }
 
 pub const Tx = struct {
@@ -3272,7 +3293,7 @@ test "SQLite migration apply skips already applied migrations" {
     try std.testing.expectEqual(@as(usize, 0), (try applyMigrations(&conn, &migrations)).applied);
 }
 
-test "SQLite migration apply rolls back dirty marker on failure" {
+test "SQLite migration apply persists dirty marker after rollback" {
     var db = try Database.open(std.testing.allocator, .{});
     defer db.deinit();
 
@@ -3294,7 +3315,10 @@ test "SQLite migration apply rolls back dirty marker on failure" {
 
     var status = try migrationStatus(std.testing.allocator, &conn);
     defer status.deinit();
-    try std.testing.expectEqual(@as(usize, 0), status.records.len);
+    try std.testing.expectEqual(@as(usize, 1), status.records.len);
+    try std.testing.expect(status.records[0].dirty);
+    try std.testing.expectEqual(@as(u64, 1), status.records[0].version);
+    try std.testing.expectError(error.MigrationDirty, applyMigrations(&conn, &migrations));
 }
 
 test "SQLite migration apply refuses existing dirty migration state" {

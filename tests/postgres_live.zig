@@ -365,6 +365,41 @@ test "postgres live: migrator applies pending files" {
     _ = try conn.exec("drop table if exists zsql_migrations");
 }
 
+test "postgres live: failed migration persists dirty state after rollback" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, io, config);
+    defer conn.deinit();
+    _ = try conn.exec("drop table if exists zsql_migrations");
+    defer _ = conn.exec("drop table if exists zsql_migrations") catch {};
+
+    const bad_sql = "create table zsql_broken (";
+    const migrations = [_]zsql.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "broken",
+            .filename = "V0001__broken.sql",
+        },
+        .sql = bad_sql,
+        .checksum = zsql.migrate.checksumSql(bad_sql),
+    }};
+    const migrator = pg.Migrator.init(&conn);
+    try std.testing.expectError(error.InvalidSql, migrator.apply(&migrations));
+
+    var status = try migrator.status(allocator);
+    defer status.deinit();
+    try std.testing.expectEqual(@as(usize, 1), status.records.len);
+    try std.testing.expect(status.records[0].dirty);
+    try std.testing.expectError(error.MigrationDirty, migrator.apply(&migrations));
+}
+
 test "postgres live: copy in and out bytes" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

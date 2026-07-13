@@ -392,6 +392,12 @@ schema graph with `Conn.inspectSchema` and render ZON via
 
 ### CLI
 
+Migration applies are transactional and serialized per driver. If migration SQL
+fails, schema changes roll back and zsql persists that version/checksum as
+`dirty` after rollback. Later applies return `error.MigrationDirty` until an
+operator inspects and repairs or removes the failed record; zsql does not hide
+or automatically retry an uncertain migration.
+
 ```sh
 zig build run -- --help
 zig build run -- doctor
