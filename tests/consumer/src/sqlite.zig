@@ -1,7 +1,10 @@
 const std = @import("std");
 const zsql = @import("zsql");
+const public_api = @import("public_api.zig");
 
 pub fn main() !void {
+    public_api.validate();
+
     var gpa = std.heap.DebugAllocator(.{}){};
     defer std.debug.assert(gpa.deinit() == .ok);
 

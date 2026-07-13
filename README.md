@@ -44,7 +44,8 @@ app.root_module.addImport("zsql", zsql_dep.module("zsql"));
 
 The repository verifies this dependency boundary from a separate Zig package
 with `zig build consumer-smoke`; the optional system-library route is covered
-by `zig build consumer-smoke-system`.
+by `zig build consumer-smoke-system`. Both routes compile the documented root
+façade and driver lifecycle declarations before exercising runtime behavior.
 
 `zig build install-smoke` also installs the static library and CLI into a fresh
 temporary prefix and runs the installed `zsql doctor`, ensuring distribution

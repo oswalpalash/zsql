@@ -8,7 +8,7 @@ coverage; PostgreSQL rows marked live also run against PostgreSQL 16 in CI.
 
 | Capability | Status | Public evidence | Test or example evidence |
 | --- | --- | --- | --- |
-| Package consumption | Complete | Zig package module `zsql`; propagated core/bundled/system SQLite dependency options; documented `zig fetch --save=zsql` setup | separate-package core and leak-checked SQLite executables via `consumer-smoke` / `consumer-smoke-system` in CI |
+| Package consumption | Complete | Zig package module `zsql`; propagated core/bundled/system SQLite dependency options; documented `zig fetch --save=zsql` setup | separate-package public-name compile contract plus core and leak-checked SQLite executables via `consumer-smoke` / `consumer-smoke-system` in CI |
 | Installed distribution | Complete | installed `libzsql.a` and `zsql` CLI; no repository-relative runtime resources | clean-prefix `install-smoke` runs installed `zsql doctor` in CI |
 | Version integrity | Complete | `build.zig.zon` release version projected into `zsql.version` and CLI doctor | `version-sync` source gate plus installed-doctor manifest comparison |
 | Release payload | Complete | manifest `.paths` includes all library, CLI, consumer, and gate inputs | isolated-index Git archive is fetched, extracted, tested, consumed, and installed by `package-smoke` |

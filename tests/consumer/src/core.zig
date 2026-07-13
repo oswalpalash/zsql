@@ -1,7 +1,10 @@
 const std = @import("std");
 const zsql = @import("zsql");
+const public_api = @import("public_api.zig");
 
 pub fn main() !void {
+    public_api.validate();
+
     const result = zsql.ExecResult{ .rows_affected = 3 };
     if (result.rows_affected != 3) return error.InvalidResult;
 
