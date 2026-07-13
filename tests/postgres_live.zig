@@ -226,6 +226,7 @@ test "postgres live: reusable prepared statement exec query and close" {
     try insert.close();
     try named.close();
     try shape.close();
+    // Successful Close collectors consumed ReadyForQuery before reuse.
     _ = try conn.exec("deallocate all");
     var recovered_missing = try select.query(&.{.{ .integer = 1 }});
     defer recovered_missing.deinit();
@@ -235,6 +236,7 @@ test "postgres live: reusable prepared statement exec query and close" {
     try std.testing.expectError(error.StatementClosed, select.query(&.{.{ .integer = 1 }}));
     try std.testing.expectError(error.InvalidSql, conn.prepare("select from"));
     try std.testing.expectEqualStrings("select from", conn.lastError().?.sql.?);
+    // Failed prepare drained its ErrorResponse sequence before reuse.
     try conn.ping();
 }
 

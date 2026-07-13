@@ -431,6 +431,10 @@ pub const Conn = struct {
         defer self.allocator.free(sync_msg);
         try self.writeAll(close_msg);
         try self.writeAll(sync_msg);
+
+        var synchronized = false;
+        errdefer if (!synchronized) self.drainUntilReady();
+
         // Drain until ReadyForQuery (CloseComplete then ReadyForQuery).
         while (true) {
             const msg = try self.readMessage();
@@ -438,14 +442,15 @@ pub const Conn = struct {
             switch (msg.tag) {
                 .close_complete, .notice_response, .parameter_status => {},
                 .ready_for_query => {
-                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    synchronized = true;
+                    self.tx_status = protocol.parseReadyForQuery(msg.body) catch {
+                        self.broken = true;
+                        return error.ProtocolError;
+                    };
                     return;
                 },
-                .error_response => return self.failFromErrorResponse(msg.body, true, null),
-                else => {
-                    self.drainUntilReady();
-                    return error.ProtocolError;
-                },
+                .error_response => return self.failFromErrorResponse(msg.body, false, null),
+                else => return error.ProtocolError,
             }
         }
     }
@@ -615,6 +620,9 @@ pub const Conn = struct {
         try self.writeAll(describe_msg);
         try self.writeAll(sync_msg);
 
+        var synchronized = false;
+        errdefer if (!synchronized) self.drainUntilReady();
+
         var parsed = false;
         var parameter_oids: ?[]u32 = null;
         errdefer if (parameter_oids) |oids| self.allocator.free(oids);
@@ -624,33 +632,25 @@ pub const Conn = struct {
             switch (msg.tag) {
                 .parse_complete => parsed = true,
                 .parameter_description => {
-                    if (parameter_oids != null) {
-                        self.drainUntilReady();
-                        return error.ProtocolError;
-                    }
-                    parameter_oids = protocol.parseParameterDescription(msg.body, self.allocator) catch |err| {
-                        self.drainUntilReady();
-                        return err;
-                    };
+                    if (parameter_oids != null) return error.ProtocolError;
+                    parameter_oids = try protocol.parseParameterDescription(msg.body, self.allocator);
                 },
                 .row_description => {
-                    const fields = protocol.parseRowDescription(msg.body, self.allocator) catch |err| {
-                        self.drainUntilReady();
-                        return err;
-                    };
+                    const fields = try protocol.parseRowDescription(msg.body, self.allocator);
                     self.allocator.free(fields);
                 },
                 .no_data, .notice_response, .parameter_status => {},
                 .ready_for_query => {
-                    self.tx_status = try protocol.parseReadyForQuery(msg.body);
+                    synchronized = true;
+                    self.tx_status = protocol.parseReadyForQuery(msg.body) catch {
+                        self.broken = true;
+                        return error.ProtocolError;
+                    };
                     if (!parsed or parameter_oids == null) return error.ProtocolError;
                     return parameter_oids.?;
                 },
-                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
-                else => {
-                    self.drainUntilReady();
-                    return error.ProtocolError;
-                },
+                .error_response => return self.failFromErrorResponse(msg.body, false, sql),
+                else => return error.ProtocolError,
             }
         }
     }
