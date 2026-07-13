@@ -595,7 +595,11 @@ pub const Conn = struct {
             names[index] = try self.allocator.dupe(u8, name);
             initialized += 1;
         }
+        if (stmt.parameterCount() != names.len) return error.ProtocolError;
+        const bind_scratch = try self.allocator.alloc(core.Value, names.len);
+        errdefer self.allocator.free(bind_scratch);
         stmt.parameter_names = names;
+        stmt.named_bind_scratch = bind_scratch;
         return stmt;
     }
 
@@ -2093,6 +2097,19 @@ fn orderedNamedBinds(
 ) ![]core.Value {
     const ordered = try allocator.alloc(core.Value, names.len);
     errdefer allocator.free(ordered);
+    try orderNamedBindsInto(names, binds, ordered);
+    return ordered;
+}
+
+/// Validate and order named values into caller-owned scratch storage.
+/// This is allocation-free so reusable prepared statements do not allocate
+/// merely to repeat their fixed name-to-position mapping.
+fn orderNamedBindsInto(
+    names: []const []const u8,
+    binds: []const core.params.NamedValue,
+    ordered: []core.Value,
+) !void {
+    if (ordered.len != names.len) return error.InvalidArguments;
     for (names, 0..) |name, i| {
         var found: ?core.Value = null;
         for (binds) |bind| {
@@ -2112,7 +2129,6 @@ fn orderedNamedBinds(
         }
         if (!used) return error.InvalidBindValue;
     }
-    return ordered;
 }
 
 test "orderedNamedBinds orders and validates named values" {
@@ -2125,6 +2141,12 @@ test "orderedNamedBinds orders and validates named values" {
     defer std.testing.allocator.free(ordered);
     try std.testing.expectEqual(@as(i64, 7), ordered[0].integer);
     try std.testing.expectEqualStrings("ada@example.com", ordered[1].text);
+
+    var scratch: [2]core.Value = undefined;
+    try orderNamedBindsInto(&names, &binds, &scratch);
+    try std.testing.expectEqual(@as(i64, 7), scratch[0].integer);
+    try std.testing.expectEqualStrings("ada@example.com", scratch[1].text);
+    try std.testing.expectError(error.InvalidArguments, orderNamedBindsInto(&names, &binds, scratch[0..1]));
     try std.testing.expectError(error.InvalidBindValue, orderedNamedBinds(std.testing.allocator, &names, &.{
         .{ .name = "id", .value = .{ .integer = 1 } },
         .{ .name = "email", .value = .{ .text = "ada@example.com" } },
@@ -2238,6 +2260,8 @@ pub const Stmt = struct {
     sql: []u8,
     parameter_oids: []u32,
     parameter_names: ?[][]const u8 = null,
+    /// Allocated once by `prepareNamed`; reused for strict bind reordering.
+    named_bind_scratch: ?[]core.Value = null,
     open: bool = true,
 
     pub fn parameterCount(self: *const Stmt) usize {
@@ -2273,15 +2297,15 @@ pub const Stmt = struct {
 
     pub fn execNamed(self: *Stmt, binds: []const core.params.NamedValue) !core.ExecResult {
         const names = self.parameter_names orelse return error.InvalidArguments;
-        const ordered = try orderedNamedBinds(self.allocator, names, binds);
-        defer self.allocator.free(ordered);
+        const ordered = self.named_bind_scratch orelse return error.InvalidArguments;
+        try orderNamedBindsInto(names, binds, ordered);
         return self.exec(ordered);
     }
 
     pub fn queryNamed(self: *Stmt, binds: []const core.params.NamedValue) !SimpleRows {
         const names = self.parameter_names orelse return error.InvalidArguments;
-        const ordered = try orderedNamedBinds(self.allocator, names, binds);
-        defer self.allocator.free(ordered);
+        const ordered = self.named_bind_scratch orelse return error.InvalidArguments;
+        try orderNamedBindsInto(names, binds, ordered);
         return self.query(ordered);
     }
 
@@ -2333,11 +2357,13 @@ pub const Stmt = struct {
             for (names) |name| self.allocator.free(name);
             self.allocator.free(names);
         }
+        if (self.named_bind_scratch) |scratch| self.allocator.free(scratch);
         self.allocator.free(self.parameter_oids);
         self.allocator.free(self.sql);
         self.allocator.free(self.name);
         self.parameter_oids = &.{};
         self.parameter_names = null;
+        self.named_bind_scratch = null;
         self.sql = &.{};
         self.name = &.{};
         self.open = false;

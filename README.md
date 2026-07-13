@@ -58,7 +58,8 @@ validates bind counts before I/O, and reuses the server statement for
 `exec`/`query`. It borrows the connection: call `Stmt.close()` or `deinit()`
 before moving or deinitializing that `Conn`. `Conn.prepareNamed` rewrites named
 placeholders once and copies their names; `Stmt.execNamed` / `queryNamed` reject
-missing, duplicate, or extra binds before execution.
+missing, duplicate, or extra binds before execution. Named statements allocate
+their ordering scratch once during prepare and reuse it on every call.
 
 An explicit PostgreSQL statement performs one safe automatic reprepare when the
 server reports that its name disappeared (`26000`) or that a cached plan changed
