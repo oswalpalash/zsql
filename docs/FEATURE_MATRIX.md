@@ -20,7 +20,7 @@ coverage; PostgreSQL rows marked live also run against PostgreSQL 16 in CI.
 | Schema inspection | Complete | driver `inspectSchema`; CLI `inspect` | inspector tests and PostgreSQL live tests |
 | Optional offline query checks | Complete within documented bounded scope | `zsql.check`, `zsql.checkedQuery` | `zig build check-sql` |
 | Query builder | Complete | `QueryBuilder`, `ident`, `identPath`, `bind`, `rawUnsafe` | core unit tests |
-| Rich database errors | Complete | fine-grained SQLite constraints; `DbError`, `OwnedDbError`, PostgreSQL `lastError` | SQLite extended-code tests; SQLSTATE and live constraint tests |
+| Rich database errors | Complete | fine-grained constraints; connection-owned SQLite/PostgreSQL `lastError`; `DbError`, `OwnedDbError` | SQLite redaction/extended-code tests; SQLSTATE and live constraint tests |
 | No ORM or hidden global runtime | By design | raw SQL APIs and explicit allocators on owning entry points | API review and leak-checked examples |
 
 ## Acceptance commands

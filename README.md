@@ -34,7 +34,7 @@ Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQ
 - `zsql.Hooks`, `zsql.QueryStart`, `zsql.QueryEnd` (connection-local observability)
 - `zsql.StmtCache` (connection-local prepared-statement name LRU)
 - `zsql.inspect`, `zsql.check`
-- `zsql.drivers.sqlite` (`-Denable-sqlite=true`): full open/exec/query/bind/tx/savepoint/pool/migrator/schema inspect and borrowed `InterruptHandle`
+- `zsql.drivers.sqlite` (`-Denable-sqlite=true`): full open/exec/query/bind/tx/savepoint/pool/migrator/schema inspect, borrowed `InterruptHandle`, and `Conn.lastError()`
 - `zsql.drivers.postgres`: native (no libpq) URL parse, SCRAM-SHA-256 / SCRAM-SHA-256-PLUS / MD5 / cleartext, simple + extended query, tx/savepoints, pool, schema inspect, owned `CancelHandle`, `Conn.lastError()`, optional `enableStmtCache`
 
 Use a driver’s explicit marker for the generic façade, e.g.
@@ -214,6 +214,11 @@ conn.execParams(...) catch |err| {
 ```
 
 After `ErrorResponse`, the driver drains to `ReadyForQuery` so the connection stays usable.
+
+SQLite exposes the same borrowed `Conn.lastError()` shape with its numeric
+extended result code, diagnostic message, and statement text. It duplicates
+connection-owned metadata immediately and never stores bind parameter values;
+a subsequent operation or `Conn.close()` clears the previous diagnostic.
 
 Optional prepared-statement cache (connection-local, no global state):
 

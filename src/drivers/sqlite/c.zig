@@ -51,6 +51,8 @@ pub extern fn sqlite3_open_v2(
 
 pub extern fn sqlite3_close_v2(db: ?*sqlite3) c_int;
 pub extern fn sqlite3_extended_result_codes(db: ?*sqlite3, onoff: c_int) c_int;
+pub extern fn sqlite3_extended_errcode(db: ?*sqlite3) c_int;
+pub extern fn sqlite3_errmsg(db: ?*sqlite3) [*:0]const u8;
 
 /// Interrupt a currently executing operation on this database connection.
 /// SQLite permits this call from a different thread.

@@ -582,6 +582,8 @@ pub const Conn = struct {
     handle: *c.sqlite3,
     closed: bool = false,
     transaction_open: bool = false,
+    /// Last allocator-owned SQLite diagnostic; exposed as a borrowed view.
+    last_error: ?core.OwnedDbError = null,
     /// Optional prepared-statement handle cache for this connection.
     prepared_cache: ?PreparedCache = null,
     /// Connection-local observability hooks (no global registry).
@@ -589,12 +591,49 @@ pub const Conn = struct {
 
     pub fn close(self: *Conn) void {
         self.disableStmtCache();
+        self.clearLastError();
         self.closed = true;
     }
 
     /// True when this connection is safe to return to an idle pool.
     pub fn isReusable(self: *const Conn) bool {
         return !self.closed and !self.transaction_open;
+    }
+
+    /// Borrowed SQLite error metadata valid until the next operation or close.
+    /// Contains statement text but never bind parameter values.
+    pub fn lastError(self: *const Conn) ?core.DbError {
+        if (self.last_error) |*owned| return owned.view();
+        return null;
+    }
+
+    fn clearLastError(self: *Conn) void {
+        if (self.last_error) |*owned| {
+            owned.deinit(self.allocator);
+            self.last_error = null;
+        }
+    }
+
+    fn captureLastError(self: *Conn, err: anyerror, sql: []const u8) void {
+        self.clearLastError();
+        const message_view = std.mem.span(c.sqlite3_errmsg(self.handle));
+        const message = self.allocator.dupe(u8, message_view) catch return;
+        const code = std.fmt.allocPrint(self.allocator, "{d}", .{c.sqlite3_extended_errcode(self.handle)}) catch {
+            self.allocator.free(message);
+            return;
+        };
+        const sql_copy = self.allocator.dupe(u8, sql) catch {
+            self.allocator.free(code);
+            self.allocator.free(message);
+            return;
+        };
+        self.last_error = .{
+            .category = core.DbError.categoryOf(err),
+            .driver = .sqlite,
+            .code = code,
+            .message = message,
+            .sql = sql_copy,
+        };
     }
 
     /// Create a borrowed cross-task interrupt handle.
@@ -632,7 +671,11 @@ pub const Conn = struct {
 
     pub fn prepare(self: *Conn, sql: []const u8) !Stmt {
         if (self.closed) return error.ConnectionClosed;
-        return Stmt.init(self.allocator, self.handle, sql);
+        self.clearLastError();
+        return Stmt.init(self.allocator, self.handle, sql) catch |err| {
+            self.captureLastError(err, sql);
+            return err;
+        };
     }
 
     /// Prepare with optional cache reuse. Returned `Prepared` owns cleanup policy.
@@ -657,6 +700,7 @@ pub const Conn = struct {
     }
 
     pub fn exec(self: *Conn, sql: []const u8, binds: []const core.Value) !core.ExecResult {
+        self.clearLastError();
         const observe = !self.hooks.isEmpty();
         const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
         if (observe) {
@@ -666,9 +710,21 @@ pub const Conn = struct {
                 .bind_count = binds.len,
             });
         }
-        var prepared = try self.prepareCached(sql);
+        var prepared = self.prepareCached(sql) catch |err| {
+            self.captureLastError(err, sql);
+            if (observe) {
+                self.hooks.emitAfter(.{
+                    .driver = .sqlite,
+                    .sql = sql,
+                    .duration_ns = core.hooks.durationSince(start_ns),
+                    .err = core.hooks.categoryOfErr(err),
+                });
+            }
+            return err;
+        };
         defer prepared.release();
         const result = prepared.stmt.exec(binds) catch |err| {
+            self.captureLastError(err, sql);
             if (observe) {
                 self.hooks.emitAfter(.{
                     .driver = .sqlite,
@@ -692,10 +748,15 @@ pub const Conn = struct {
 
     pub fn execScript(self: *Conn, sql: []const u8) !void {
         if (self.closed) return error.ConnectionClosed;
-        try execScriptSql(self.allocator, self.handle, sql);
+        self.clearLastError();
+        execScriptSql(self.allocator, self.handle, sql) catch |err| {
+            self.captureLastError(err, sql);
+            return err;
+        };
     }
 
     pub fn query(self: *Conn, sql: []const u8, binds: []const core.Value) !Rows {
+        self.clearLastError();
         // Hooks fire for prepare/bind start; row iteration is not instrumented.
         const observe = !self.hooks.isEmpty();
         const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
@@ -707,6 +768,7 @@ pub const Conn = struct {
             });
         }
         var prepared = self.prepareCached(sql) catch |err| {
+            self.captureLastError(err, sql);
             if (observe) {
                 self.hooks.emitAfter(.{
                     .driver = .sqlite,
@@ -719,6 +781,7 @@ pub const Conn = struct {
         };
         errdefer prepared.release();
         const rows = Rows.initOwned(prepared.stmt, binds, !prepared.from_cache) catch |err| {
+            self.captureLastError(err, sql);
             if (observe) {
                 self.hooks.emitAfter(.{
                     .driver = .sqlite,
@@ -775,15 +838,29 @@ pub const Conn = struct {
     }
 
     pub fn execNamed(self: *Conn, sql: []const u8, binds: []const NamedValue) !core.ExecResult {
-        var prepared = try self.prepareCached(sql);
+        self.clearLastError();
+        var prepared = self.prepareCached(sql) catch |err| {
+            self.captureLastError(err, sql);
+            return err;
+        };
         defer prepared.release();
-        return prepared.stmt.execNamed(binds);
+        return prepared.stmt.execNamed(binds) catch |err| {
+            self.captureLastError(err, sql);
+            return err;
+        };
     }
 
     pub fn queryNamed(self: *Conn, sql: []const u8, binds: []const NamedValue) !Rows {
-        var prepared = try self.prepareCached(sql);
+        self.clearLastError();
+        var prepared = self.prepareCached(sql) catch |err| {
+            self.captureLastError(err, sql);
+            return err;
+        };
         errdefer prepared.release();
-        return Rows.initOwnedNamed(prepared.stmt, binds, !prepared.from_cache);
+        return Rows.initOwnedNamed(prepared.stmt, binds, !prepared.from_cache) catch |err| {
+            self.captureLastError(err, sql);
+            return err;
+        };
     }
 
     pub fn begin(self: *Conn) !Tx {
@@ -1809,6 +1886,32 @@ test "SQLite maps extended constraint result codes" {
         &.{},
     ));
     try conn.ping();
+}
+
+test "SQLite lastError owns diagnostics and excludes bind values" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+    _ = try conn.exec("create table diagnostic_users (email text unique)", &.{});
+
+    const sql = "insert into diagnostic_users (email) values (?)";
+    const secret = "never-store-this-bind-value";
+    _ = try conn.exec(sql, &.{.{ .text = secret }});
+    try std.testing.expectError(error.UniqueViolation, conn.exec(sql, &.{.{ .text = secret }}));
+
+    const db_err = conn.lastError() orelse return error.TestExpectedEqual;
+    try std.testing.expect(db_err.driver == .sqlite);
+    try std.testing.expect(db_err.category == .constraint);
+    try std.testing.expectEqualStrings("2067", db_err.code.?);
+    try std.testing.expect(std.mem.indexOf(u8, db_err.message, "UNIQUE constraint failed") != null);
+    try std.testing.expectEqualStrings(sql, db_err.sql.?);
+    try std.testing.expect(std.mem.indexOf(u8, db_err.message, secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, db_err.code.?, secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, db_err.sql.?, secret) == null);
+
+    try conn.ping();
+    try std.testing.expectEqual(@as(?core.DbError, null), conn.lastError());
 }
 
 fn advanceRowsForInterrupt(rows: *Rows) anyerror!?core.Row {
