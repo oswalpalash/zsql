@@ -81,6 +81,19 @@ pub fn main() !void {
     });
     try user_aggregates.validate(schema);
 
+    const users_by_state = zsql.checkedQuery(.{
+        .sql =
+        \\select active as state, count(*) as total
+        \\from users
+        \\group by state
+        \\order by state
+        ,
+        .row = struct { state: i64, total: i64 },
+        .check_group_by = true,
+        .check_order_by = true,
+    });
+    try users_by_state.validate(schema);
+
     var buffer: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     try zsql.inspect.writeSchemaZon(&writer, schema);

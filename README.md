@@ -11,7 +11,8 @@ It gives you:
 - connection pooling
 - transactions and savepoints
 - migrations
-- optional offline query checks (JOIN scope, SELECT projections, optional WHERE / JOIN ON / ORDER BY column refs)
+- optional offline query checks (JOIN scope, SELECT projections, and bounded
+  WHERE / JOIN ON / GROUP BY / ORDER BY column refs)
 
 It does not give you:
 - an ORM
@@ -448,6 +449,7 @@ try zsql.check.checkQuery(.{
     .check_projections = true, // also parse SELECT list against the scope
     .check_where = true, // resolve bare/qualified column refs in WHERE/HAVING
     .check_join_on = true, // resolve column refs in JOIN ON clauses
+    .check_group_by = true, // resolve GROUP BY refs and unique SELECT aliases
     .check_order_by = true, // resolve column refs in ORDER BY
 });
 
@@ -466,22 +468,22 @@ try get_user.validate(schema);
 Use `.level = .result_shape` or `.result_types` when a single progressive
 validation policy is preferable to individual clause flags; both `checkQuery`
 and `checkedQuery` preserve it. `result_shape` checks projections;
-`result_types` additionally enables WHERE/HAVING, JOIN ON, and ORDER BY
-reference validation.
+`result_types` additionally enables WHERE/HAVING, JOIN ON, GROUP BY, and ORDER
+BY reference validation.
 
 Every declared row field must map to a returned simple column projection.
 Projection aliases are the result field names and retain the source column's
 type and nullability checks. Qualified and unqualified stars are supported;
 an output name supplied by more than one projection is rejected as ambiguous.
 Portable built-in `COUNT(*)` and `COUNT([DISTINCT] simple_column)` projections
-are also supported when explicitly aliased; their result is checked as non-null `INT8`
-(`i64` in typed rows), and column arguments must resolve in scope. Explicitly
-aliased built-in `MIN(simple_column)` and `MAX(simple_column)` preserve the
-source type and are always checked as nullable, so typed row fields must be optional.
-`ORDER BY` may refer to a unique projection alias. Dialect-sensitive
-`SUM`/`AVG`, casts, DISTINCT extrema, window/filter clauses, and arbitrary
-expression projections cannot supply a checked row field and remain outside
-this bounded checker.
+are also supported when explicitly aliased; their result is checked as
+non-null `INT8` (`i64` in typed rows), and column arguments must resolve in
+scope. Explicitly aliased built-in `MIN(simple_column)` and
+`MAX(simple_column)` preserve the source type and are always checked as
+nullable, so typed row fields must be optional. `GROUP BY` and `ORDER BY` may
+refer to a unique projection alias. Dialect-sensitive `SUM`/`AVG`, casts,
+DISTINCT extrema, window/filter clauses, and arbitrary expression projections
+cannot supply a checked row field and remain outside this bounded checker.
 Checker table scope is capped at 16 tables; explicit, extracted, and implicit
 scope overflow returns `TooManyTables` rather than truncating validation.
 
@@ -500,10 +502,12 @@ representations.
 
 When `from_table` / `from_tables` are omitted, `checkQuery` best-effort extracts
 `FROM` / `JOIN` table names and aliases from the SQL. `check_where`,
-`check_join_on`, and `check_order_by` are opt-in: they resolve simple column refs
-(including those inside function arguments like `lower(email)`), while skipping
-keywords, binds, casts, and function *names*. SQLite and PostgreSQL can build a
-schema graph with `Conn.inspectSchema` and render ZON via
+`check_join_on`, `check_group_by`, and `check_order_by` are opt-in: they resolve
+simple column refs (including those inside function arguments like
+`lower(email)`), while skipping keywords, binds, casts, and function *names*.
+GROUP BY validation checks reference existence and unique result aliases; it
+does not attempt to prove full SQL grouping legality. SQLite and PostgreSQL can
+build a schema graph with `Conn.inspectSchema` and render ZON via
 `zsql.inspect.writeSchemaZon`. Applications load an embedded artifact with
 `parseSchemaZon` and release its allocator-owned graph with
 `freeParsedSchemaZon`.

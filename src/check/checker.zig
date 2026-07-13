@@ -79,7 +79,7 @@ const max_projections = 64;
 /// (`users.email` / `u.email`), optional SELECT-list projection checks
 /// (`check_projections`), optional WHERE column checks (`check_where`), optional
 /// JOIN ON column checks (`check_join_on`), and optional ORDER BY column checks
-/// (`check_order_by`).
+/// (`check_order_by`), and optional GROUP BY column checks (`check_group_by`).
 ///
 /// Values are never required at check time. Allocation-free.
 pub fn checkQuery(options: struct {
@@ -102,6 +102,9 @@ pub fn checkQuery(options: struct {
     check_where: bool = false,
     /// When true, parse simple JOIN ON column references the same way as WHERE.
     check_join_on: bool = false,
+    /// When true, parse simple GROUP BY column references and unique SELECT
+    /// aliases. Positional ordinals are ignored.
+    check_group_by: bool = false,
     /// When true, parse simple ORDER BY column references the same way as WHERE.
     /// Positional sorts (`ORDER BY 1`) and keywords (`ASC`/`DESC`) are ignored.
     check_order_by: bool = false,
@@ -110,6 +113,7 @@ pub fn checkQuery(options: struct {
     const check_projections = options.check_projections or level_value >= @intFromEnum(CheckLevel.result_shape);
     const check_where = options.check_where or level_value >= @intFromEnum(CheckLevel.result_types);
     const check_join_on = options.check_join_on or level_value >= @intFromEnum(CheckLevel.result_types);
+    const check_group_by = options.check_group_by or level_value >= @intFromEnum(CheckLevel.result_types);
     const check_order_by = options.check_order_by or level_value >= @intFromEnum(CheckLevel.result_types);
     const summary = params.summarize(options.sql) catch return error.InvalidSql;
 
@@ -163,7 +167,7 @@ pub fn checkQuery(options: struct {
         try schemaAsScope(options.schema, &table_buf);
 
     var proj_buf: [max_projections]Projection = undefined;
-    const projs = if (check_projections or check_order_by or options.row.len != 0)
+    const projs = if (check_projections or check_group_by or check_order_by or options.row.len != 0)
         try parseSelectProjections(options.sql, &proj_buf)
     else
         proj_buf[0..0];
@@ -184,14 +188,7 @@ pub fn checkQuery(options: struct {
                         _ = findTableRef(resolve_scope, q) orelse return error.UnknownTable;
                     }
                 },
-                .count, .min, .max => _ = try resolveAggregateProjection(options.schema, resolve_scope, proj),
-                .column => {
-                    if (proj.qualifier) |q| {
-                        _ = try resolveQualified(options.schema, resolve_scope, q, proj.column);
-                    } else {
-                        _ = try resolveField(options.schema, resolve_scope, proj.column);
-                    }
-                },
+                .column, .count, .min, .max => _ = try resolveProjectionColumn(options.schema, resolve_scope, proj),
             }
         }
     }
@@ -212,14 +209,20 @@ pub fn checkQuery(options: struct {
         try resolveProjectionRefs(options.schema, resolve_scope, refs);
     }
 
+    if (check_group_by) {
+        var group_buf: [max_projections]Projection = undefined;
+        const refs = try parseGroupByColumnRefs(options.sql, &group_buf);
+        try resolveOutputRefs(options.schema, resolve_scope, refs, projs);
+    }
+
     if (check_order_by) {
         var order_buf: [max_projections]Projection = undefined;
         const refs = try parseOrderByColumnRefs(options.sql, &order_buf);
-        try resolveOrderRefs(options.schema, resolve_scope, refs, projs);
+        try resolveOutputRefs(options.schema, resolve_scope, refs, projs);
     }
 }
 
-fn resolveOrderRefs(
+fn resolveOutputRefs(
     schema: inspect.Schema,
     scope: []const TableRef,
     refs: []const Projection,
@@ -228,13 +231,20 @@ fn resolveOrderRefs(
     for (refs) |ref| {
         if (ref.qualifier == null) {
             var alias_matches: usize = 0;
+            var alias_projection: ?Projection = null;
             for (projections) |projection| {
                 if (projection.alias) |alias| {
-                    if (std.mem.eql(u8, alias, ref.column)) alias_matches += 1;
+                    if (std.mem.eql(u8, alias, ref.column)) {
+                        alias_matches += 1;
+                        alias_projection = projection;
+                    }
                 }
             }
             if (alias_matches > 1) return error.AmbiguousProjection;
-            if (alias_matches == 1) continue;
+            if (alias_projection) |projection| {
+                _ = try resolveProjectionColumn(schema, scope, projection);
+                continue;
+            }
         }
         if (ref.qualifier) |qualifier| {
             _ = try resolveQualified(schema, scope, qualifier, ref.column);
@@ -254,14 +264,7 @@ fn resolveProjectedField(
     for (projections) |projection| {
         if (projection.kind == .star) continue;
         if (!projectionMatchesField(projection, field_name)) continue;
-        const column = switch (projection.kind) {
-            .column => if (projection.qualifier) |qualifier|
-                (try resolveQualified(schema, scope, qualifier, projection.column)).col
-            else
-                (try resolveField(schema, scope, projection.column)).col,
-            .count, .min, .max => try resolveAggregateProjection(schema, scope, projection),
-            .star => unreachable,
-        };
+        const column = try resolveProjectionColumn(schema, scope, projection);
         try addProjectionMatch(&match, column);
     }
 
@@ -292,6 +295,17 @@ fn resolveProjectedField(
         }
     }
     return match orelse error.RowFieldNotProjected;
+}
+
+fn resolveProjectionColumn(schema: inspect.Schema, scope: []const TableRef, projection: Projection) CheckError!inspect.Column {
+    return switch (projection.kind) {
+        .column => if (projection.qualifier) |qualifier|
+            (try resolveQualified(schema, scope, qualifier, projection.column)).col
+        else
+            (try resolveField(schema, scope, projection.column)).col,
+        .count, .min, .max => try resolveAggregateProjection(schema, scope, projection),
+        .star => unreachable,
+    };
 }
 
 fn resolveAggregateProjection(schema: inspect.Schema, scope: []const TableRef, projection: Projection) CheckError!inspect.Column {
@@ -1092,6 +1106,21 @@ fn isJoinOnTerminator(sc: Scanner) bool {
         (sc.peek() == ',');
 }
 
+fn isGroupByTerminator(sc: Scanner) bool {
+    return sc.startsWithKeyword("having") or
+        sc.startsWithKeyword("order") or
+        sc.startsWithKeyword("limit") or
+        sc.startsWithKeyword("offset") or
+        sc.startsWithKeyword("fetch") or
+        sc.startsWithKeyword("union") or
+        sc.startsWithKeyword("intersect") or
+        sc.startsWithKeyword("except") or
+        sc.startsWithKeyword("returning") or
+        sc.startsWithKeyword("window") or
+        sc.startsWithKeyword("for") or
+        (sc.peek() == ';');
+}
+
 fn isOrderByTerminator(sc: Scanner) bool {
     // Do not treat "order" as a terminator (we are already inside ORDER BY).
     return sc.startsWithKeyword("limit") or
@@ -1215,7 +1244,7 @@ fn collectParenExpr(sc: *Scanner, buf: *[max_projections]Projection, start_count
 /// (e.g. `lower(email)`, `coalesce(u.name, p.title)`).
 fn collectColumnRefs(sc: *Scanner, buf: *[max_projections]Projection, start_count: usize, is_terminator: TerminatorFn) CheckError!usize {
     var count = start_count;
-    while (sc.index < sc.sql.len and count < max_projections) {
+    while (sc.index < sc.sql.len) {
         try sc.skipTrivia();
         if (sc.index >= sc.sql.len) break;
         if (is_terminator(sc.*)) break;
@@ -1268,6 +1297,7 @@ fn collectColumnRefs(sc: *Scanner, buf: *[max_projections]Projection, start_coun
             }
             if (std.mem.eql(u8, second, "*") or isSqlNoiseIdent(second)) continue;
             if (isSqlNoiseIdent(first.?)) continue;
+            if (count >= max_projections) return error.TooManyProjections;
             buf[count] = .{ .column = second, .qualifier = first.? };
             count += 1;
             continue;
@@ -1280,6 +1310,7 @@ fn collectColumnRefs(sc: *Scanner, buf: *[max_projections]Projection, start_coun
         }
 
         if (isSqlNoiseIdent(first.?)) continue;
+        if (count >= max_projections) return error.TooManyProjections;
         buf[count] = .{ .column = first.? };
         count += 1;
     }
@@ -1306,7 +1337,7 @@ fn parseWhereColumnRefs(sql: []const u8, buf: *[max_projections]Projection) Chec
 fn parseJoinOnColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
     var sc = Scanner.init(sql);
     var count: usize = 0;
-    while (sc.index < sc.sql.len and count < max_projections) {
+    while (sc.index < sc.sql.len) {
         try sc.skipTrivia();
         if (sc.index >= sc.sql.len) break;
         if (try sc.matchKeyword("on")) {
@@ -1331,6 +1362,26 @@ fn parseHavingColumnRefs(sql: []const u8, buf: *[max_projections]Projection) Che
 
     // HAVING uses the same terminators as WHERE (ORDER/LIMIT/…).
     const count = try collectColumnRefs(&sc, buf, 0, isWhereTerminator);
+    return buf[0..count];
+}
+
+/// Collect bare/qualified column references from GROUP BY.
+/// Returns empty when no GROUP BY is present. Best-effort.
+fn parseGroupByColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
+    var sc = Scanner.init(sql);
+    while (sc.index < sc.sql.len) {
+        try sc.skipTrivia();
+        if (sc.index >= sc.sql.len) break;
+        if (try sc.matchKeyword("group")) {
+            try sc.skipTrivia();
+            if (try sc.matchKeyword("by")) break;
+            // Bare "group" without "by" — keep scanning.
+            continue;
+        }
+        if ((try sc.readIdentOrStar()) == null and sc.index < sc.sql.len) sc.advance();
+    } else return buf[0..0];
+
+    const count = try collectColumnRefs(&sc, buf, 0, isGroupByTerminator);
     return buf[0..count];
 }
 
@@ -1375,6 +1426,7 @@ pub fn checkedQuery(comptime options: anytype) type {
     const check_projections_value: bool = if (@hasField(@TypeOf(options), "check_projections")) options.check_projections else false;
     const check_where_value: bool = if (@hasField(@TypeOf(options), "check_where")) options.check_where else false;
     const check_join_on_value: bool = if (@hasField(@TypeOf(options), "check_join_on")) options.check_join_on else false;
+    const check_group_by_value: bool = if (@hasField(@TypeOf(options), "check_group_by")) options.check_group_by else false;
     const check_order_by_value: bool = if (@hasField(@TypeOf(options), "check_order_by")) options.check_order_by else false;
     const level_value: CheckLevel = if (@hasField(@TypeOf(options), "level")) options.level else .none;
 
@@ -1444,6 +1496,7 @@ pub fn checkedQuery(comptime options: anytype) type {
         pub const check_projections = check_projections_value;
         pub const check_where = check_where_value;
         pub const check_join_on = check_join_on_value;
+        pub const check_group_by = check_group_by_value;
         pub const check_order_by = check_order_by_value;
         pub const level = level_value;
 
@@ -1459,6 +1512,7 @@ pub fn checkedQuery(comptime options: anytype) type {
                 .check_projections = check_projections,
                 .check_where = check_where,
                 .check_join_on = check_join_on,
+                .check_group_by = check_group_by,
                 .check_order_by = check_order_by,
             });
         }
@@ -2108,6 +2162,17 @@ test "check level enables result-shape validation" {
         .level = .result_shape,
     });
     try std.testing.expectError(error.UnknownColumn, checked.validate(schema));
+
+    try checkQuery(.{
+        .sql = "select id from users group by missing",
+        .schema = schema,
+        .level = .result_shape,
+    });
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select id from users group by missing",
+        .schema = schema,
+        .level = .result_types,
+    }));
 }
 
 test "checkedQuery supports from_tables and check_projections" {
@@ -2369,6 +2434,80 @@ test "checkQuery join ON column refs resolve against scope" {
     });
 }
 
+test "checkQuery group by refs resolve columns and projection aliases" {
+    const schema = inspect.Schema{ .tables = &.{.{
+        .name = "users",
+        .columns = &.{
+            .{ .name = "id", .type_name = "INTEGER", .nullable = false },
+            .{ .name = "email", .type_name = "TEXT", .nullable = false },
+            .{ .name = "active", .type_name = "INTEGER", .nullable = false },
+        },
+    }} };
+
+    try checkQuery(.{
+        .sql = "select active, count(*) as total from users group by active, lower(email), 1",
+        .schema = schema,
+        .check_group_by = true,
+    });
+    try checkQuery(.{
+        .sql = "select active as state, count(*) as total from users group by state",
+        .schema = schema,
+        .check_group_by = true,
+    });
+    try std.testing.expectError(error.AmbiguousProjection, checkQuery(.{
+        .sql = "select active as key, email as key from users group by key",
+        .schema = schema,
+        .check_group_by = true,
+    }));
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select missing as key from users group by key",
+        .schema = schema,
+        .check_group_by = true,
+    }));
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select min(missing) as first_value from users group by first_value",
+        .schema = schema,
+        .check_group_by = true,
+    }));
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select active from users group by missing",
+        .schema = schema,
+        .check_group_by = true,
+    }));
+
+    // GROUP BY scanning stops before HAVING; that clause remains controlled by
+    // check_where / result_types.
+    try checkQuery(.{
+        .sql = "select active from users group by active having missing > 0",
+        .schema = schema,
+        .check_group_by = true,
+    });
+    // Default off keeps the existing bounded opt-in behavior.
+    try checkQuery(.{
+        .sql = "select active from users group by missing",
+        .schema = schema,
+    });
+
+    const grouped = checkedQuery(.{
+        .sql = "select active as state from users group by state",
+        .check_group_by = true,
+    });
+    try grouped.validate(schema);
+}
+
+test "clause reference collection rejects capacity overflow" {
+    var storage: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+    for (0..max_projections + 1) |_| try writer.writeAll("column ");
+
+    var sc = Scanner.init(writer.buffered());
+    var refs: [max_projections]Projection = undefined;
+    try std.testing.expectError(
+        error.TooManyProjections,
+        collectColumnRefs(&sc, &refs, 0, isGroupByTerminator),
+    );
+}
+
 test "checkQuery order by column refs resolve against scope" {
     const schema = inspect.Schema{
         .tables = &.{
@@ -2401,6 +2540,11 @@ test "checkQuery order by column refs resolve against scope" {
         .schema = schema,
         .check_order_by = true,
     });
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select missing as value from users order by value",
+        .schema = schema,
+        .check_order_by = true,
+    }));
     try checkQuery(.{
         .sql = "select count(*) as total from users order by total",
         .schema = schema,
