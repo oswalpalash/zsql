@@ -656,6 +656,44 @@ test "migration creation bounds repeated version collisions" {
     try std.testing.expectEqual(max_migration_create_attempts, collisions.attempts);
 }
 
+test "migration creation preserves versions wider than the minimum padding" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "migrations");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "migrations/V9999__previous.sql",
+        .data = migration_template,
+    });
+
+    const path = try createNextMigrationFile(
+        std.testing.allocator,
+        tmp.dir,
+        std.testing.io,
+        "migrations",
+        "wide_version",
+    );
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("migrations/V10000__wide_version.sql", path);
+
+    const id = try zsql.migrate.parseFilename(path);
+    try std.testing.expectEqual(@as(u64, 10_000), id.version);
+}
+
+test "migration version discovery rejects u64 exhaustion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "migrations");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "migrations/V18446744073709551615__last.sql",
+        .data = migration_template,
+    });
+
+    try std.testing.expectError(
+        error.MigrationVersionConflict,
+        nextMigrationVersion(tmp.dir, std.testing.io, "migrations"),
+    );
+}
+
 fn nextMigrationVersion(root: std.Io.Dir, io: std.Io, dir_path: []const u8) !u64 {
     var dir = root.openDir(io, dir_path, .{ .iterate = true }) catch return 1;
     defer dir.close(io);
