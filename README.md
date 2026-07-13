@@ -394,6 +394,9 @@ const flag = try zsql.decode(bool, try row.get(2));
 ```
 
 Postgres `SimpleRow` exposes the same `get` / `getName` / `as` / `asName` / `to` / `getOwned` surface.
+PostgreSQL `bytea` is allocator-owned by `SimpleRows` and decoded to the original
+bytes for both server `hex` and `escape` output modes; wire hex characters are
+never exposed as blob contents.
 
 `zsql.types.Text`, `Blob`, `Numeric`, and canonical-text `Uuid` decode through
 the same borrowed row path. PostgreSQL `date`, `time`, `timestamp`, and

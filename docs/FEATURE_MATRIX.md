@@ -12,7 +12,7 @@ coverage; PostgreSQL rows marked live also run against PostgreSQL 16 in CI.
 | Native PostgreSQL driver | Complete | full-open `connect_timeout`; owned `CancelHandle` | timeout/protocol unit tests; live cancellation in CI |
 | Prepared statements | Complete | driver-selected `Statement(D)`; explicit direct/pool owners; reusable named-bind scratch; session-monotonic PostgreSQL names; allocation-free cache teardown; unsigned OID metadata; narrow invalidation recovery | SQLite schema-change tests and PostgreSQL protocol/direct/pool/cache/OOM tests |
 | Safe parameter binding | Complete | positional/named APIs; single-allocation PostgreSQL Bind packets; full unsigned 16-bit parameter count | byte-parity/allocation tests; driver tests; `tests/postgres_live.zig` |
-| Typed row decoding | Complete | `Row.as`, `Row.asName`, `Row.to`, `zsql.decode` | core and driver tests |
+| Typed row decoding | Complete | `Row.as`, `Row.asName`, `Row.to`, `zsql.decode`; owned PostgreSQL bytea hex/escape decode | malformed/OOM unit tests; core and live driver tests |
 | Explicit owned rows | Complete | `OwnedRow`, `Row.getOwned`, `zsql.freeOwnedRows` | allocator-backed core and driver tests |
 | Connection pooling | Complete | `Pool(D)`, `Lease(D)`, health-aware release, shutdown draining/wakeup, stats and timeouts | SQLite recovery/lifecycle tests; PostgreSQL live tests |
 | Transactions and savepoints | Complete | explicit nested/idle/aborted states; PostgreSQL `25P02` mapping; prepared-statement transition safety; failed-state savepoint recovery; `Tx(D)`, `Savepoint(D)`, `withTx` | SQLite state tests and PostgreSQL direct/prepared/pool live tests |

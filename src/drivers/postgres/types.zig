@@ -84,20 +84,29 @@ pub fn encodeTextInto(dest: []u8, value: core.Value) !void {
 ///
 /// - bool / int / float map to typed values
 /// - text / varchar / unknown map to `.text` borrowing `raw`
-/// - bytea maps to `.text` of the wire form for now (hex/escape); binary decode later
+/// - bytea requires allocator-owned decoding via `decodeTextOwned`
 /// - date/timestamp map to `.text` until a dedicated temporal type exists
 ///
-/// `raw` must outlive the returned `Value` for text/blob variants.
+/// `raw` must outlive the returned `Value` for text variants.
 pub fn decodeText(oid: u32, raw: []const u8) !core.Value {
     return switch (@as(TypeOid, @enumFromInt(oid))) {
         .bool => .{ .boolean = try parseBool(raw) },
         .int2, .int4, .int8 => .{ .integer = try parseInt(raw) },
         .float4, .float8 => .{ .real = try parseFloat(raw) },
         .text, .varchar => .{ .text = raw },
-        .bytea => .{ .blob = try decodeBytea(raw) },
+        .bytea => error.Unsupported,
         .date, .timestamp, .timestamptz, .numeric => .{ .text = raw },
         _ => .{ .text = raw },
     };
+}
+
+/// Decode one text-format field into allocator-owned storage.
+/// PostgreSQL bytea hex and escape output are converted to the original bytes.
+pub fn decodeTextOwned(allocator: std.mem.Allocator, oid: u32, raw: []const u8) !core.OwnedValue {
+    if (@as(TypeOid, @enumFromInt(oid)) == .bytea) {
+        return .{ .blob = try decodeByteaOwned(allocator, raw) };
+    }
+    return core.OwnedValue.from(allocator, try decodeText(oid, raw));
 }
 
 fn parseBool(raw: []const u8) !bool {
@@ -121,15 +130,87 @@ fn parseFloat(raw: []const u8) !f64 {
     return std.fmt.parseFloat(f64, raw) catch error.TypeMismatch;
 }
 
-/// Decode PostgreSQL text-format bytea.
-/// Supports hex form `\xDEADBEEF` only for now; other forms return TypeMismatch.
-/// Returns a slice into `raw` after the `\x` prefix (hex digits), not decoded binary.
-/// Callers that need binary should use a future owned decoder.
-fn decodeBytea(raw: []const u8) ![]const u8 {
-    if (raw.len >= 2 and raw[0] == '\\' and (raw[1] == 'x' or raw[1] == 'X')) {
-        return raw[2..];
+fn decodeByteaOwned(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const len = try decodedByteaLen(raw);
+    const out = try allocator.alloc(u8, len);
+    errdefer allocator.free(out);
+    try decodeByteaInto(out, raw);
+    return out;
+}
+
+fn decodedByteaLen(raw: []const u8) !usize {
+    if (isHexBytea(raw)) {
+        const hex = raw[2..];
+        if (hex.len % 2 != 0) return error.TypeMismatch;
+        for (hex) |char| _ = try hexNibble(char);
+        return hex.len / 2;
     }
-    return error.TypeMismatch;
+
+    var input_index: usize = 0;
+    var output_len: usize = 0;
+    while (input_index < raw.len) {
+        if (raw[input_index] != '\\') {
+            input_index += 1;
+        } else if (input_index + 1 < raw.len and raw[input_index + 1] == '\\') {
+            input_index += 2;
+        } else {
+            _ = try parseOctalByte(raw, input_index);
+            input_index += 4;
+        }
+        output_len += 1;
+    }
+    return output_len;
+}
+
+fn decodeByteaInto(out: []u8, raw: []const u8) !void {
+    if (out.len != try decodedByteaLen(raw)) return error.InvalidArguments;
+    if (isHexBytea(raw)) {
+        const hex = raw[2..];
+        for (out, 0..) |*byte, index| {
+            byte.* = (try hexNibble(hex[index * 2])) << 4 |
+                try hexNibble(hex[index * 2 + 1]);
+        }
+        return;
+    }
+
+    var input_index: usize = 0;
+    var output_index: usize = 0;
+    while (input_index < raw.len) : (output_index += 1) {
+        if (raw[input_index] != '\\') {
+            out[output_index] = raw[input_index];
+            input_index += 1;
+        } else if (input_index + 1 < raw.len and raw[input_index + 1] == '\\') {
+            out[output_index] = '\\';
+            input_index += 2;
+        } else {
+            out[output_index] = try parseOctalByte(raw, input_index);
+            input_index += 4;
+        }
+    }
+}
+
+fn isHexBytea(raw: []const u8) bool {
+    return raw.len >= 2 and raw[0] == '\\' and (raw[1] == 'x' or raw[1] == 'X');
+}
+
+fn hexNibble(char: u8) !u8 {
+    return switch (char) {
+        '0'...'9' => char - '0',
+        'a'...'f' => char - 'a' + 10,
+        'A'...'F' => char - 'A' + 10,
+        else => error.TypeMismatch,
+    };
+}
+
+fn parseOctalByte(raw: []const u8, slash_index: usize) !u8 {
+    if (slash_index + 4 > raw.len or raw[slash_index] != '\\') return error.TypeMismatch;
+    const a = raw[slash_index + 1];
+    const b = raw[slash_index + 2];
+    const c = raw[slash_index + 3];
+    if (a < '0' or a > '3' or b < '0' or b > '7' or c < '0' or c > '7') {
+        return error.TypeMismatch;
+    }
+    return (a - '0') * 64 + (b - '0') * 8 + (c - '0');
 }
 
 /// Parse rows-affected from a CommandComplete tag such as `INSERT 0 1` or `UPDATE 3`.
@@ -157,6 +238,23 @@ test "decode text primitives" {
     try std.testing.expectEqual(@as(f64, 1.5), (try decodeText(@intFromEnum(TypeOid.float8), "1.5")).real);
     try std.testing.expectEqualStrings("hello", (try decodeText(@intFromEnum(TypeOid.text), "hello")).text);
     try std.testing.expectEqualStrings("extension", (try decodeText(0xf0000001, "extension")).text);
+    try std.testing.expectError(error.Unsupported, decodeText(@intFromEnum(TypeOid.bytea), "\\x00"));
+}
+
+test "decode owned bytea hex and escape formats" {
+    const oid = @intFromEnum(TypeOid.bytea);
+    var hex = try decodeTextOwned(std.testing.allocator, oid, "\\x00ff5c41");
+    defer hex.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("\x00\xff\\A", hex.blob);
+
+    const escaped_wire = [_]u8{ 'A', '\\', '\\', '\\', '0', '0', '0', '\\', '3', '7', '7' };
+    var escaped = try decodeTextOwned(std.testing.allocator, oid, &escaped_wire);
+    defer escaped.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("A\\\x00\xff", escaped.blob);
+
+    try std.testing.expectError(error.TypeMismatch, decodeTextOwned(std.testing.allocator, oid, "\\x0"));
+    try std.testing.expectError(error.TypeMismatch, decodeTextOwned(std.testing.allocator, oid, "\\xgg"));
+    try std.testing.expectError(error.TypeMismatch, decodeTextOwned(std.testing.allocator, oid, "\\9"));
 }
 
 test "parse command complete tags" {

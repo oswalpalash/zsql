@@ -238,6 +238,35 @@ test "postgres live: reusable prepared statement exec query and close" {
     try conn.ping();
 }
 
+test "postgres live: bytea round trips hex and escape output" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, std.testing.io, config);
+    defer conn.deinit();
+
+    const expected = [_]u8{ 0, 0xff, '\\', 'A' };
+    var stmt = try conn.prepare("select $1::bytea as payload");
+    defer stmt.deinit();
+
+    var hex_rows = try stmt.query(&.{.{ .blob = &expected }});
+    defer hex_rows.deinit();
+    try std.testing.expectEqualSlices(u8, &expected, try (try hex_rows.next().?.value("payload")).asBlob());
+
+    _ = try conn.exec("set bytea_output = 'escape'");
+    var escape_rows = try stmt.query(&.{.{ .blob = &expected }});
+    defer escape_rows.deinit();
+    try std.testing.expectEqualSlices(u8, &expected, try (try escape_rows.next().?.value("payload")).asBlob());
+
+    var simple_rows = try conn.query("select decode('00ff5c41', 'hex') as payload");
+    defer simple_rows.deinit();
+    try std.testing.expectEqualSlices(u8, &expected, try (try simple_rows.next().?.value("payload")).asBlob());
+}
+
 test "postgres live: queryOneParams enforces cardinality" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

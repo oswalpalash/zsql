@@ -1345,20 +1345,7 @@ pub const Conn = struct {
                     defer self.allocator.free(data_cols);
                     if (columns.len == 0 or data_cols.len != columns.len) return error.ProtocolError;
 
-                    const values = try self.allocator.alloc(core.OwnedValue, data_cols.len);
-                    errdefer {
-                        for (values) |*v| v.deinit(self.allocator);
-                        self.allocator.free(values);
-                    }
-                    for (data_cols, columns, 0..) |col, field, i| {
-                        if (col.bytes) |raw| {
-                            const decoded = try types.decodeText(field.type_oid, raw);
-                            values[i] = try core.OwnedValue.from(self.allocator, decoded);
-                        } else {
-                            values[i] = .{ .null = {} };
-                        }
-                    }
-                    try rows.append(self.allocator, .{ .values = values });
+                    try appendDecodedRow(self.allocator, &rows, data_cols, columns);
                 },
                 .command_complete => {
                     const tag = try protocol.parseCommandComplete(msg.body);
@@ -1465,20 +1452,7 @@ pub const Conn = struct {
                     defer self.allocator.free(data_cols);
                     if (columns.len == 0 or data_cols.len != columns.len) return error.ProtocolError;
 
-                    var values = try self.allocator.alloc(core.OwnedValue, data_cols.len);
-                    errdefer {
-                        for (values) |*v| v.deinit(self.allocator);
-                        self.allocator.free(values);
-                    }
-                    for (data_cols, columns, 0..) |col, field, i| {
-                        if (col.bytes) |raw| {
-                            const decoded = try types.decodeText(field.type_oid, raw);
-                            values[i] = try core.OwnedValue.from(self.allocator, decoded);
-                        } else {
-                            values[i] = .{ .null = {} };
-                        }
-                    }
-                    try rows.append(self.allocator, .{ .values = values });
+                    try appendDecodedRow(self.allocator, &rows, data_cols, columns);
                 },
                 .command_complete => {
                     const tag = try protocol.parseCommandComplete(msg.body);
@@ -2016,6 +1990,70 @@ const OwnedSimpleRow = struct {
         self.* = undefined;
     }
 };
+
+fn decodeDataValues(
+    allocator: std.mem.Allocator,
+    data_columns: []const protocol.DataColumn,
+    fields: []const protocol.FieldDescription,
+) ![]core.OwnedValue {
+    if (data_columns.len != fields.len) return error.ProtocolError;
+    const values = try allocator.alloc(core.OwnedValue, data_columns.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (values[0..initialized]) |*value| value.deinit(allocator);
+        allocator.free(values);
+    }
+    for (data_columns, fields, 0..) |column, field, index| {
+        values[index] = if (column.bytes) |raw|
+            try types.decodeTextOwned(allocator, field.type_oid, raw)
+        else
+            .{ .null = {} };
+        initialized += 1;
+    }
+    return values;
+}
+
+fn freeDataValues(allocator: std.mem.Allocator, values: []core.OwnedValue) void {
+    for (values) |*value| value.deinit(allocator);
+    allocator.free(values);
+}
+
+fn appendDecodedRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayListUnmanaged(OwnedSimpleRow),
+    data_columns: []const protocol.DataColumn,
+    fields: []const protocol.FieldDescription,
+) !void {
+    const values = try decodeDataValues(allocator, data_columns, fields);
+    errdefer freeDataValues(allocator, values);
+    try rows.append(allocator, .{ .values = values });
+}
+
+test "row value decode frees only initialized values on OOM" {
+    const fields = [_]protocol.FieldDescription{
+        .{ .name = "a", .table_oid = 0, .column_attr = 0, .type_oid = @intFromEnum(types.TypeOid.text), .type_size = -1, .type_modifier = -1, .format = 0 },
+        .{ .name = "b", .table_oid = 0, .column_attr = 0, .type_oid = @intFromEnum(types.TypeOid.text), .type_size = -1, .type_modifier = -1, .format = 0 },
+    };
+    const columns = [_]protocol.DataColumn{ .{ .bytes = "first" }, .{ .bytes = "second" } };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    try std.testing.expectError(error.OutOfMemory, decodeDataValues(failing.allocator(), &columns, &fields));
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+
+    var append_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
+    var rows: std.ArrayListUnmanaged(OwnedSimpleRow) = .empty;
+    defer rows.deinit(append_failing.allocator());
+    try std.testing.expectError(error.OutOfMemory, appendDecodedRow(append_failing.allocator(), &rows, &columns, &fields));
+    try std.testing.expectEqual(@as(usize, 0), rows.items.len);
+    try std.testing.expectEqual(append_failing.allocated_bytes, append_failing.freed_bytes);
+
+    const blob_fields = [_]protocol.FieldDescription{
+        .{ .name = "payload", .table_oid = 0, .column_attr = 0, .type_oid = @intFromEnum(types.TypeOid.bytea), .type_size = -1, .type_modifier = -1, .format = 0 },
+    };
+    const blob_columns = [_]protocol.DataColumn{.{ .bytes = "\\x00ff" }};
+    const values = try decodeDataValues(std.testing.allocator, &blob_columns, &blob_fields);
+    defer freeDataValues(std.testing.allocator, values);
+    try std.testing.expectEqualStrings("\x00\xff", values[0].blob);
+}
 
 /// Allocator-owned PostgreSQL asynchronous notification.
 pub const Notification = struct {
