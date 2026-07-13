@@ -11,6 +11,7 @@ coverage; PostgreSQL rows marked live also run against PostgreSQL 16 in CI.
 | Package consumption | Complete | Zig package module `zsql`; propagated core/bundled/system SQLite dependency options; documented `zig fetch --save=zsql` setup | separate-package public-name compile contract plus core and leak-checked SQLite executables via `consumer-smoke` / `consumer-smoke-system` in CI |
 | Installed distribution | Complete | installed `libzsql.a` and `zsql` CLI; no repository-relative runtime resources | clean-prefix `install-smoke` runs installed `zsql doctor` in CI |
 | Target portability | Complete for release gate | core library and CLI cross-build for `x86_64-windows` and static `aarch64-linux-musl`, both libc-free by default and with bundled SQLite | isolated-prefix four-cell `portability-smoke` is part of `release-verify` in CI |
+| Native artifact reproducibility | Complete for stripped `ReleaseSafe` gate | public `-Dstrip=true` install mode removes build-cache debug paths from release artifacts | `reproducibility-smoke` compares CLI and static-library bytes across separate local caches and prefixes |
 | Version integrity | Complete | `build.zig.zon` release version projected into `zsql.version` and CLI doctor | `version-sync` source gate plus installed-doctor manifest comparison |
 | Release payload | Complete | manifest `.paths` includes all library, CLI, consumer, and gate inputs | isolated-index Git archive is fetched, extracted, tested, consumed, installed, and cross-built for static ARM Linux with bundled SQLite by `package-smoke` |
 | Pre-tag release contract | Complete | documented `release-verify`; live PostgreSQL remains explicit and separate | aggregate runs every deterministic format/build/test/example/package/install/consumer gate and has failure-propagation regression |
@@ -49,6 +50,7 @@ remain as compatibility aliases.
 | Offline checks | `zig build check-sql` |
 | All service-free examples | `zig build examples -Denable-sqlite=true` |
 | Cross-target distribution | `zig build portability-smoke` |
+| Stripped native reproducibility | `zig build reproducibility-smoke` |
 
 ## Deliberate boundaries
 

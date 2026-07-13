@@ -15,4 +15,5 @@ zig_exe=${1:?usage: release_verify.sh /path/to/zig}
 "$zig_exe" build consumer-smoke-system
 "$zig_exe" build install-smoke
 "$zig_exe" build portability-smoke
+"$zig_exe" build reproducibility-smoke
 "$zig_exe" build package-smoke

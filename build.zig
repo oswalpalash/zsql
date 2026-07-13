@@ -15,6 +15,7 @@ const sqlite_amalgamation_c_flags = [_][]const u8{
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Strip debug information from installed artifacts") orelse false;
     // Default builds (enable-sqlite=false) must remain free of libc so the
     // CLI and library install cleanly without system SQLite. Do not call
     // std.c.* from code paths compiled into the default package.
@@ -41,6 +42,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/zsql.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     zsql_mod.addOptions("zsql_options", options);
     if (enable_sqlite) {
@@ -78,6 +80,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("cli/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     cli_mod.addImport("zsql", zsql_mod);
     if (enable_sqlite) {
@@ -244,6 +247,10 @@ pub fn build(b: *std.Build) void {
     const portability_smoke = b.addSystemCommand(&.{ "sh", "scripts/portability_smoke.sh", b.graph.zig_exe });
     const portability_smoke_step = b.step("portability-smoke", "Cross-build the installed library and CLI for Windows and static Linux");
     portability_smoke_step.dependOn(&portability_smoke.step);
+
+    const reproducibility_smoke = b.addSystemCommand(&.{ "sh", "scripts/reproducibility_smoke.sh", b.graph.zig_exe });
+    const reproducibility_smoke_step = b.step("reproducibility-smoke", "Compare isolated stripped ReleaseSafe library and CLI builds");
+    reproducibility_smoke_step.dependOn(&reproducibility_smoke.step);
 
     const package_smoke = b.addSystemCommand(&.{ "sh", "scripts/package_smoke.sh", b.graph.zig_exe });
     const package_smoke_step = b.step("package-smoke", "Fetch and test the manifest-selected clean package payload");
