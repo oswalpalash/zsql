@@ -1,5 +1,6 @@
 const std = @import("std");
 const zsql = @import("zsql");
+const builtin = @import("builtin");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -102,6 +103,29 @@ fn writeFileAtomic(
         try atomic_file.replace(io);
     } else {
         try atomic_file.link(io);
+    }
+    try syncPublishedDirectory(atomic_file.dir, io);
+}
+
+/// Persists the directory entry added or replaced by atomic publication on
+/// platforms where directory handles support the same sync operation as files.
+fn syncPublishedDirectory(dir: std.Io.Dir, io: std.Io) !void {
+    switch (builtin.os.tag) {
+        .linux,
+        .macos,
+        .freebsd,
+        .openbsd,
+        .netbsd,
+        .dragonfly,
+        .illumos,
+        => {
+            const directory_file: std.Io.File = .{
+                .handle = dir.handle,
+                .flags = .{ .nonblocking = false },
+            };
+            try directory_file.sync(io);
+        },
+        else => {},
     }
 }
 

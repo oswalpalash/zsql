@@ -702,7 +702,10 @@ The four-digit version field is minimum padding, not a ceiling; exhaustion at
 Atomic replacement preserves an existing regular file's permissions, so
 regenerating a private schema artifact does not silently broaden its access.
 Missing parent directories in an explicit output path are created only after
-the command has successfully rendered the complete artifact in memory.
+the command has successfully rendered the complete artifact in memory. After
+publication, zsql also synchronizes the containing directory on supported
+POSIX platforms; other targets retain atomic visibility and pre-publication
+file synchronization, with power-loss directory durability left to the target.
 
 Generated struct files import `zsql` themselves, map supported SQL domain types
 to `zsql.types.*`, and preserve database nullability with optional Zig fields.
