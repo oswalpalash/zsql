@@ -545,6 +545,9 @@ Fully qualified PostgreSQL column references (`schema.table.column`) are
 validated in SELECT projections, qualified stars, portable aggregate
 arguments, WHERE/HAVING expressions, JOIN ON, GROUP BY, and ORDER BY. Quoted
 components remain exact; unquoted components use PostgreSQL lowercase folding.
+PostgreSQL cast type syntax is excluded from column lookup, including
+schema-qualified types, modifiers, array suffixes, and standard multi-word type
+names in both `expr::type` and `CAST(expr AS type)` forms.
 
 ### CLI
 

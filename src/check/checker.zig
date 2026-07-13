@@ -1644,6 +1644,43 @@ fn skipParenGroup(sc: *Scanner) CheckError!void {
     }
 }
 
+/// Consume the type portion of `expr::type` or `CAST(expr AS type)` without
+/// treating schema/type components or modifiers as column references.
+fn skipCastType(sc: *Scanner) CheckError!void {
+    _ = try sc.readIdentOrStar() orelse return error.InvalidSql;
+    while (true) {
+        try sc.skipTrivia();
+        if (sc.peek() != '.') break;
+        sc.advance();
+        _ = try sc.readIdentOrStar() orelse return error.InvalidSql;
+    }
+    try sc.skipTrivia();
+    if (sc.peek() == '(') try skipParenGroup(sc);
+
+    // PostgreSQL array suffixes (`int8[]`, `schema.type[][]`).
+    while (true) {
+        try sc.skipTrivia();
+        if (sc.peek() != '[') break;
+        sc.advance();
+        try sc.skipTrivia();
+        if (sc.peek() != ']') return error.InvalidSql;
+        sc.advance();
+    }
+
+    // Standard multi-word type suffixes: double precision, character varying,
+    // timestamp/time with(out) time zone.
+    while (true) {
+        try sc.skipTrivia();
+        if (try sc.matchKeyword("with") or
+            try sc.matchKeyword("without") or
+            try sc.matchKeyword("time") or
+            try sc.matchKeyword("zone") or
+            try sc.matchKeyword("precision") or
+            try sc.matchKeyword("varying")) continue;
+        break;
+    }
+}
+
 const TerminatorFn = *const fn (Scanner) bool;
 
 fn isCloseParen(sc: Scanner) bool {
@@ -1680,9 +1717,7 @@ fn collectColumnRefs(sc: *Scanner, buf: *[max_projections]Projection, start_coun
         if (sc.peek() == ':' and sc.index + 1 < sc.sql.len and sc.sql[sc.index + 1] == ':') {
             sc.advance();
             sc.advance();
-            _ = try sc.readIdentOrStar();
-            try sc.skipTrivia();
-            if (sc.peek() == '(') _ = try collectParenExpr(sc, buf, count);
+            try skipCastType(sc);
             continue;
         }
 
@@ -1703,9 +1738,7 @@ fn collectColumnRefs(sc: *Scanner, buf: *[max_projections]Projection, start_coun
 
         // CAST(x AS type) / AS type-name: skip the type token after AS.
         if (sqlIdentKeywordEql(first.?, "as")) {
-            _ = try sc.readIdentOrStar();
-            try sc.skipTrivia();
-            if (sc.peek() == '(') try skipParenGroup(sc); // varchar(255)
+            try skipCastType(sc);
             continue;
         }
 
@@ -2725,6 +2758,38 @@ test "checkQuery ignores postgres literals and nested comments in WHERE" {
         .args = &.{.{ .name = "id" }},
         .check_where = true,
     });
+}
+
+test "checkQuery consumes qualified PostgreSQL cast types in clauses" {
+    const schema = inspect.Schema{ .dialect = .postgres, .tables = &.{.{
+        .schema = "public",
+        .name = "users",
+        .columns = &.{.{ .name = "id", .type_name = "int8", .nullable = false }},
+    }} };
+
+    try checkQuery(.{
+        .sql =
+        \\select id from users
+        \\where id::audit.custom_type is not null
+        \\  and cast(id as audit."Custom.Type") is not null
+        \\  and id::pg_catalog.int8[][] is not null
+        \\  and cast(id as numeric(10, 2)) > 0
+        \\  and cast(id as double precision) > 0
+        \\  and cast(id as timestamp without time zone) is not null
+        ,
+        .schema = schema,
+        .check_where = true,
+    });
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select id from users where id::audit.custom_type is not null and missing = 1",
+        .schema = schema,
+        .check_where = true,
+    }));
+    try std.testing.expectError(error.InvalidSql, checkQuery(.{
+        .sql = "select id from users where id::audit.",
+        .schema = schema,
+        .check_where = true,
+    }));
 }
 
 test "checkQuery projections validate select list" {
