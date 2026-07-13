@@ -282,6 +282,10 @@ try conn.enableStmtCache(32);
 try conn.disableStmtCache();
 ```
 
+Explicit and cached PostgreSQL statements share a session-monotonic generated
+name namespace. Enabling, disabling, or resizing the cache never reuses names
+that may still belong to an open explicit `Stmt`.
+
 Failed PostgreSQL Parse attempts and server-side cached-plan invalidations remove
 their client mapping. The next call receives a fresh statement name and Parse,
 preventing permanent `prepared statement does not exist` or `0A000` loops.

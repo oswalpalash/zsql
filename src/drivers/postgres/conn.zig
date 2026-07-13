@@ -56,6 +56,9 @@ pub const Conn = struct {
     /// Enabled with `enableStmtCache`; when set, extended queries reuse named
     /// server prepares and skip Parse on cache hits.
     stmt_cache: ?core.StmtCache = null,
+    /// Session-wide namespace shared by explicit and cached server statements.
+    /// Never reset while the connection lives: explicit statements may remain
+    /// open across cache enable/disable cycles.
     next_stmt_id: u64 = 0,
     /// Peer leaf certificate DER for SCRAM-SHA-256-PLUS `tls-server-end-point`.
     /// Owned copy from `Config.peer_cert_der` when provided. `std.crypto.tls.Client`
@@ -400,7 +403,6 @@ pub const Conn = struct {
         if (self.closed) return error.ConnectionClosed;
         try self.disableStmtCache();
         self.stmt_cache = try core.StmtCache.init(self.allocator, max_entries);
-        self.next_stmt_id = 0;
     }
 
     /// Disable the statement cache and Close any named prepares on the server.

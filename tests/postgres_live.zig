@@ -548,6 +548,11 @@ test "postgres live: statement cache reuses named prepares" {
     var conn = try pg.Conn.open(allocator, io, config);
     defer conn.deinit();
 
+    // Explicit and cached statements share one session-wide name namespace.
+    // Enabling the cache must not reset the counter and collide with this live
+    // explicit statement.
+    var explicit = try conn.prepare("select $1::int as explicit_n");
+    defer explicit.deinit();
     try conn.enableStmtCache(4);
     try std.testing.expectEqual(@as(usize, 0), conn.stmtCacheLen());
 
@@ -556,6 +561,10 @@ test "postgres live: statement cache reuses named prepares" {
     defer rows1.deinit();
     try std.testing.expectEqual(@as(i64, 1), try (try rows1.next().?.value("n")).asInt());
     try std.testing.expectEqual(@as(usize, 1), conn.stmtCacheLen());
+
+    var explicit_rows = try explicit.query(&.{.{ .integer = 3 }});
+    defer explicit_rows.deinit();
+    try std.testing.expectEqual(@as(i64, 3), try explicit_rows.next().?.as(i64, 0));
 
     var rows2 = try conn.queryParams(sql, &.{.{ .integer = 2 }});
     defer rows2.deinit();
