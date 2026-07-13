@@ -47,8 +47,8 @@ types; it does not attempt to normalize SQL dialects.
 ```sh
 # Default: compile the bundled SQLite amalgamation (no system libsqlite3)
 zig build test -Denable-sqlite=true
-zig build sqlite-example -Denable-sqlite=true
-zig build sqlite-migrate-example -Denable-sqlite=true
+zig build run-sqlite-example -Denable-sqlite=true
+zig build run-migration-example -Denable-sqlite=true
 
 # Optional: link the OS package instead
 zig build test -Denable-sqlite=true -Dsqlite-system=true
@@ -369,7 +369,7 @@ zig build -Denable-sqlite=true
 zig build checked-queries-example
 # CI-friendly alias for validating the checked-query schema artifact/example:
 zig build check-sql
-zig build postgres-pool-example   # skips cleanly if ZSQL_PG_URL unset
+zig build run-postgres-pool-example # skips cleanly if ZSQL_PG_URL unset
 ```
 
 ## Development
@@ -386,3 +386,6 @@ zig build test -Denable-sqlite=true
 ```
 
 CI runs the same gates on Ubuntu with system SQLite and a Postgres service for `zig build test-postgres`.
+
+The implementation evidence behind the public promise and roadmap acceptance
+commands is tracked in [`docs/FEATURE_MATRIX.md`](docs/FEATURE_MATRIX.md).

@@ -142,9 +142,15 @@ pub fn build(b: *std.Build) void {
     const run_pg_pool_example = b.addRunArtifact(pg_pool_example);
     const pg_pool_example_step = b.step("postgres-pool-example", "Run postgres pool example (skips if ZSQL_PG_URL unset)");
     pg_pool_example_step.dependOn(&run_pg_pool_example.step);
+    const run_pg_pool_example_step = b.step("run-postgres-pool-example", "Acceptance alias for postgres-pool-example");
+    run_pg_pool_example_step.dependOn(pg_pool_example_step);
 
     const sqlite_example_step = b.step("sqlite-example", "Run the SQLite GPA leak-checked example");
     const sqlite_migrate_example_step = b.step("sqlite-migrate-example", "Run the SQLite migration GPA leak-checked example");
+    const run_sqlite_example_step = b.step("run-sqlite-example", "Acceptance alias for sqlite-example");
+    run_sqlite_example_step.dependOn(sqlite_example_step);
+    const run_migration_example_step = b.step("run-migration-example", "Acceptance alias for sqlite-migrate-example");
+    run_migration_example_step.dependOn(sqlite_migrate_example_step);
     if (enable_sqlite) {
         const sqlite_example_mod = b.createModule(.{
             .root_source_file = b.path("examples/sqlite_basic.zig"),

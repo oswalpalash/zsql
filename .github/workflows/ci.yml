@@ -65,17 +65,17 @@ jobs:
         run: zig build checked-queries-example
 
       - name: Postgres pool example (skips without ZSQL_PG_URL)
-        run: zig build postgres-pool-example
+        run: zig build run-postgres-pool-example
 
       # Default SQLite path: bundled amalgamation (no system libsqlite3).
       - name: Test with SQLite (amalgamation)
         run: zig build test -Denable-sqlite=true
 
       - name: SQLite example (amalgamation)
-        run: zig build sqlite-example -Denable-sqlite=true
+        run: zig build run-sqlite-example -Denable-sqlite=true
 
       - name: SQLite migration example (amalgamation)
-        run: zig build sqlite-migrate-example -Denable-sqlite=true
+        run: zig build run-migration-example -Denable-sqlite=true
 
       - name: CLI doctor with SQLite amalgamation
         run: zig build run -Denable-sqlite=true -- doctor
@@ -98,4 +98,4 @@ jobs:
       - name: Postgres pool example (live)
         env:
           ZSQL_PG_URL: postgres://zsql:zsql@127.0.0.1:5432/zsql?sslmode=disable
-        run: zig build postgres-pool-example
+        run: zig build run-postgres-pool-example
