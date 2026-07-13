@@ -66,18 +66,20 @@ pub fn main() !void {
     try user_posts.validate(schema);
 
     // Portable aggregate inference is deliberately narrow: aliased COUNT is
-    // non-null i64, and a simple column argument is still schema-validated.
-    const user_count = zsql.checkedQuery(.{
+    // non-null i64, while MIN/MAX preserve the source type and stay optional.
+    const user_aggregates = zsql.checkedQuery(.{
         .sql =
-        \\select count(distinct email) as total
+        \\select count(distinct email) as total,
+        \\       min(id) as first_id,
+        \\       max(id) as last_id
         \\from users
         \\order by total
         ,
-        .row = struct { total: i64 },
+        .row = struct { total: i64, first_id: ?i64, last_id: ?i64 },
         .check_projections = true,
         .check_order_by = true,
     });
-    try user_count.validate(schema);
+    try user_aggregates.validate(schema);
 
     var buffer: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);

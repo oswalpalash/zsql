@@ -53,10 +53,12 @@ const ProjectionKind = enum {
     column,
     star,
     count,
+    min,
+    max,
 };
 
 const Projection = struct {
-    /// Unqualified source column name, `*`, or the COUNT argument.
+    /// Unqualified source column name, `*`, or a supported aggregate argument.
     column: []const u8,
     /// Optional table or alias qualifier before `.`.
     qualifier: ?[]const u8 = null,
@@ -71,7 +73,8 @@ const max_projections = 64;
 /// Lightweight offline SQL check against a schema artifact and parameter/row specs.
 ///
 /// Validates placeholders and maps each declared result field to a supported
-/// SELECT projection: simple columns, aliases, stars, and portable COUNT forms.
+/// SELECT projection: simple columns, aliases, stars, and portable aggregate
+/// forms with sound cross-driver result metadata.
 /// Supports multi-table / JOIN scope via `from_tables`, qualified column names
 /// (`users.email` / `u.email`), optional SELECT-list projection checks
 /// (`check_projections`), optional WHERE column checks (`check_where`), optional
@@ -181,7 +184,7 @@ pub fn checkQuery(options: struct {
                         _ = findTableRef(resolve_scope, q) orelse return error.UnknownTable;
                     }
                 },
-                .count => _ = try resolveCountProjection(options.schema, resolve_scope, proj),
+                .count, .min, .max => _ = try resolveAggregateProjection(options.schema, resolve_scope, proj),
                 .column => {
                     if (proj.qualifier) |q| {
                         _ = try resolveQualified(options.schema, resolve_scope, q, proj.column);
@@ -256,7 +259,7 @@ fn resolveProjectedField(
                 (try resolveQualified(schema, scope, qualifier, projection.column)).col
             else
                 (try resolveField(schema, scope, projection.column)).col,
-            .count => try resolveCountProjection(schema, scope, projection),
+            .count, .min, .max => try resolveAggregateProjection(schema, scope, projection),
             .star => unreachable,
         };
         try addProjectionMatch(&match, column);
@@ -291,18 +294,27 @@ fn resolveProjectedField(
     return match orelse error.RowFieldNotProjected;
 }
 
-fn resolveCountProjection(schema: inspect.Schema, scope: []const TableRef, projection: Projection) CheckError!inspect.Column {
-    if (!std.mem.eql(u8, projection.column, "*")) {
-        if (projection.qualifier) |qualifier| {
-            _ = try resolveQualified(schema, scope, qualifier, projection.column);
-        } else {
-            _ = try resolveField(schema, scope, projection.column);
-        }
-    }
-    return .{
-        .name = projection.alias orelse "count",
-        .type_name = "INT8",
-        .nullable = false,
+fn resolveAggregateProjection(schema: inspect.Schema, scope: []const TableRef, projection: Projection) CheckError!inspect.Column {
+    const source = if (std.mem.eql(u8, projection.column, "*"))
+        null
+    else if (projection.qualifier) |qualifier|
+        try resolveQualified(schema, scope, qualifier, projection.column)
+    else
+        try resolveField(schema, scope, projection.column);
+
+    return switch (projection.kind) {
+        .count => .{
+            .name = projection.alias orelse "count",
+            .type_name = "INT8",
+            .nullable = false,
+        },
+        .min, .max => .{
+            .name = projection.alias orelse if (projection.kind == .min) "min" else "max",
+            .type_name = source.?.col.type_name,
+            // Empty input, or an all-null nullable input, produces SQL NULL.
+            .nullable = true,
+        },
+        .column, .star => unreachable,
     };
 }
 
@@ -312,9 +324,12 @@ fn addProjectionMatch(match: *?inspect.Column, candidate: inspect.Column) CheckE
 }
 
 fn projectionMatchesField(projection: Projection, field_name: []const u8) bool {
-    if (projection.kind == .count) {
-        const alias = projection.alias orelse return false;
-        return std.mem.eql(u8, alias, field_name);
+    switch (projection.kind) {
+        .count, .min, .max => {
+            const alias = projection.alias orelse return false;
+            return std.mem.eql(u8, alias, field_name);
+        },
+        .column, .star => {},
     }
     if (projection.alias) |alias| return std.mem.eql(u8, alias, field_name);
     if (std.mem.indexOfScalar(u8, field_name, '.')) |dot| {
@@ -863,8 +878,8 @@ fn parseFromJoinTables(sql: []const u8, schema: inspect.Schema, buf: *[max_table
     return buf[0..count];
 }
 
-/// Parse simple SELECT projections up to FROM. Portable COUNT projections are
-/// recognized; other expressions with `(` are skipped.
+/// Parse simple SELECT projections up to FROM. Portable COUNT/MIN/MAX
+/// projections are recognized; other expressions with `(` are skipped.
 fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
     var sc = Scanner.init(sql);
     // Optional WITH ... skip to SELECT (best-effort: first SELECT)
@@ -891,9 +906,13 @@ fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) Ch
         }
 
         // Parenthesized expressions and unsupported function calls are skipped.
-        // COUNT has a portable non-null INT8 result, so recognize its bounded
-        // star/simple-column forms rather than inferring arbitrary expressions.
+        // Recognize only aggregate forms with portable result rules rather
+        // than inferring arbitrary expressions.
         const item_start = sc.index;
+        const function_name_is_quoted = switch (sc.sql[item_start]) {
+            '"', '`', '[' => true,
+            else => false,
+        };
         const first = try sc.readIdentOrStar();
         if (first == null) {
             // literal / operator — skip until comma or FROM
@@ -903,9 +922,10 @@ fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) Ch
 
         try sc.skipTrivia();
         if (sc.peek() == '(') {
-            if (std.ascii.eqlIgnoreCase(first.?, "count")) {
+            const function_kind = if (function_name_is_quoted) null else projectionFunctionKind(first.?);
+            if (function_kind) |kind| {
                 var candidate = sc;
-                if (try parseCountProjection(&candidate)) |projection| {
+                if (try parseAggregateProjection(&candidate, kind)) |projection| {
                     buf[count] = projection;
                     count += 1;
                     sc = candidate;
@@ -957,16 +977,24 @@ fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) Ch
     return buf[0..count];
 }
 
-fn parseCountProjection(sc: *Scanner) CheckError!?Projection {
+fn projectionFunctionKind(name: []const u8) ?ProjectionKind {
+    if (std.ascii.eqlIgnoreCase(name, "count")) return .count;
+    if (std.ascii.eqlIgnoreCase(name, "min")) return .min;
+    if (std.ascii.eqlIgnoreCase(name, "max")) return .max;
+    return null;
+}
+
+fn parseAggregateProjection(sc: *Scanner, kind: ProjectionKind) CheckError!?Projection {
     if (sc.peek() != '(') return null;
     sc.advance();
     try sc.skipTrivia();
     const distinct = try sc.matchKeyword("distinct");
+    if (distinct and kind != .count) return null;
     const first = try sc.readIdentOrStar() orelse return null;
 
-    var projection = Projection{ .column = first, .kind = .count };
+    var projection = Projection{ .column = first, .kind = kind };
     if (std.mem.eql(u8, first, "*")) {
-        if (distinct) return null;
+        if (kind != .count or distinct) return null;
     } else {
         try sc.skipTrivia();
         if (sc.peek() == '.') {
@@ -1971,7 +1999,7 @@ test "checked row fields must be returned projections" {
     }));
 }
 
-test "checked rows support bounded count projection aliases" {
+test "checked rows support bounded aggregate projection aliases" {
     const schema = inspect.Schema{ .tables = &.{.{
         .name = "users",
         .columns = &.{
@@ -1997,6 +2025,22 @@ test "checked rows support bounded count projection aliases" {
         .row = &.{.{ .name = "addresses", .type_name = "INT8", .nullable = false }},
         .check_projections = true,
     });
+
+    const extrema = checkedQuery(.{
+        .sql = "select min(id) as first_id, max(email) as last_email from users",
+        .row = struct { first_id: ?i64, last_email: ?[]const u8 },
+    });
+    try extrema.validate(schema);
+    try std.testing.expectError(error.NullabilityMismatch, checkQuery(.{
+        .sql = "select min(id) as first_id from users",
+        .schema = schema,
+        .row = &.{.{ .name = "first_id", .type_name = "INT8", .nullable = false }},
+    }));
+    try std.testing.expectError(error.TypeMismatch, checkQuery(.{
+        .sql = "select max(id) as last_id from users",
+        .schema = schema,
+        .row = &.{.{ .name = "last_id", .type_name = "TEXT", .nullable = true }},
+    }));
     try std.testing.expectError(error.TypeMismatch, checkQuery(.{
         .sql = "select count(*) as total from users",
         .schema = schema,
@@ -2017,6 +2061,11 @@ test "checked rows support bounded count projection aliases" {
         .schema = schema,
         .check_projections = true,
     }));
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select min(u.missing) as first_id from users u",
+        .schema = schema,
+        .row = &.{.{ .name = "first_id", .type_name = "INT8", .nullable = true }},
+    }));
     try std.testing.expectError(error.RowFieldNotProjected, checkQuery(.{
         .sql = "select count(*) from users",
         .schema = schema,
@@ -2031,6 +2080,10 @@ test "checked rows support bounded count projection aliases" {
         "select count(*) filter (where id > 0) as total from users",
         "select count(*) over () as total from users",
         "select count(*)::bigint as total from users",
+        "select \"count\"(id) as total from users",
+        "select min(*) as total from users",
+        "select min(distinct id) as total from users",
+        "select max(id + 1) as total from users",
     }) |sql| {
         try std.testing.expectError(error.RowFieldNotProjected, checkQuery(.{
             .sql = sql,
