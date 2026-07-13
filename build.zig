@@ -228,6 +228,10 @@ pub fn build(b: *std.Build) void {
     consumer_system.setCwd(b.path("tests/consumer"));
     const consumer_system_step = b.step("consumer-smoke-system", "Test system SQLite from a separate consumer package");
     consumer_system_step.dependOn(&consumer_system.step);
+
+    const install_smoke = b.addSystemCommand(&.{ "sh", "scripts/install_smoke.sh", b.graph.zig_exe });
+    const install_smoke_step = b.step("install-smoke", "Install to a clean prefix and run the installed CLI");
+    install_smoke_step.dependOn(&install_smoke.step);
 }
 
 fn buildSqliteAmalgamation(

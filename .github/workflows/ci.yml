@@ -55,6 +55,9 @@ jobs:
       - name: Build (default, no sqlite/libc)
         run: zig build
 
+      - name: Clean-prefix install smoke
+        run: zig build install-smoke
+
       - name: Test (default)
         run: zig build test
 

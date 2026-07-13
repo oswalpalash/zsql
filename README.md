@@ -46,6 +46,10 @@ The repository verifies this dependency boundary from a separate Zig package
 with `zig build consumer-smoke`; the optional system-library route is covered
 by `zig build consumer-smoke-system`.
 
+`zig build install-smoke` also installs the static library and CLI into a fresh
+temporary prefix and runs the installed `zsql doctor`, ensuring distribution
+artifacts do not depend on repository-relative files.
+
 ### Public names
 
 - `zsql.Database(D)`, `zsql.Connection(D)`, `zsql.Statement(D)`, `zsql.ResultRows(D)`, `zsql.ResultRow(D)`
