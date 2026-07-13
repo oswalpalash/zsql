@@ -691,6 +691,11 @@ zig build check-sql
 zig build run-postgres-pool-example # skips cleanly if ZSQL_PG_URL unset
 ```
 
+CLI-generated migration, schema, and Zig files are written through a
+same-directory temporary file and synchronized before publication. `inspect`
+and `gen structs` atomically replace their destination; `migrate new` remains
+exclusive and never overwrites an existing migration.
+
 Generated struct files import `zsql` themselves, map supported SQL domain types
 to `zsql.types.*`, and preserve database nullability with optional Zig fields.
 Column fields preserve their exact SQL names through Zig's quoted-identifier

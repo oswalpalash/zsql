@@ -67,6 +67,33 @@ fn writeOut(io: std.Io, stream: Stream, bytes: []const u8) !void {
     try file.writeStreamingAll(io, bytes);
 }
 
+const AtomicWriteMode = enum {
+    create,
+    replace,
+};
+
+/// Writes a complete CLI artifact through a same-directory temporary file.
+/// `create` preserves an existing destination; `replace` swaps it atomically.
+fn writeFileAtomic(
+    dir: std.Io.Dir,
+    io: std.Io,
+    sub_path: []const u8,
+    bytes: []const u8,
+    mode: AtomicWriteMode,
+) !void {
+    const replace = mode == .replace;
+    var atomic_file = try dir.createFileAtomic(io, sub_path, .{ .replace = replace });
+    defer atomic_file.deinit(io);
+
+    try atomic_file.file.writeStreamingAll(io, bytes);
+    try atomic_file.file.sync(io);
+    if (replace) {
+        try atomic_file.replace(io);
+    } else {
+        try atomic_file.link(io);
+    }
+}
+
 fn printHelp(io: std.Io) !void {
     try writeOut(io, .stdout,
         \\zsql — explicit SQL toolkit for Zig
@@ -127,9 +154,7 @@ fn cmdGenStructs(init: std.process.Init, args: *std.process.Args.Iterator) !void
     var growing: std.Io.Writer.Allocating = .init(init.gpa);
     defer growing.deinit();
     try zsql.codegen.writeStructs(&growing.writer, schema);
-    const file = try std.Io.Dir.cwd().createFile(init.io, dest_path, .{});
-    defer file.close(init.io);
-    try file.writeStreamingAll(init.io, growing.written());
+    try writeFileAtomic(std.Io.Dir.cwd(), init.io, dest_path, growing.written(), .replace);
 }
 
 fn cmdDoctor(io: std.Io) !void {
@@ -174,12 +199,10 @@ fn cmdMigrateNew(init: std.process.Init, name: []const u8) !void {
     const path = try std.fmt.allocPrint(allocator, "migrations/{s}", .{filename});
     defer allocator.free(path);
 
-    const file = try cwd.createFile(io, path, .{ .exclusive = true });
-    defer file.close(io);
-    try file.writeStreamingAll(io,
+    try writeFileAtomic(cwd, io, path,
         \\-- Write forward-only migration SQL below.
         \\
-    );
+    , .create);
 
     const msg = try std.fmt.allocPrint(allocator, "created {s}\n", .{path});
     defer allocator.free(msg);
@@ -405,9 +428,7 @@ fn cmdInspect(init: std.process.Init, args: *std.process.Args.Iterator) !void {
         try zsql.inspect.writeSchemaZon(&growing.writer, schema);
     }
 
-    const file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
-    defer file.close(io);
-    try file.writeStreamingAll(io, growing.written());
+    try writeFileAtomic(std.Io.Dir.cwd(), io, out_path, growing.written(), .replace);
 
     const msg = try std.fmt.allocPrint(allocator, "wrote {s}\n", .{out_path});
     defer allocator.free(msg);
@@ -438,6 +459,62 @@ test "migration repair finds exact version" {
     }};
     try std.testing.expectEqual(@as(u64, 7), findMigrationByVersion(&migrations, 7).?.id.version);
     try std.testing.expect(findMigrationByVersion(&migrations, 8) == null);
+}
+
+test "atomic CLI artifact replacement swaps complete contents" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "schema.zon",
+        .data = "old schema\n",
+    });
+    try writeFileAtomic(tmp.dir, std.testing.io, "schema.zon", "new schema\n", .replace);
+
+    const contents = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "schema.zon",
+        std.testing.allocator,
+        .limited(1024),
+    );
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("new schema\n", contents);
+}
+
+test "atomic CLI artifact creation preserves existing destination and cleans temporary file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "V0001__create_users.sql",
+        .data = "existing migration\n",
+    });
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        writeFileAtomic(
+            tmp.dir,
+            std.testing.io,
+            "V0001__create_users.sql",
+            "replacement migration\n",
+            .create,
+        ),
+    );
+
+    const contents = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "V0001__create_users.sql",
+        std.testing.allocator,
+        .limited(1024),
+    );
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("existing migration\n", contents);
+
+    var entries = tmp.dir.iterate();
+    var file_count: usize = 0;
+    while (try entries.next(std.testing.io)) |entry| {
+        if (entry.kind == .file) file_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), file_count);
 }
 
 fn nextMigrationVersion(io: std.Io, dir_path: []const u8) !u64 {
