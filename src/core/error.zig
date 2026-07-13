@@ -22,6 +22,8 @@ pub const Error = error{
     MigrationChecksumMismatch,
     /// Migration history contains a dirty/incomplete entry and needs repair.
     MigrationDirty,
+    MigrationNotFound,
+    MigrationNotDirty,
     /// Backward-compatible spelling; new APIs return `MigrationDirty`.
     DirtyMigration,
     UnexpectedRow,

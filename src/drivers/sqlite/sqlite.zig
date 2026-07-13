@@ -84,6 +84,12 @@ pub const Migrator = struct {
     pub fn up(self: Migrator, migrations: []const core.migrate.MigrationFile) !ApplyResult {
         return self.apply(migrations);
     }
+
+    /// Remove one dirty history row only when version and checksum match.
+    /// This never marks a migration clean; callers must rerun repaired SQL.
+    pub fn repairDirty(self: Migrator, version: u64, expected_checksum: core.migrate.Checksum) !void {
+        return repairDirtyMigration(self.conn, version, expected_checksum);
+    }
 };
 
 pub const PoolConfig = struct {
@@ -1318,6 +1324,35 @@ fn persistDirtyMigration(conn: *Conn, migration: core.migrate.MigrationFile) !vo
         .{ .text = migration.id.name },
         .{ .text = &migration.checksum },
     });
+}
+
+pub fn repairDirtyMigration(conn: *Conn, version: u64, expected_checksum: core.migrate.Checksum) !void {
+    try ensureMigrationTable(conn);
+    var tx = try conn.beginImmediate();
+    errdefer tx.rollbackIfOpen();
+
+    {
+        var rows = try tx.query(
+            "select checksum, dirty from zsql_migrations where version = ?",
+            &.{.{ .integer = try sqliteVersion(version) }},
+        );
+        defer rows.deinit();
+        const row = (try rows.next()) orelse return error.MigrationNotFound;
+        const stored_checksum = try parseChecksum(try (try row.getName("checksum")).asText());
+        const dirty = try sqliteBool(try (try row.getName("dirty")).asInt());
+        if (!dirty) return error.MigrationNotDirty;
+        if (!std.mem.eql(u8, &stored_checksum, &expected_checksum)) return error.MigrationChecksumMismatch;
+    }
+
+    const result = try tx.exec(
+        "delete from zsql_migrations where version = ? and checksum = ? and dirty = 1",
+        &.{
+            .{ .integer = try sqliteVersion(version) },
+            .{ .text = &expected_checksum },
+        },
+    );
+    if (result.rows_affected != 1) return error.MigrationVersionConflict;
+    try tx.commit();
 }
 
 pub const Tx = struct {
@@ -3495,6 +3530,22 @@ test "SQLite migration apply persists dirty marker after rollback" {
     try std.testing.expect(status.records[0].dirty);
     try std.testing.expectEqual(@as(u64, 1), status.records[0].version);
     try std.testing.expectError(error.MigrationDirty, applyMigrations(&conn, &migrations));
+
+    const fixed_sql = "create table repaired (id integer primary key);";
+    const fixed_checksum = core.migrate.checksumSql(fixed_sql);
+    const migrator = Migrator.init(&conn);
+    try std.testing.expectError(error.MigrationChecksumMismatch, migrator.repairDirty(1, fixed_checksum));
+    try migrator.repairDirty(1, migrations[0].checksum);
+    try std.testing.expectError(error.MigrationNotFound, migrator.repairDirty(99, migrations[0].checksum));
+
+    const fixed = [_]core.migrate.MigrationFile{.{
+        .id = migrations[0].id,
+        .sql = fixed_sql,
+        .checksum = fixed_checksum,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), (try migrator.apply(&fixed)).applied);
+    try std.testing.expectError(error.MigrationNotDirty, migrator.repairDirty(1, fixed_checksum));
+    try conn.ping();
 }
 
 test "SQLite migration apply refuses existing dirty migration state" {

@@ -377,6 +377,8 @@ test "postgres live: failed migration persists dirty state after rollback" {
     defer config.deinit();
     var conn = try pg.Conn.open(allocator, io, config);
     defer conn.deinit();
+    _ = try conn.exec("drop table if exists zsql_repaired");
+    defer _ = conn.exec("drop table if exists zsql_repaired") catch {};
     _ = try conn.exec("drop table if exists zsql_migrations");
     defer _ = conn.exec("drop table if exists zsql_migrations") catch {};
 
@@ -398,6 +400,21 @@ test "postgres live: failed migration persists dirty state after rollback" {
     try std.testing.expectEqual(@as(usize, 1), status.records.len);
     try std.testing.expect(status.records[0].dirty);
     try std.testing.expectError(error.MigrationDirty, migrator.apply(&migrations));
+
+    const fixed_sql = "create table zsql_repaired (id bigint primary key)";
+    const fixed_checksum = zsql.migrate.checksumSql(fixed_sql);
+    try std.testing.expectError(error.MigrationChecksumMismatch, migrator.repairDirty(1, fixed_checksum));
+    try migrator.repairDirty(1, migrations[0].checksum);
+    try std.testing.expectError(error.MigrationNotFound, migrator.repairDirty(99, migrations[0].checksum));
+
+    const fixed = [_]zsql.migrate.MigrationFile{.{
+        .id = migrations[0].id,
+        .sql = fixed_sql,
+        .checksum = fixed_checksum,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), (try migrator.apply(&fixed)).applied);
+    try std.testing.expectError(error.MigrationNotDirty, migrator.repairDirty(1, fixed_checksum));
+    try conn.ping();
 }
 
 test "postgres live: copy in and out bytes" {

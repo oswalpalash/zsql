@@ -217,6 +217,39 @@ pub const Migrator = struct {
         });
     }
 
+    /// Remove one dirty history row only when version and checksum match.
+    /// This never marks a migration clean; callers must rerun repaired SQL.
+    pub fn repairDirty(self: Migrator, version: u64, expected_checksum: core.migrate.Checksum) !void {
+        try self.ensureTable();
+        try self.lock();
+        defer self.unlock();
+
+        try self.conn.begin();
+        errdefer self.conn.rollbackIfOpen();
+
+        var record = self.conn.queryOneParams(
+            "select checksum, dirty from zsql_migrations where version = $1 for update",
+            &.{.{ .integer = try toI64(version) }},
+        ) catch |err| switch (err) {
+            error.NoRows => return error.MigrationNotFound,
+            else => return err,
+        };
+        defer record.deinit();
+        const stored_checksum = try parseChecksum(try (try record.getName("checksum")).asText());
+        if (!try (try record.getName("dirty")).asBool()) return error.MigrationNotDirty;
+        if (!std.mem.eql(u8, &stored_checksum, &expected_checksum)) return error.MigrationChecksumMismatch;
+
+        const result = try self.conn.execParams(
+            "delete from zsql_migrations where version = $1 and checksum = $2 and dirty = true",
+            &.{
+                .{ .integer = try toI64(version) },
+                .{ .text = &expected_checksum },
+            },
+        );
+        if (result.rows_affected != 1) return error.MigrationVersionConflict;
+        try self.conn.commit();
+    }
+
     /// Alias for `apply` matching the public API target (`Migrator.up`).
     pub fn up(self: Migrator, migrations: []const core.migrate.MigrationFile) !ApplyResult {
         return self.apply(migrations);

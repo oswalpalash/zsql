@@ -409,6 +409,11 @@ fails, schema changes roll back and zsql persists that version/checksum as
 operator inspects and repairs or removes the failed record; zsql does not hide
 or automatically retry an uncertain migration.
 
+`Migrator(D).repairDirty(version, expected_checksum)` is the guarded repair
+primitive. It locks migration history, requires an existing dirty row and exact
+checksum match, then deletes only that row so corrected migration SQL can rerun.
+It never marks schema state clean.
+
 ```sh
 zig build run -- --help
 zig build run -- doctor
