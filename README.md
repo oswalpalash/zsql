@@ -475,6 +475,13 @@ indexes share one bind slot, anonymous indexes advance after explicit indexes,
 and mixed named/positional styles or duplicate named argument specs are
 rejected before runtime.
 
+Typed result checks reject authoritative PostgreSQL width narrowing (`int8` to
+`i32`, `float8` to `f32`) and keep exact decimal values on
+`zsql.types.Numeric`; PostgreSQL `numeric` is not treated as a binary float.
+SQLite affinity names do not carry authoritative widths, so generated
+`INTEGER` and `REAL` fields use the driver's non-narrowing `i64` and `f64`
+representations.
+
 When `from_table` / `from_tables` are omitted, `checkQuery` best-effort extracts
 `FROM` / `JOIN` table names and aliases from the SQL. `check_where`,
 `check_join_on`, and `check_order_by` are opt-in: they resolve simple column refs

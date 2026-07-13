@@ -350,12 +350,25 @@ fn typesCompatible(want: []const u8, have: []const u8) bool {
     const a = normalizeTypeName(want);
     const b = normalizeTypeName(have);
     if (std.ascii.eqlIgnoreCase(a, b)) return true;
-    // Integer family
-    if (isIntegerType(a) and isIntegerType(b)) return true;
+    // PostgreSQL inspection emits authoritative int2/int4/int8 and
+    // float4/float8 names. Reject narrowing there. Generic SQL aliases come
+    // from SQLite affinity declarations, whose width is not authoritative.
+    if (isIntegerType(a) and isIntegerType(b)) {
+        const want_bits = fixedIntegerBits(a);
+        const have_bits = fixedIntegerBits(b);
+        if (want_bits != null and have_bits != null) return want_bits.? >= have_bits.?;
+        return true;
+    }
     // Text family
     if (isTextType(a) and isTextType(b)) return true;
-    // Float family
-    if (isFloatType(a) and isFloatType(b)) return true;
+    // Binary float family; decimal/numeric is text-backed and separate.
+    if (isFloatType(a) and isFloatType(b)) {
+        const want_bits = fixedFloatBits(a);
+        const have_bits = fixedFloatBits(b);
+        if (want_bits != null and have_bits != null) return want_bits.? >= have_bits.?;
+        return true;
+    }
+    if (isNumericType(a) and isNumericType(b)) return true;
     // Bool family
     if (isBoolType(a) and isBoolType(b)) return true;
     // Blob family
@@ -383,6 +396,13 @@ fn isIntegerType(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "bigserial");
 }
 
+fn fixedIntegerBits(name: []const u8) ?u8 {
+    if (std.ascii.eqlIgnoreCase(name, "int2")) return 16;
+    if (std.ascii.eqlIgnoreCase(name, "int4")) return 32;
+    if (std.ascii.eqlIgnoreCase(name, "int8")) return 64;
+    return null;
+}
+
 fn isTextType(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "text") or
         std.ascii.eqlIgnoreCase(name, "varchar") or
@@ -397,8 +417,18 @@ fn isFloatType(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "float") or
         std.ascii.eqlIgnoreCase(name, "float4") or
         std.ascii.eqlIgnoreCase(name, "float8") or
-        std.ascii.eqlIgnoreCase(name, "double") or
-        std.ascii.eqlIgnoreCase(name, "numeric");
+        std.ascii.eqlIgnoreCase(name, "double");
+}
+
+fn fixedFloatBits(name: []const u8) ?u8 {
+    if (std.ascii.eqlIgnoreCase(name, "float4")) return 32;
+    if (std.ascii.eqlIgnoreCase(name, "float8")) return 64;
+    return null;
+}
+
+fn isNumericType(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "numeric") or
+        std.ascii.eqlIgnoreCase(name, "decimal");
 }
 
 fn isBoolType(name: []const u8) bool {
@@ -1353,9 +1383,15 @@ test "checkQuery enforces exact placeholder contracts" {
 test "typesCompatible accepts common cross-driver aliases" {
     try std.testing.expect(typesCompatible("INTEGER", "int4"));
     try std.testing.expect(typesCompatible("bigint", "INTEGER"));
+    try std.testing.expect(typesCompatible("INT8", "int4"));
+    try std.testing.expect(!typesCompatible("INT4", "int8"));
     try std.testing.expect(typesCompatible("TEXT", "varchar"));
     try std.testing.expect(typesCompatible("BOOLEAN", "bool"));
     try std.testing.expect(typesCompatible("BLOB", "bytea"));
+    try std.testing.expect(typesCompatible("FLOAT8", "float4"));
+    try std.testing.expect(!typesCompatible("FLOAT4", "float8"));
+    try std.testing.expect(typesCompatible("NUMERIC", "decimal"));
+    try std.testing.expect(!typesCompatible("FLOAT8", "numeric"));
     try std.testing.expect(!typesCompatible("TEXT", "INTEGER"));
 }
 
@@ -1437,6 +1473,43 @@ test "typed checkedQuery validates zsql domain wrappers" {
         .from_table = "documents",
     });
     try q.validate(schema);
+}
+
+test "typed checkedQuery rejects authoritative numeric narrowing" {
+    const schema = inspect.Schema{ .tables = &.{.{ .name = "metrics", .columns = &.{
+        .{ .name = "wide_int", .type_name = "int8", .nullable = false },
+        .{ .name = "narrow_int", .type_name = "int4", .nullable = false },
+        .{ .name = "wide_float", .type_name = "float8", .nullable = false },
+        .{ .name = "amount", .type_name = "numeric", .nullable = false },
+    } }} };
+
+    const narrow_int = checkedQuery(.{
+        .sql = "select wide_int from metrics",
+        .row = struct { wide_int: i32 },
+        .from_table = "metrics",
+    });
+    try std.testing.expectError(error.TypeMismatch, narrow_int.validate(schema));
+
+    const widened_int = checkedQuery(.{
+        .sql = "select narrow_int from metrics",
+        .row = struct { narrow_int: i64 },
+        .from_table = "metrics",
+    });
+    try widened_int.validate(schema);
+
+    const narrow_float = checkedQuery(.{
+        .sql = "select wide_float from metrics",
+        .row = struct { wide_float: f32 },
+        .from_table = "metrics",
+    });
+    try std.testing.expectError(error.TypeMismatch, narrow_float.validate(schema));
+
+    const decimal_as_float = checkedQuery(.{
+        .sql = "select amount from metrics",
+        .row = struct { amount: f64 },
+        .from_table = "metrics",
+    });
+    try std.testing.expectError(error.TypeMismatch, decimal_as_float.validate(schema));
 }
 
 test "typed checkedQuery maps 8-bit integers to INT2" {
