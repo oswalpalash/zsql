@@ -701,6 +701,8 @@ The four-digit version field is minimum padding, not a ceiling; exhaustion at
 `u64` maximum returns `MigrationVersionConflict` instead of wrapping to zero.
 Atomic replacement preserves an existing regular file's permissions, so
 regenerating a private schema artifact does not silently broaden its access.
+Missing parent directories in an explicit output path are created only after
+the command has successfully rendered the complete artifact in memory.
 
 Generated struct files import `zsql` themselves, map supported SQL domain types
 to `zsql.types.*`, and preserve database nullability with optional Zig fields.

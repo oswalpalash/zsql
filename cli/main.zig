@@ -90,6 +90,7 @@ fn writeFileAtomic(
         break :permissions if (stat.kind == .file) stat.permissions else .default_file;
     } else .default_file;
     var atomic_file = try dir.createFileAtomic(io, sub_path, .{
+        .make_path = true,
         .permissions = permissions,
         .replace = replace,
     });
@@ -497,6 +498,27 @@ test "atomic CLI artifact replacement preserves existing file permissions" {
     const after = try tmp.dir.statFile(std.testing.io, "schema.zon", .{});
 
     try std.testing.expectEqual(before.permissions, after.permissions);
+}
+
+test "atomic CLI artifact publication creates missing output parents" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFileAtomic(
+        tmp.dir,
+        std.testing.io,
+        "generated/db/schema.zon",
+        "schema\n",
+        .replace,
+    );
+    const contents = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "generated/db/schema.zon",
+        std.testing.allocator,
+        .limited(1024),
+    );
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings("schema\n", contents);
 }
 
 test "atomic CLI artifact creation preserves existing destination and cleans temporary file" {
