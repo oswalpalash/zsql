@@ -68,13 +68,13 @@ pub fn writeSchemaZon(writer: *std.Io.Writer, schema: Schema) !void {
     for (schema.tables) |table| {
         try writer.writeAll("        .{ ");
         if (table.schema) |schema_name| {
-            try writer.print(".schema = \"{s}\", ", .{schema_name});
+            try writer.print(".schema = \"{f}\", ", .{std.zig.fmtString(schema_name)});
         }
-        try writer.print(".name = \"{s}\", .columns = .{{\n", .{table.name});
+        try writer.print(".name = \"{f}\", .columns = .{{\n", .{std.zig.fmtString(table.name)});
         for (table.columns) |col| {
             try writer.print(
-                "            .{{ .name = \"{s}\", .type_name = \"{s}\", .nullable = {}, .primary_key = {} }},\n",
-                .{ col.name, col.type_name, col.nullable, col.primary_key },
+                "            .{{ .name = \"{f}\", .type_name = \"{f}\", .nullable = {}, .primary_key = {} }},\n",
+                .{ std.zig.fmtString(col.name), std.zig.fmtString(col.type_name), col.nullable, col.primary_key },
             );
         }
         if (table.indexes.len == 0) {
@@ -82,10 +82,10 @@ pub fn writeSchemaZon(writer: *std.Io.Writer, schema: Schema) !void {
         } else {
             try writer.writeAll("        }, .indexes = .{\n");
             for (table.indexes) |idx| {
-                try writer.print("            .{{ .name = \"{s}\", .unique = {}, .columns = .{{", .{ idx.name, idx.unique });
+                try writer.print("            .{{ .name = \"{f}\", .unique = {}, .columns = .{{", .{ std.zig.fmtString(idx.name), idx.unique });
                 for (idx.columns, 0..) |col, i| {
                     if (i != 0) try writer.writeAll(", ");
-                    try writer.print("\"{s}\"", .{col});
+                    try writer.print("\"{f}\"", .{std.zig.fmtString(col)});
                 }
                 try writer.writeAll("} },\n");
             }
@@ -324,6 +324,39 @@ test "writeSchemaZon preserves structured PostgreSQL table identity" {
     try std.testing.expectEqual(Dialect.postgres, parsed.dialect);
     try std.testing.expectEqualStrings("audit", parsed.tables[0].schema.?);
     try std.testing.expectEqualStrings("events", parsed.tables[0].name);
+}
+
+test "writeSchemaZon escapes and round trips every catalog string" {
+    const original = Schema{ .dialect = .postgres, .tables = &.{.{
+        .schema = "odd\"\\\n\x00\xff",
+        .name = "table\t\"name",
+        .columns = &.{.{
+            .name = "column\r\n\\\"",
+            .type_name = "type\x07\xff",
+            .nullable = true,
+        }},
+        .indexes = &.{.{
+            .name = "index\n\"\\",
+            .unique = true,
+            .columns = &.{"column\r\n\\\""},
+        }},
+    }} };
+    var buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeSchemaZon(&writer, original);
+
+    const source = try std.testing.allocator.dupeZ(u8, writer.buffered());
+    defer std.testing.allocator.free(source);
+    const parsed = try parseSchemaZon(std.testing.allocator, source);
+    defer freeParsedSchemaZon(std.testing.allocator, parsed);
+
+    const table = parsed.tables[0];
+    try std.testing.expectEqualStrings(original.tables[0].schema.?, table.schema.?);
+    try std.testing.expectEqualStrings(original.tables[0].name, table.name);
+    try std.testing.expectEqualStrings(original.tables[0].columns[0].name, table.columns[0].name);
+    try std.testing.expectEqualStrings(original.tables[0].columns[0].type_name, table.columns[0].type_name);
+    try std.testing.expectEqualStrings(original.tables[0].indexes[0].name, table.indexes[0].name);
+    try std.testing.expectEqualStrings(original.tables[0].indexes[0].columns[0], table.indexes[0].columns[0]);
 }
 
 test "columnsFromSqliteTableInfo maps nullability and pk" {
