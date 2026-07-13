@@ -621,6 +621,31 @@ test "postgres live: copy in and out bytes" {
     try conn.ping();
 }
 
+test "postgres live: asynchronous notifications preserve session reuse" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+
+    var listener = try pg.Conn.open(allocator, std.testing.io, config);
+    defer listener.deinit();
+    var sender = try pg.Conn.open(allocator, std.testing.io, config);
+    defer sender.deinit();
+
+    try listener.listen("zsql_live_events");
+    _ = try sender.exec("notify zsql_live_events, 'ready'");
+    var notification = try listener.nextNotification();
+    defer notification.deinit(allocator);
+    try std.testing.expectEqualStrings("zsql_live_events", notification.channel);
+    try std.testing.expectEqualStrings("ready", notification.payload);
+
+    try listener.unlisten("zsql_live_events");
+    try listener.ping();
+}
+
 test "postgres live: statement cache reuses named prepares" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

@@ -826,10 +826,24 @@ pub const Conn = struct {
             const msg = try self.readMessage();
             defer self.allocator.free(msg.body);
             switch (msg.tag) {
-                .notification_response => return Notification.parse(self.allocator, msg.body),
+                .notification_response => return Notification.parse(self.allocator, msg.body) catch |err| {
+                    // OOM happens after the complete message was consumed and
+                    // does not desynchronize the session. Malformed payloads
+                    // mean the wire stream itself cannot be trusted.
+                    if (err != error.OutOfMemory) self.broken = true;
+                    return err;
+                },
                 .parameter_status, .notice_response => {},
-                .error_response => return self.failFromErrorResponse(msg.body, true, null),
-                else => return error.ProtocolError,
+                .error_response => {
+                    // No command is outstanding, so there is no guaranteed
+                    // ReadyForQuery boundary to drain to.
+                    self.broken = true;
+                    return self.failFromErrorResponse(msg.body, false, null);
+                },
+                else => {
+                    self.broken = true;
+                    return error.ProtocolError;
+                },
             }
         }
     }
