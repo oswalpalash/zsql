@@ -37,7 +37,7 @@ pub const ArgSpec = struct {
 
 pub const FieldSpec = struct {
     name: []const u8,
-    /// Optional: when set, must match a schema column type name (case-insensitive).
+    /// Optional: when set, must match the resolved result type (case-insensitive).
     type_name: ?[]const u8 = null,
     nullable: bool = false,
 };
@@ -49,15 +49,20 @@ const TableRef = struct {
     alias: ?[]const u8 = null,
 };
 
+const ProjectionKind = enum {
+    column,
+    star,
+    count,
+};
+
 const Projection = struct {
-    /// Unqualified column name, or the part after the last `.`.
+    /// Unqualified source column name, `*`, or the COUNT argument.
     column: []const u8,
     /// Optional table or alias qualifier before `.`.
     qualifier: ?[]const u8 = null,
     /// Result-column name introduced by `AS alias` or a bare alias.
     alias: ?[]const u8 = null,
-    /// True for `*` or `table.*` — skipped for type checks, still requires known table.
-    is_star: bool = false,
+    kind: ProjectionKind = .column,
 };
 
 const max_tables = 16;
@@ -65,12 +70,13 @@ const max_projections = 64;
 
 /// Lightweight offline SQL check against a schema artifact and parameter/row specs.
 ///
-/// Validates placeholders and maps each declared result field to a simple
-/// SELECT projection, including aliases and stars. Supports multi-table / JOIN
-/// scope via `from_tables`, qualified column names (`users.email` / `u.email`),
-/// optional SELECT-list projection checks (`check_projections`), optional WHERE
-/// column checks (`check_where`), optional JOIN ON column checks
-/// (`check_join_on`), and optional ORDER BY column checks (`check_order_by`).
+/// Validates placeholders and maps each declared result field to a supported
+/// SELECT projection: simple columns, aliases, stars, and portable COUNT forms.
+/// Supports multi-table / JOIN scope via `from_tables`, qualified column names
+/// (`users.email` / `u.email`), optional SELECT-list projection checks
+/// (`check_projections`), optional WHERE column checks (`check_where`), optional
+/// JOIN ON column checks (`check_join_on`), and optional ORDER BY column checks
+/// (`check_order_by`).
 ///
 /// Values are never required at check time. Allocation-free.
 pub fn checkQuery(options: struct {
@@ -162,23 +168,27 @@ pub fn checkQuery(options: struct {
     if (options.row.len != 0) {
         for (options.row) |field| {
             const resolved = try resolveProjectedField(options.schema, resolve_scope, projs, field.name);
-            try checkFieldAgainstColumn(field, resolved.col);
+            try checkFieldAgainstColumn(field, resolved);
         }
     }
 
     if (check_projections) {
         for (projs) |proj| {
-            if (proj.is_star) {
-                if (proj.qualifier) |q| {
-                    // table.* — qualifier must resolve to a known table/alias in scope.
-                    _ = findTableRef(resolve_scope, q) orelse return error.UnknownTable;
-                }
-                continue;
-            }
-            if (proj.qualifier) |q| {
-                _ = try resolveQualified(options.schema, resolve_scope, q, proj.column);
-            } else {
-                _ = try resolveField(options.schema, resolve_scope, proj.column);
+            switch (proj.kind) {
+                .star => {
+                    if (proj.qualifier) |q| {
+                        // table.* — qualifier must resolve to a known table/alias in scope.
+                        _ = findTableRef(resolve_scope, q) orelse return error.UnknownTable;
+                    }
+                },
+                .count => _ = try resolveCountProjection(options.schema, resolve_scope, proj),
+                .column => {
+                    if (proj.qualifier) |q| {
+                        _ = try resolveQualified(options.schema, resolve_scope, q, proj.column);
+                    } else {
+                        _ = try resolveField(options.schema, resolve_scope, proj.column);
+                    }
+                },
             }
         }
     }
@@ -236,23 +246,27 @@ fn resolveProjectedField(
     scope: []const TableRef,
     projections: []const Projection,
     field_name: []const u8,
-) CheckError!ResolvedColumn {
-    var match: ?ResolvedColumn = null;
+) CheckError!inspect.Column {
+    var match: ?inspect.Column = null;
     for (projections) |projection| {
-        if (projection.is_star) continue;
+        if (projection.kind == .star) continue;
         if (!projectionMatchesField(projection, field_name)) continue;
-        const resolved = if (projection.qualifier) |qualifier|
-            try resolveQualified(schema, scope, qualifier, projection.column)
-        else
-            try resolveField(schema, scope, projection.column);
-        try addProjectionMatch(&match, resolved);
+        const column = switch (projection.kind) {
+            .column => if (projection.qualifier) |qualifier|
+                (try resolveQualified(schema, scope, qualifier, projection.column)).col
+            else
+                (try resolveField(schema, scope, projection.column)).col,
+            .count => try resolveCountProjection(schema, scope, projection),
+            .star => unreachable,
+        };
+        try addProjectionMatch(&match, column);
     }
 
     const dot = std.mem.indexOfScalar(u8, field_name, '.');
     const field_qualifier = if (dot) |index| field_name[0..index] else null;
     const column_name = if (dot) |index| field_name[index + 1 ..] else field_name;
     for (projections) |projection| {
-        if (!projection.is_star) continue;
+        if (projection.kind != .star) continue;
         if (projection.qualifier) |star_qualifier| {
             const table_ref = findTableRef(scope, star_qualifier) orelse return error.UnknownTable;
             if (field_qualifier) |qualifier| {
@@ -261,7 +275,7 @@ fn resolveProjectedField(
             }
             const table = findTable(schema, table_ref.name) orelse return error.UnknownTable;
             const column = findColumn(table, column_name) orelse continue;
-            try addProjectionMatch(&match, .{ .table = table, .col = column });
+            try addProjectionMatch(&match, column);
         } else {
             for (scope) |table_ref| {
                 if (field_qualifier) |qualifier| {
@@ -270,19 +284,38 @@ fn resolveProjectedField(
                 }
                 const table = findTable(schema, table_ref.name) orelse continue;
                 const column = findColumn(table, column_name) orelse continue;
-                try addProjectionMatch(&match, .{ .table = table, .col = column });
+                try addProjectionMatch(&match, column);
             }
         }
     }
     return match orelse error.RowFieldNotProjected;
 }
 
-fn addProjectionMatch(match: *?ResolvedColumn, candidate: ResolvedColumn) CheckError!void {
+fn resolveCountProjection(schema: inspect.Schema, scope: []const TableRef, projection: Projection) CheckError!inspect.Column {
+    if (!std.mem.eql(u8, projection.column, "*")) {
+        if (projection.qualifier) |qualifier| {
+            _ = try resolveQualified(schema, scope, qualifier, projection.column);
+        } else {
+            _ = try resolveField(schema, scope, projection.column);
+        }
+    }
+    return .{
+        .name = projection.alias orelse "count",
+        .type_name = "INT8",
+        .nullable = false,
+    };
+}
+
+fn addProjectionMatch(match: *?inspect.Column, candidate: inspect.Column) CheckError!void {
     if (match.* != null) return error.AmbiguousProjection;
     match.* = candidate;
 }
 
 fn projectionMatchesField(projection: Projection, field_name: []const u8) bool {
+    if (projection.kind == .count) {
+        const alias = projection.alias orelse return false;
+        return std.mem.eql(u8, alias, field_name);
+    }
     if (projection.alias) |alias| return std.mem.eql(u8, alias, field_name);
     if (std.mem.indexOfScalar(u8, field_name, '.')) |dot| {
         const qualifier = projection.qualifier orelse return false;
@@ -830,7 +863,8 @@ fn parseFromJoinTables(sql: []const u8, schema: inspect.Schema, buf: *[max_table
     return buf[0..count];
 }
 
-/// Parse simple SELECT projections up to FROM. Expressions with `(` are skipped.
+/// Parse simple SELECT projections up to FROM. Portable COUNT projections are
+/// recognized; other expressions with `(` are skipped.
 fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
     var sc = Scanner.init(sql);
     // Optional WITH ... skip to SELECT (best-effort: first SELECT)
@@ -856,7 +890,9 @@ fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) Ch
             try sc.skipTrivia();
         }
 
-        // If expression starts with '(' or is a function call (ident followed by '('), skip to next comma/from.
+        // Parenthesized expressions and unsupported function calls are skipped.
+        // COUNT has a portable non-null INT8 result, so recognize its bounded
+        // star/simple-column forms rather than inferring arbitrary expressions.
         const item_start = sc.index;
         const first = try sc.readIdentOrStar();
         if (first == null) {
@@ -867,48 +903,43 @@ fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) Ch
 
         try sc.skipTrivia();
         if (sc.peek() == '(') {
-            // function call / expression — skip
-            sc.index = item_start;
-            try skipSelectItem(&sc);
-            continue;
-        }
-
-        // first may be *, table, or column
-        const projection_index = count;
-        if (std.mem.eql(u8, first.?, "*")) {
-            buf[count] = .{ .column = "*", .is_star = true };
-            count += 1;
-        } else if (sc.peek() == '.') {
-            sc.advance();
-            const second = try sc.readIdentOrStar() orelse return error.InvalidSql;
-            if (std.mem.eql(u8, second, "*")) {
-                buf[count] = .{ .column = "*", .qualifier = first.?, .is_star = true };
-            } else {
-                buf[count] = .{ .column = second, .qualifier = first.? };
-            }
-            count += 1;
-        } else {
-            buf[count] = .{ .column = first.? };
-            count += 1;
-        }
-
-        // Optional AS alias or bare alias.
-        try sc.skipTrivia();
-        if (try sc.matchKeyword("as")) {
-            const alias = try sc.readIdentOrStar() orelse return error.InvalidSql;
-            if (std.mem.eql(u8, alias, "*")) return error.InvalidSql;
-            buf[projection_index].alias = alias;
-        } else {
-            // bare alias before comma/from
-            const save = sc.index;
-            if (!sc.startsWithKeyword("from") and sc.peek() != ',' and sc.peek() != ';') {
-                if (try sc.readIdentOrStar()) |alias| {
-                    if (std.mem.eql(u8, alias, "*")) return error.InvalidSql;
-                    buf[projection_index].alias = alias;
+            if (std.ascii.eqlIgnoreCase(first.?, "count")) {
+                var candidate = sc;
+                if (try parseCountProjection(&candidate)) |projection| {
+                    buf[count] = projection;
+                    count += 1;
+                    sc = candidate;
                 } else {
-                    sc.index = save;
+                    sc.index = item_start;
+                    try skipSelectItem(&sc);
+                    continue;
                 }
+            } else {
+                sc.index = item_start;
+                try skipSelectItem(&sc);
+                continue;
             }
+        } else {
+            // first may be *, table, or column
+            const projection_index = count;
+            if (std.mem.eql(u8, first.?, "*")) {
+                buf[count] = .{ .column = "*", .kind = .star };
+                count += 1;
+            } else if (sc.peek() == '.') {
+                sc.advance();
+                const second = try sc.readIdentOrStar() orelse return error.InvalidSql;
+                if (std.mem.eql(u8, second, "*")) {
+                    buf[count] = .{ .column = "*", .qualifier = first.?, .kind = .star };
+                } else {
+                    buf[count] = .{ .column = second, .qualifier = first.? };
+                }
+                count += 1;
+            } else {
+                buf[count] = .{ .column = first.? };
+                count += 1;
+            }
+
+            try parseProjectionAlias(&sc, &buf[projection_index]);
         }
 
         try sc.skipTrivia();
@@ -924,6 +955,62 @@ fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) Ch
         if (!sc.startsWithKeyword("from") and sc.peek() != ';') return error.TooManyProjections;
     }
     return buf[0..count];
+}
+
+fn parseCountProjection(sc: *Scanner) CheckError!?Projection {
+    if (sc.peek() != '(') return null;
+    sc.advance();
+    try sc.skipTrivia();
+    const distinct = try sc.matchKeyword("distinct");
+    const first = try sc.readIdentOrStar() orelse return null;
+
+    var projection = Projection{ .column = first, .kind = .count };
+    if (std.mem.eql(u8, first, "*")) {
+        if (distinct) return null;
+    } else {
+        try sc.skipTrivia();
+        if (sc.peek() == '.') {
+            sc.advance();
+            const second = try sc.readIdentOrStar() orelse return null;
+            if (std.mem.eql(u8, second, "*")) return null;
+            projection.qualifier = first;
+            projection.column = second;
+        }
+    }
+
+    try sc.skipTrivia();
+    if (sc.peek() != ')') return null;
+    sc.advance();
+    try sc.skipTrivia();
+    if (sc.startsWithKeyword("filter") or sc.startsWithKeyword("over")) return null;
+    try parseProjectionAlias(sc, &projection);
+    try sc.skipTrivia();
+    if (sc.index < sc.sql.len and
+        sc.peek() != ',' and
+        sc.peek() != ';' and
+        !sc.startsWithKeyword("from")) return null;
+    return projection;
+}
+
+fn parseProjectionAlias(sc: *Scanner, projection: *Projection) CheckError!void {
+    try sc.skipTrivia();
+    if (try sc.matchKeyword("as")) {
+        const alias = try sc.readIdentOrStar() orelse return error.InvalidSql;
+        if (std.mem.eql(u8, alias, "*")) return error.InvalidSql;
+        projection.alias = alias;
+        return;
+    }
+
+    // Bare alias before comma/from.
+    const save = sc.index;
+    if (!sc.startsWithKeyword("from") and sc.peek() != ',' and sc.peek() != ';') {
+        if (try sc.readIdentOrStar()) |alias| {
+            if (std.mem.eql(u8, alias, "*")) return error.InvalidSql;
+            projection.alias = alias;
+        } else {
+            sc.index = save;
+        }
+    }
 }
 
 fn skipSelectItem(sc: *Scanner) CheckError!void {
@@ -1884,6 +1971,75 @@ test "checked row fields must be returned projections" {
     }));
 }
 
+test "checked rows support bounded count projection aliases" {
+    const schema = inspect.Schema{ .tables = &.{.{
+        .name = "users",
+        .columns = &.{
+            .{ .name = "id", .type_name = "int8", .nullable = false },
+            .{ .name = "email", .type_name = "text", .nullable = true },
+        },
+    }} };
+
+    const count_all = checkedQuery(.{
+        .sql = "select count(*) as total from users",
+        .row = struct { total: i64 },
+    });
+    try count_all.validate(schema);
+    try checkQuery(.{
+        .sql = "select count(*) as total",
+        .schema = .{ .tables = &.{} },
+        .row = &.{.{ .name = "total", .type_name = "INT8" }},
+    });
+
+    try checkQuery(.{
+        .sql = "select count(distinct u.email) addresses from users u",
+        .schema = schema,
+        .row = &.{.{ .name = "addresses", .type_name = "INT8", .nullable = false }},
+        .check_projections = true,
+    });
+    try std.testing.expectError(error.TypeMismatch, checkQuery(.{
+        .sql = "select count(*) as total from users",
+        .schema = schema,
+        .row = &.{.{ .name = "total", .type_name = "INT4" }},
+    }));
+    try std.testing.expectError(error.AmbiguousProjection, checkQuery(.{
+        .sql = "select count(*) as total, id as total from users",
+        .schema = schema,
+        .row = &.{.{ .name = "total", .type_name = "INT8" }},
+    }));
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select count(u.missing) as total from users u",
+        .schema = schema,
+        .row = &.{.{ .name = "total", .type_name = "INT8" }},
+    }));
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select count(u.missing) from users u",
+        .schema = schema,
+        .check_projections = true,
+    }));
+    try std.testing.expectError(error.RowFieldNotProjected, checkQuery(.{
+        .sql = "select count(*) from users",
+        .schema = schema,
+        .row = &.{.{ .name = "total", .type_name = "INT8" }},
+    }));
+
+    // Dialect-sensitive and context-sensitive expressions remain outside the
+    // bounded inference contract, even when they expose an alias.
+    for ([_][]const u8{
+        "select sum(id) as total from users",
+        "select count(id + 1) as total from users",
+        "select count(*) filter (where id > 0) as total from users",
+        "select count(*) over () as total from users",
+        "select count(*)::bigint as total from users",
+    }) |sql| {
+        try std.testing.expectError(error.RowFieldNotProjected, checkQuery(.{
+            .sql = sql,
+            .schema = schema,
+            .row = &.{.{ .name = "total", .type_name = "INT8" }},
+        }));
+    }
+}
+
 test "check level enables result-shape validation" {
     const schema = inspect.Schema{ .tables = &.{.{ .name = "users", .columns = &.{
         .{ .name = "id", .type_name = "INTEGER", .nullable = false },
@@ -2190,6 +2346,12 @@ test "checkQuery order by column refs resolve against scope" {
     try checkQuery(.{
         .sql = "select email as address from users order by address",
         .schema = schema,
+        .check_order_by = true,
+    });
+    try checkQuery(.{
+        .sql = "select count(*) as total from users order by total",
+        .schema = schema,
+        .row = &.{.{ .name = "total", .type_name = "INT8" }},
         .check_order_by = true,
     });
 
