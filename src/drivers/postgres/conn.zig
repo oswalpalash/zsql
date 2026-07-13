@@ -1434,11 +1434,22 @@ pub const Conn = struct {
         }
 
         var rows_affected: u64 = 0;
+        var completed_commands: usize = 0;
+        var saw_row_description = false;
         while (true) {
             const msg = try self.readMessage();
             defer self.allocator.free(msg.body);
             switch (msg.tag) {
                 .row_description => {
+                    // Simple-query protocol may return multiple command result
+                    // sets, but SimpleRows deliberately has one shared schema.
+                    // Reject instead of relabeling earlier rows with a later
+                    // RowDescription.
+                    if (saw_row_description or completed_commands != 0) {
+                        self.drainUntilReady();
+                        return error.Unsupported;
+                    }
+                    saw_row_description = true;
                     if (columns.len != 0) self.allocator.free(columns);
                     columns = try protocol.parseRowDescription(msg.body, self.allocator);
                     for (column_names.items) |name| self.allocator.free(name);
@@ -1455,10 +1466,21 @@ pub const Conn = struct {
                     try appendDecodedRow(self.allocator, &rows, data_cols, columns);
                 },
                 .command_complete => {
+                    completed_commands += 1;
+                    if (completed_commands > 1) {
+                        self.drainUntilReady();
+                        return error.Unsupported;
+                    }
                     const tag = try protocol.parseCommandComplete(msg.body);
                     rows_affected = types.parseCommandTag(tag).rows_affected;
                 },
-                .empty_query_response => {},
+                .empty_query_response => {
+                    completed_commands += 1;
+                    if (completed_commands > 1 or saw_row_description) {
+                        self.drainUntilReady();
+                        return error.Unsupported;
+                    }
+                },
                 .ready_for_query => {
                     self.tx_status = try protocol.parseReadyForQuery(msg.body);
                     const names = try column_names.toOwnedSlice(self.allocator);

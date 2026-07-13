@@ -397,6 +397,10 @@ Postgres `SimpleRow` exposes the same `get` / `getName` / `as` / `asName` / `to`
 PostgreSQL `bytea` is allocator-owned by `SimpleRows` and decoded to the original
 bytes for both server `hex` and `escape` output modes; wire hex characters are
 never exposed as blob contents.
+PostgreSQL `query` accepts one command/result schema per call. Multi-command
+simple-query results return `error.Unsupported` after draining to
+`ReadyForQuery`, avoiding ambiguous flattening or mislabeled columns; use
+separate query calls instead.
 
 `zsql.types.Text`, `Blob`, `Numeric`, and canonical-text `Uuid` decode through
 the same borrowed row path. PostgreSQL `date`, `time`, `timestamp`, and
