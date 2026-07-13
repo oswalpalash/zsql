@@ -463,32 +463,44 @@ test "postgres live: inspectSchema exports user tables" {
     defer conn.deinit();
 
     _ = try conn.exec("drop table if exists zsql_inspect_demo");
+    _ = try conn.exec("drop schema if exists zsql_inspect_audit cascade");
+    defer {
+        _ = conn.exec("drop table if exists zsql_inspect_demo") catch {};
+        _ = conn.exec("drop schema if exists zsql_inspect_audit cascade") catch {};
+    }
     _ = try conn.exec(
         \\create table zsql_inspect_demo (
         \\  id bigserial primary key,
         \\  email text not null
         \\)
     );
+    _ = try conn.exec("create schema zsql_inspect_audit");
+    _ = try conn.exec("create table zsql_inspect_audit.events (id bigint primary key)");
 
     const schema = try conn.inspectSchema(allocator);
     defer pg.freeInspectedSchema(allocator, schema);
     try std.testing.expectEqual(zsql.inspect.Dialect.postgres, schema.dialect);
 
-    var found = false;
+    var found_public = false;
+    var found_audit = false;
     for (schema.tables) |table| {
-        if (std.mem.eql(u8, table.name, "zsql_inspect_demo")) {
-            found = true;
+        if (std.mem.eql(u8, table.schema orelse "", "public") and
+            std.mem.eql(u8, table.name, "zsql_inspect_demo"))
+        {
+            found_public = true;
             try std.testing.expect(table.columns.len >= 2);
         }
+        if (std.mem.eql(u8, table.schema orelse "", "zsql_inspect_audit") and
+            std.mem.eql(u8, table.name, "events")) found_audit = true;
     }
-    try std.testing.expect(found);
+    try std.testing.expect(found_public);
+    try std.testing.expect(found_audit);
 
     var growing: std.Io.Writer.Allocating = .init(allocator);
     defer growing.deinit();
     try zsql.inspect.writeSchemaZon(&growing.writer, schema);
     try std.testing.expect(std.mem.indexOf(u8, growing.written(), "zsql_inspect_demo") != null);
-
-    _ = try conn.exec("drop table if exists zsql_inspect_demo");
+    try std.testing.expect(std.mem.indexOf(u8, growing.written(), ".schema = \"zsql_inspect_audit\"") != null);
 }
 
 test "postgres live: migrator applies pending files" {

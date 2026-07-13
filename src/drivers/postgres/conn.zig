@@ -1109,8 +1109,8 @@ pub const Conn = struct {
     /// Inspect base tables via `information_schema` for offline query checks.
     ///
     /// Caller owns the returned schema; free with `freeInspectedSchema`.
-    /// Table names in the `public` schema are bare; other schemas are
-    /// qualified as `schema.table`. Column types use PostgreSQL `udt_name`.
+    /// Each table carries its exact PostgreSQL schema and table name as
+    /// separate fields. Column types use PostgreSQL `udt_name`.
     pub fn inspectSchema(self: *Conn, allocator: std.mem.Allocator) !core.inspect.Schema {
         if (self.closed) return error.ConnectionClosed;
 
@@ -1124,8 +1124,10 @@ pub const Conn = struct {
             const schema_name = try (try row.value("table_schema")).asText();
             const table_name = try (try row.value("table_name")).asText();
 
-            const display_name = try core.inspect.postgresTableDisplayName(allocator, schema_name, table_name);
-            errdefer allocator.free(display_name);
+            const owned_schema_name = try allocator.dupe(u8, schema_name);
+            errdefer allocator.free(owned_schema_name);
+            const owned_table_name = try allocator.dupe(u8, table_name);
+            errdefer allocator.free(owned_table_name);
 
             var col_rows = try self.queryParams(core.inspect.postgres_list_columns_sql, &.{
                 .{ .text = schema_name },
@@ -1174,12 +1176,14 @@ pub const Conn = struct {
             }
 
             const columns = try core.inspect.columnsFromPostgresColumnInfo(allocator, info);
+            errdefer core.inspect.freeColumns(allocator, @constCast(columns));
 
             const indexes = try loadPostgresIndexes(self, allocator, schema_name, table_name);
             errdefer core.inspect.freeIndexes(allocator, @constCast(indexes));
 
             try tables_list.append(allocator, .{
-                .name = display_name,
+                .schema = owned_schema_name,
+                .name = owned_table_name,
                 .columns = columns,
                 .indexes = indexes,
             });
@@ -2056,6 +2060,7 @@ pub fn freeInspectedSchema(allocator: std.mem.Allocator, schema: core.inspect.Sc
 
 fn freeInspectedTables(allocator: std.mem.Allocator, tables: []core.inspect.Table) void {
     for (tables) |table| {
+        if (table.schema) |schema_name| allocator.free(schema_name);
         allocator.free(table.name);
         for (table.columns) |col| {
             allocator.free(col.name);

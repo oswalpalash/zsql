@@ -24,6 +24,10 @@ pub const Index = struct {
 };
 
 pub const Table = struct {
+    /// Owning database schema/namespace when the driver exposes one.
+    /// SQLite and legacy artifacts leave this null. PostgreSQL inspection
+    /// always records the exact schema name, including `public`.
+    schema: ?[]const u8 = null,
     name: []const u8,
     columns: []const Column,
     indexes: []const Index = &.{},
@@ -37,6 +41,7 @@ pub const Schema = struct {
 /// Free a fully allocator-owned schema graph produced by driver inspection.
 pub fn freeSchema(allocator: std.mem.Allocator, schema: Schema) void {
     for (schema.tables) |table| {
+        if (table.schema) |schema_name| allocator.free(schema_name);
         allocator.free(table.name);
         freeColumns(allocator, @constCast(table.columns));
         freeIndexes(allocator, @constCast(table.indexes));
@@ -61,7 +66,11 @@ pub fn writeSchemaZon(writer: *std.Io.Writer, schema: Schema) !void {
     try writer.print("    .dialect = .{s},\n", .{@tagName(schema.dialect)});
     try writer.writeAll("    .tables = .{\n");
     for (schema.tables) |table| {
-        try writer.print("        .{{ .name = \"{s}\", .columns = .{{\n", .{table.name});
+        try writer.writeAll("        .{ ");
+        if (table.schema) |schema_name| {
+            try writer.print(".schema = \"{s}\", ", .{schema_name});
+        }
+        try writer.print(".name = \"{s}\", .columns = .{{\n", .{table.name});
         for (table.columns) |col| {
             try writer.print(
                 "            .{{ .name = \"{s}\", .type_name = \"{s}\", .nullable = {}, .primary_key = {} }},\n",
@@ -161,17 +170,6 @@ pub fn columnsFromPostgresColumnInfo(allocator: std.mem.Allocator, rows: []const
         initialized = i + 1;
     }
     return columns;
-}
-
-/// Build a stable offline-check table name from PostgreSQL schema + table.
-///
-/// - `public` tables use the bare table name (`users`) so app SQL matches.
-/// - Other schemas are qualified (`audit.events`).
-pub fn postgresTableDisplayName(allocator: std.mem.Allocator, schema_name: []const u8, table_name: []const u8) ![]u8 {
-    if (std.mem.eql(u8, schema_name, "public")) {
-        return try allocator.dupe(u8, table_name);
-    }
-    return try std.fmt.allocPrint(allocator, "{s}.{s}", .{ schema_name, table_name });
 }
 
 /// Trusted SQL used by the Postgres driver to list base tables.
@@ -308,6 +306,26 @@ test "parseSchemaZon defaults legacy artifacts to unknown dialect" {
     try std.testing.expectEqual(@as(usize, 0), schema.tables.len);
 }
 
+test "writeSchemaZon preserves structured PostgreSQL table identity" {
+    const original = Schema{ .dialect = .postgres, .tables = &.{.{
+        .schema = "audit",
+        .name = "events",
+        .columns = &.{.{ .name = "id", .type_name = "int8", .nullable = false }},
+    }} };
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeSchemaZon(&writer, original);
+
+    const source = try std.testing.allocator.dupeZ(u8, writer.buffered());
+    defer std.testing.allocator.free(source);
+    const parsed = try parseSchemaZon(std.testing.allocator, source);
+    defer freeParsedSchemaZon(std.testing.allocator, parsed);
+
+    try std.testing.expectEqual(Dialect.postgres, parsed.dialect);
+    try std.testing.expectEqualStrings("audit", parsed.tables[0].schema.?);
+    try std.testing.expectEqualStrings("events", parsed.tables[0].name);
+}
+
 test "columnsFromSqliteTableInfo maps nullability and pk" {
     const rows = [_]SqliteTableInfoRow{
         .{ .name = "id", .type_name = "INTEGER", .notnull = false, .pk = true },
@@ -333,16 +351,6 @@ test "columnsFromPostgresColumnInfo maps nullability and pk" {
     try std.testing.expect(!columns[1].nullable);
     try std.testing.expect(columns[2].nullable);
     try std.testing.expectEqualStrings("int8", columns[0].type_name);
-}
-
-test "postgresTableDisplayName qualifies non-public schemas" {
-    const public_name = try postgresTableDisplayName(std.testing.allocator, "public", "users");
-    defer std.testing.allocator.free(public_name);
-    try std.testing.expectEqualStrings("users", public_name);
-
-    const other = try postgresTableDisplayName(std.testing.allocator, "audit", "events");
-    defer std.testing.allocator.free(other);
-    try std.testing.expectEqualStrings("audit.events", other);
 }
 
 test "postgres inspection SQL is parameterized and catalog-safe" {

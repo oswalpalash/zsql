@@ -1217,6 +1217,7 @@ pub fn freeInspectedSchema(allocator: std.mem.Allocator, schema: core.inspect.Sc
 
 fn freeInspectedTables(allocator: std.mem.Allocator, tables: []core.inspect.Table) void {
     for (tables) |table| {
+        if (table.schema) |schema_name| allocator.free(schema_name);
         allocator.free(table.name);
         for (table.columns) |col| {
             allocator.free(col.name);

@@ -533,6 +533,14 @@ checks unquoted identifiers case-insensitively. Quoted identifiers remain exact.
 Legacy and hand-authored artifacts without this field default to `.unknown` and
 retain exact-match behavior.
 
+PostgreSQL artifacts store each table's exact `.schema` and `.name` separately.
+The checker resolves `schema.table` without flattening identifiers that may
+themselves contain dots. Because artifacts do not encode a session
+`search_path`, only `public` tables resolve as bare PostgreSQL names;
+non-public tables must be schema-qualified. A SQL alias hides the original
+relation name, matching PostgreSQL visibility rules. Legacy artifacts that used
+a single `schema.table` display name remain readable.
+
 ### CLI
 
 Migration applies are transactional and serialized per driver. If migration SQL

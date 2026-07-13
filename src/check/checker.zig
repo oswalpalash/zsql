@@ -45,7 +45,9 @@ pub const FieldSpec = struct {
 /// A table reference discovered in SQL or supplied by the caller.
 /// `alias` is optional (FROM users u / FROM users AS u).
 const TableRef = struct {
-    name: []const u8,
+    table: inspect.Table,
+    /// Identifier spelling used for the relation's table component in SQL.
+    relation_name: []const u8,
     alias: ?[]const u8 = null,
 };
 
@@ -288,18 +290,18 @@ fn resolveProjectedField(
             const table_ref = findTableRefSql(scope, star_qualifier, schema.dialect) orelse return error.UnknownTable;
             if (field_qualifier) |qualifier| {
                 const field_ref = findTableRef(scope, qualifier, schema.dialect) orelse return error.RowFieldNotProjected;
-                if (!std.mem.eql(u8, field_ref.name, table_ref.name)) continue;
+                if (!sameTable(field_ref.table, table_ref.table)) continue;
             }
-            const table = findTable(schema, table_ref.name) orelse return error.UnknownTable;
+            const table = table_ref.table;
             const column = findColumn(table, column_name) orelse continue;
             try addProjectionMatch(&match, column);
         } else {
             for (scope) |table_ref| {
                 if (field_qualifier) |qualifier| {
                     const field_ref = findTableRef(scope, qualifier, schema.dialect) orelse return error.RowFieldNotProjected;
-                    if (!std.mem.eql(u8, field_ref.name, table_ref.name)) continue;
+                    if (!sameTable(field_ref.table, table_ref.table)) continue;
                 }
-                const table = findTable(schema, table_ref.name) orelse continue;
+                const table = table_ref.table;
                 const column = findColumn(table, column_name) orelse continue;
                 try addProjectionMatch(&match, column);
             }
@@ -384,7 +386,7 @@ fn resolveProjectionRefs(schema: inspect.Schema, scope: []const TableRef, refs: 
 fn schemaAsScope(schema: inspect.Schema, buf: *[max_tables]TableRef) CheckError![]const TableRef {
     if (schema.tables.len > max_tables) return error.TooManyTables;
     for (schema.tables, 0..) |t, i| {
-        buf[i] = .{ .name = t.name };
+        buf[i] = .{ .table = t, .relation_name = t.name };
     }
     return buf[0..schema.tables.len];
 }
@@ -399,14 +401,14 @@ fn resolveTableScope(
     if (from_tables.len != 0) {
         if (from_tables.len > max_tables) return error.TooManyTables;
         for (from_tables, 0..) |name, i| {
-            if (findTable(schema, name) == null) return error.UnknownTable;
-            buf[i] = .{ .name = name };
+            const table = findTable(schema, name) orelse return error.UnknownTable;
+            buf[i] = .{ .table = table, .relation_name = table.name };
         }
         return buf[0..from_tables.len];
     }
     if (from_table) |name| {
-        if (findTable(schema, name) == null) return error.UnknownTable;
-        buf[0] = .{ .name = name };
+        const table = findTable(schema, name) orelse return error.UnknownTable;
+        buf[0] = .{ .table = table, .relation_name = table.name };
         return buf[0..1];
     }
     // Auto-extract FROM / JOIN table refs when the caller did not pin scope.
@@ -441,23 +443,17 @@ fn resolveQualified(
     qual: []const u8,
     col_name: []const u8,
 ) CheckError!ResolvedColumn {
-    const ref = findTableRef(scope, qual, schema.dialect) orelse {
-        // Allow direct schema table name even if not in explicit scope.
-        if (findTable(schema, qual)) |table| {
-            const col = findColumn(table, col_name) orelse return error.UnknownColumn;
-            return .{ .table = table, .col = col };
-        }
-        return error.UnknownTable;
-    };
-    const table = findTable(schema, ref.name) orelse return error.UnknownTable;
+    const ref = findTableRef(scope, qual, schema.dialect) orelse return error.UnknownTable;
+    const table = ref.table;
     const col = findColumn(table, col_name) orelse return error.UnknownColumn;
     return .{ .table = table, .col = col };
 }
 
 fn resolveUnqualified(schema: inspect.Schema, scope: []const TableRef, col_name: []const u8) CheckError!ResolvedColumn {
+    _ = schema;
     var found: ?ResolvedColumn = null;
     for (scope) |ref| {
-        const table = findTable(schema, ref.name) orelse continue;
+        const table = ref.table;
         if (findColumn(table, col_name)) |col| {
             if (found != null) return error.AmbiguousColumn;
             found = .{ .table = table, .col = col };
@@ -472,14 +468,8 @@ fn resolveQualifiedSql(
     qualifier: []const u8,
     column: []const u8,
 ) CheckError!ResolvedColumn {
-    const ref = findTableRefSql(scope, qualifier, schema.dialect) orelse {
-        if (findTableSql(schema, qualifier)) |table| {
-            const col = findColumnSql(table, column, schema.dialect) orelse return error.UnknownColumn;
-            return .{ .table = table, .col = col };
-        }
-        return error.UnknownTable;
-    };
-    const table = findTable(schema, ref.name) orelse return error.UnknownTable;
+    const ref = findTableRefSql(scope, qualifier, schema.dialect) orelse return error.UnknownTable;
+    const table = ref.table;
     const col = findColumnSql(table, column, schema.dialect) orelse return error.UnknownColumn;
     return .{ .table = table, .col = col };
 }
@@ -487,7 +477,7 @@ fn resolveQualifiedSql(
 fn resolveUnqualifiedSql(schema: inspect.Schema, scope: []const TableRef, column: []const u8) CheckError!ResolvedColumn {
     var found: ?ResolvedColumn = null;
     for (scope) |ref| {
-        const table = findTable(schema, ref.name) orelse continue;
+        const table = ref.table;
         if (findColumnSql(table, column, schema.dialect)) |col| {
             if (found != null) return error.AmbiguousColumn;
             found = .{ .table = table, .col = col };
@@ -498,20 +488,22 @@ fn resolveUnqualifiedSql(schema: inspect.Schema, scope: []const TableRef, column
 
 fn findTableRef(scope: []const TableRef, qual: []const u8, dialect: inspect.Dialect) ?TableRef {
     for (scope) |ref| {
-        if (std.mem.eql(u8, ref.name, qual)) return ref;
         if (ref.alias) |a| {
             if (sqlOutputIdentEql(a, qual, dialect)) return ref;
+            continue;
         }
+        if (std.mem.eql(u8, ref.table.name, qual) or sqlIdentEql(ref.relation_name, qual)) return ref;
     }
     return null;
 }
 
 fn findTableRefSql(scope: []const TableRef, qualifier: []const u8, dialect: inspect.Dialect) ?TableRef {
     for (scope) |ref| {
-        if (sqlSchemaIdentEql(qualifier, ref.name, dialect)) return ref;
         if (ref.alias) |alias| {
             if (sqlIdentsResolveEql(alias, qualifier, dialect)) return ref;
+            continue;
         }
+        if (sqlIdentsResolveEql(ref.relation_name, qualifier, dialect)) return ref;
     }
     return null;
 }
@@ -526,16 +518,59 @@ fn stripMarker(name: []const u8) []const u8 {
 
 fn findTable(schema: inspect.Schema, name: []const u8) ?inspect.Table {
     for (schema.tables) |table| {
-        if (std.mem.eql(u8, table.name, name)) return table;
+        if (tableVisibleBare(schema.dialect, table) and std.mem.eql(u8, table.name, name)) return table;
+    }
+    if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
+        if (dot != 0 and dot + 1 < name.len) {
+            for (schema.tables) |table| {
+                const table_schema = table.schema orelse continue;
+                if (std.mem.eql(u8, table_schema, name[0..dot]) and
+                    std.mem.eql(u8, table.name, name[dot + 1 ..])) return table;
+            }
+        }
+    }
+    // Preserve legacy artifacts whose table name itself contains a dot.
+    for (schema.tables) |table| {
+        if (table.schema == null and std.mem.eql(u8, table.name, name)) return table;
     }
     return null;
 }
 
 fn findTableSql(schema: inspect.Schema, name: []const u8) ?inspect.Table {
     for (schema.tables) |table| {
+        if (!tableVisibleBare(schema.dialect, table)) continue;
         if (sqlSchemaIdentEql(name, table.name, schema.dialect)) return table;
     }
     return null;
+}
+
+fn findQualifiedTableSql(
+    schema: inspect.Schema,
+    schema_name: []const u8,
+    table_name: []const u8,
+) ?inspect.Table {
+    for (schema.tables) |table| {
+        const table_schema = table.schema orelse continue;
+        if (sqlSchemaIdentEql(schema_name, table_schema, schema.dialect) and
+            sqlSchemaIdentEql(table_name, table.name, schema.dialect)) return table;
+    }
+    // Read old PostgreSQL artifacts that encoded non-public relations as one
+    // `schema.table` display name instead of structured components.
+    for (schema.tables) |table| {
+        if (table.schema == null and sqlQualifiedIdentEql(schema_name, table_name, table.name, schema.dialect)) return table;
+    }
+    return null;
+}
+
+fn tableVisibleBare(dialect: inspect.Dialect, table: inspect.Table) bool {
+    const schema_name = table.schema orelse return true;
+    return dialect == .postgres and std.mem.eql(u8, schema_name, "public");
+}
+
+fn sameTable(a: inspect.Table, b: inspect.Table) bool {
+    if (!std.mem.eql(u8, a.name, b.name)) return false;
+    if (a.schema == null or b.schema == null) return a.schema == null and b.schema == null;
+    return std.mem.eql(u8, a.schema.?, b.schema.?);
 }
 
 fn findColumn(table: inspect.Table, name: []const u8) ?inspect.Column {
@@ -898,6 +933,18 @@ fn sqlSchemaIdentEql(encoded: []const u8, schema_name: []const u8, dialect: insp
     };
 }
 
+fn sqlQualifiedIdentEql(
+    schema_ident: []const u8,
+    table_ident: []const u8,
+    qualified_name: []const u8,
+    dialect: inspect.Dialect,
+) bool {
+    const dot = std.mem.indexOfScalar(u8, qualified_name, '.') orelse return false;
+    if (dot == 0 or dot + 1 >= qualified_name.len) return false;
+    return sqlSchemaIdentEql(schema_ident, qualified_name[0..dot], dialect) and
+        sqlSchemaIdentEql(table_ident, qualified_name[dot + 1 ..], dialect);
+}
+
 fn sqlIdentsResolveEql(a: []const u8, b: []const u8, dialect: inspect.Dialect) bool {
     const a_quoted = sqlIdentClose(a) != null;
     const b_quoted = sqlIdentClose(b) != null;
@@ -1037,11 +1084,21 @@ fn parseFromJoinTables(
             continue;
         }
 
-        const table_name = (try sc.readIdentOrStar()) orelse {
+        const first_relation_ident = (try sc.readIdentOrStar()) orelse {
             if (sc.peek() == '(') return error.UnknownTable;
             break;
         };
-        if (sqlIdentEql(table_name, "*")) return error.InvalidSql;
+        if (sqlIdentEql(first_relation_ident, "*")) return error.InvalidSql;
+
+        var schema_name: ?[]const u8 = null;
+        var table_name = first_relation_ident;
+        try sc.skipTrivia();
+        if (sc.peek() == '.') {
+            sc.advance();
+            schema_name = first_relation_ident;
+            table_name = try sc.readIdentOrStar() orelse return error.InvalidSql;
+            if (sqlIdentEql(table_name, "*")) return error.InvalidSql;
+        }
 
         // Optional AS alias / bare alias
         var alias: ?[]const u8 = null;
@@ -1079,9 +1136,13 @@ fn parseFromJoinTables(
 
         // CTE/subquery-derived relation shapes are opaque. Reject them rather
         // than falling back to unrelated schema tables and claiming success.
-        if (findTableSql(schema, table_name)) |table| {
+        const resolved_table = if (schema_name) |qualifier|
+            findQualifiedTableSql(schema, qualifier, table_name)
+        else
+            findTableSql(schema, table_name);
+        if (resolved_table) |table| {
             if (count >= max_tables) return error.TooManyTables;
-            buf[count] = .{ .name = table.name, .alias = alias };
+            buf[count] = .{ .table = table, .relation_name = table_name, .alias = alias };
             count += 1;
         } else return error.UnknownTable;
     }
@@ -1136,7 +1197,7 @@ fn validateUsingClause(
     merge_count: *usize,
 ) CheckError!void {
     if (tables.len < 2) return error.InvalidSql;
-    const right = findTable(schema, tables[tables.len - 1].name) orelse return error.UnknownTable;
+    const right = tables[tables.len - 1].table;
 
     try sc.skipTrivia();
     if (sc.peek() != '(') return error.InvalidSql;
@@ -1179,7 +1240,7 @@ fn usingLeftExposureCount(
 ) usize {
     var physical_count: usize = 0;
     for (left) |ref| {
-        const table = findTable(schema, ref.name) orelse continue;
+        const table = ref.table;
         if (findColumnSql(table, column, schema.dialect) != null) physical_count += 1;
     }
     for (merges) |merge| {
@@ -2438,6 +2499,82 @@ test "checkQuery applies dialect-aware unquoted identifier lookup" {
         .schema = legacy_schema,
         .check_projections = true,
     }));
+}
+
+test "checkQuery resolves structured PostgreSQL schema-qualified relations" {
+    const schema = inspect.Schema{ .dialect = .postgres, .tables = &.{
+        .{ .schema = "public", .name = "users", .columns = &.{.{ .name = "id", .type_name = "int8", .nullable = false }} },
+        .{ .schema = "audit", .name = "events", .columns = &.{
+            .{ .name = "id", .type_name = "int8", .nullable = false },
+            .{ .name = "user_id", .type_name = "int8", .nullable = false },
+        } },
+        .{ .schema = "archive", .name = "events", .columns = &.{.{ .name = "id", .type_name = "int8", .nullable = false }} },
+        .{ .schema = "Audit", .name = "Events", .columns = &.{.{ .name = "Camel", .type_name = "text", .nullable = false }} },
+    } };
+
+    try checkQuery(.{
+        .sql = "select e.id from AUDIT.EVENTS e where e.user_id = $1",
+        .schema = schema,
+        .args = &.{.{ .name = "1" }},
+        .row = &.{.{ .name = "e.id", .type_name = "int8" }},
+        .check_where = true,
+    });
+    try checkQuery(.{
+        .sql = "select events.id from audit.events",
+        .schema = schema,
+        .row = &.{.{ .name = "events.id", .type_name = "int8" }},
+    });
+    try checkQuery(.{
+        .sql = "select \"Events\".\"Camel\" from \"Audit\".\"Events\"",
+        .schema = schema,
+        .row = &.{.{ .name = "Events.Camel", .type_name = "text" }},
+    });
+    try checkQuery(.{
+        .sql = "select id from users",
+        .schema = schema,
+        .row = &.{.{ .name = "id", .type_name = "int8" }},
+    });
+
+    // The artifact does not encode search_path. Only public is safe to resolve
+    // as a bare PostgreSQL relation; non-public tables require qualification.
+    try std.testing.expectError(error.UnknownTable, checkQuery(.{
+        .sql = "select id from events",
+        .schema = schema,
+        .check_projections = true,
+    }));
+    try std.testing.expectError(error.UnknownTable, checkQuery(.{
+        .sql = "select id from events",
+        .schema = schema,
+        .from_table = "events",
+        .check_projections = true,
+    }));
+    try checkQuery(.{
+        .sql = "select id from audit.events",
+        .schema = schema,
+        .from_table = "audit.events",
+        .row = &.{.{ .name = "id", .type_name = "int8" }},
+    });
+    // Once a relation has an alias, PostgreSQL hides its original table name.
+    try std.testing.expectError(error.UnknownTable, checkQuery(.{
+        .sql = "select events.id from audit.events as e",
+        .schema = schema,
+        .check_projections = true,
+    }));
+    try std.testing.expectError(error.UnknownTable, checkQuery(.{
+        .sql = "select users.id from users as u",
+        .schema = schema,
+        .check_projections = true,
+    }));
+
+    const legacy = inspect.Schema{ .tables = &.{.{
+        .name = "audit.events",
+        .columns = &.{.{ .name = "id", .type_name = "int8", .nullable = false }},
+    }} };
+    try checkQuery(.{
+        .sql = "select e.id from audit.events e",
+        .schema = legacy,
+        .row = &.{.{ .name = "e.id", .type_name = "int8" }},
+    });
 }
 
 test "checkQuery ignores postgres literals and nested comments in WHERE" {
