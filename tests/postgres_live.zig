@@ -89,6 +89,7 @@ test "postgres live: handshake, params, tx, errors, inspect" {
     defer count_rows.deinit();
     const count_row = count_rows.next().?;
     try std.testing.expectEqual(@as(i64, 2), try (try count_row.value("n")).asInt());
+    try std.testing.expectEqual(@as(?zsql.DbError, null), conn.lastError());
 
     try conn.begin();
     _ = try conn.execParams(

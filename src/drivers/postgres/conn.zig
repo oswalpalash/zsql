@@ -457,6 +457,7 @@ pub const Conn = struct {
     /// Prefer extended/parameterized APIs once available for any user values.
     /// This path is intended for DDL, transaction control, and trusted SQL.
     pub fn exec(self: *Conn, sql: []const u8) !core.ExecResult {
+        self.clearLastError();
         return self.execObserved(sql, 0, struct {
             fn run(c: *Conn, s: []const u8) !core.ExecResult {
                 return c.execUnobserved(s);
@@ -503,6 +504,7 @@ pub const Conn = struct {
     /// Placeholders must use PostgreSQL `$1` style. Values are bound in text
     /// format and never concatenated into the SQL string.
     pub fn execParams(self: *Conn, sql: []const u8, binds: []const core.Value) !core.ExecResult {
+        self.clearLastError();
         const observe = !self.hooks.isEmpty();
         const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
         if (observe) {
@@ -538,6 +540,7 @@ pub const Conn = struct {
     /// Execute named parameters by rewriting them to PostgreSQL `$n` binds.
     /// Values are reordered into a temporary slice; they are never interpolated.
     pub fn execNamed(self: *Conn, sql: []const u8, binds: []const core.params.NamedValue) !core.ExecResult {
+        self.clearLastError();
         var rewrite = try core.params.rewriteNamedPostgres(self.allocator, sql);
         defer rewrite.deinit(self.allocator);
         const ordered = try orderedNamedBinds(self.allocator, rewrite.names, binds);
@@ -625,12 +628,14 @@ pub const Conn = struct {
     /// Register this dedicated connection for a PostgreSQL notification channel.
     /// Channel names are identifier-quoted; payloads are never interpolated.
     pub fn listen(self: *Conn, channel: []const u8) !void {
+        self.clearLastError();
         const sql = try listenSql(self.allocator, "listen", channel);
         defer self.allocator.free(sql);
         _ = try self.exec(sql);
     }
 
     pub fn unlisten(self: *Conn, channel: []const u8) !void {
+        self.clearLastError();
         const sql = try listenSql(self.allocator, "unlisten", channel);
         defer self.allocator.free(sql);
         _ = try self.exec(sql);
@@ -639,6 +644,7 @@ pub const Conn = struct {
     /// Wait for the next asynchronous PostgreSQL notification.
     /// The returned channel and payload are allocator-owned.
     pub fn nextNotification(self: *Conn) !Notification {
+        self.clearLastError();
         if (self.closed) return error.ConnectionClosed;
         while (true) {
             const msg = try self.readMessage();
@@ -655,6 +661,7 @@ pub const Conn = struct {
     /// COPY trusted SQL input from an explicit byte buffer. Values must be
     /// encoded by the caller according to the selected COPY format.
     pub fn copyIn(self: *Conn, sql: []const u8, data: []const u8) !core.ExecResult {
+        self.clearLastError();
         if (self.closed) return error.ConnectionClosed;
         const query_packet = try protocol.buildQueryMessage(self.allocator, sql);
         defer self.allocator.free(query_packet);
@@ -692,6 +699,7 @@ pub const Conn = struct {
 
     /// COPY trusted SQL output into an allocator-owned byte buffer.
     pub fn copyOut(self: *Conn, sql: []const u8) ![]u8 {
+        self.clearLastError();
         if (self.closed) return error.ConnectionClosed;
         const query_packet = try protocol.buildQueryMessage(self.allocator, sql);
         defer self.allocator.free(query_packet);
@@ -727,6 +735,7 @@ pub const Conn = struct {
 
     /// Parameterized query via extended protocol; returns owned simple rows.
     pub fn queryParams(self: *Conn, sql: []const u8, binds: []const core.Value) !SimpleRows {
+        self.clearLastError();
         const observe = !self.hooks.isEmpty();
         const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
         if (observe) {
@@ -784,6 +793,7 @@ pub const Conn = struct {
 
     /// Query with named parameters, rewritten to PostgreSQL `$n` binds.
     pub fn queryNamed(self: *Conn, sql: []const u8, binds: []const core.params.NamedValue) !SimpleRows {
+        self.clearLastError();
         var rewrite = try core.params.rewriteNamedPostgres(self.allocator, sql);
         defer rewrite.deinit(self.allocator);
         const ordered = try orderedNamedBinds(self.allocator, rewrite.names, binds);
@@ -1227,6 +1237,7 @@ pub const Conn = struct {
     /// Column text is copied so values outlive the network buffer. Call
     /// `SimpleRows.deinit` when finished.
     pub fn query(self: *Conn, sql: []const u8) !SimpleRows {
+        self.clearLastError();
         const observe = !self.hooks.isEmpty();
         const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
         if (observe) {

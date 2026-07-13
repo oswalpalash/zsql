@@ -214,6 +214,8 @@ conn.execParams(...) catch |err| {
 ```
 
 After `ErrorResponse`, the driver drains to `ReadyForQuery` so the connection stays usable.
+PostgreSQL `lastError()` is borrowed until the next SQL operation or `deinit`;
+starting a later operation clears stale metadata, including when it succeeds.
 
 SQLite exposes the same borrowed `Conn.lastError()` shape with its numeric
 extended result code, diagnostic message, and statement text. It duplicates
