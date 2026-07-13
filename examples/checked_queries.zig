@@ -65,6 +65,14 @@ pub fn main() !void {
     });
     try user_posts.validate(schema);
 
+    // Schema-known USING lists are checked on both join sides.
+    const same_id = zsql.checkedQuery(.{
+        .sql = "select u.id from users u join posts p using (id)",
+        .row = struct { id: i64 },
+        .check_join_on = true,
+    });
+    try same_id.validate(schema);
+
     // Portable aggregate inference is deliberately narrow: aliased COUNT is
     // non-null i64, while MIN/MAX preserve the source type and stay optional.
     const user_aggregates = zsql.checkedQuery(.{

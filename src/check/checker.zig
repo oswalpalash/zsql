@@ -49,6 +49,11 @@ const TableRef = struct {
     alias: ?[]const u8 = null,
 };
 
+const UsingMerge = struct {
+    column: []const u8,
+    reductions: usize,
+};
+
 const ProjectionKind = enum {
     column,
     star,
@@ -100,7 +105,8 @@ pub fn checkQuery(options: struct {
     /// bind markers are skipped. Opt-in so complex expressions do not surprise
     /// callers.
     check_where: bool = false,
-    /// When true, parse simple JOIN ON column references the same way as WHERE.
+    /// When true, parse simple JOIN ON column references and validate USING
+    /// columns against both sides of schema-known joins.
     check_join_on: bool = false,
     /// When true, parse simple GROUP BY column references and unique SELECT
     /// aliases. Positional ordinals are ignored.
@@ -207,6 +213,9 @@ pub fn checkQuery(options: struct {
         var on_buf: [max_projections]Projection = undefined;
         const refs = try parseJoinOnColumnRefs(options.sql, &on_buf);
         try resolveProjectionRefs(options.schema, resolve_scope, refs);
+
+        var using_table_buf: [max_tables]TableRef = undefined;
+        _ = try parseFromJoinTables(options.sql, options.schema, &using_table_buf, true);
     }
 
     if (check_group_by) {
@@ -393,7 +402,7 @@ fn resolveTableScope(
         return buf[0..1];
     }
     // Auto-extract FROM / JOIN table refs when the caller did not pin scope.
-    return parseFromJoinTables(sql, schema, buf);
+    return parseFromJoinTables(sql, schema, buf, false);
 }
 
 const ResolvedColumn = struct {
@@ -751,9 +760,17 @@ fn isIdentContinue(c: u8) bool {
 }
 
 /// Parse table refs after FROM / JOIN. Returns empty slice if none found.
-fn parseFromJoinTables(sql: []const u8, schema: inspect.Schema, buf: *[max_tables]TableRef) CheckError![]const TableRef {
+fn parseFromJoinTables(
+    sql: []const u8,
+    schema: inspect.Schema,
+    buf: *[max_tables]TableRef,
+    validate_using: bool,
+) CheckError![]const TableRef {
     var sc = Scanner.init(sql);
     var count: usize = 0;
+    var merge_buf: [max_projections]UsingMerge = undefined;
+    var merge_count: usize = 0;
+    var all_relations_known = true;
 
     // Find first FROM keyword at statement level (simple scan).
     while (sc.index < sc.sql.len) {
@@ -803,44 +820,23 @@ fn parseFromJoinTables(sql: []const u8, schema: inspect.Schema, buf: *[max_table
         }
 
         try sc.skipTrivia();
-        // ON / USING clauses after a join — skip until next join/comma/where
-        if (try sc.matchKeyword("on") or try sc.matchKeyword("using")) {
-            // Skip until next JOIN keyword or terminator. Naive paren-aware skip.
-            var depth: i32 = 0;
-            while (sc.index < sc.sql.len) {
-                try sc.skipTrivia();
-                if (sc.index >= sc.sql.len) break;
-                if (depth == 0) {
-                    if (sc.startsWithKeyword("inner") or
-                        sc.startsWithKeyword("left") or
-                        sc.startsWithKeyword("right") or
-                        sc.startsWithKeyword("full") or
-                        sc.startsWithKeyword("cross") or
-                        sc.startsWithKeyword("join") or
-                        sc.startsWithKeyword("where") or
-                        sc.startsWithKeyword("group") or
-                        sc.startsWithKeyword("order") or
-                        sc.startsWithKeyword("limit") or
-                        sc.startsWithKeyword("having") or
-                        sc.startsWithKeyword("union") or
-                        sc.startsWithKeyword("returning") or
-                        sc.peek() == ',' or sc.peek() == ';')
-                    {
-                        break;
-                    }
-                }
-                const c = sc.peek() orelse break;
-                if (c == '(') {
-                    depth += 1;
-                    sc.advance();
-                } else if (c == ')') {
-                    depth -= 1;
-                    sc.advance();
-                } else {
-                    // consume ident or single char
-                    if ((try sc.readIdentOrStar()) == null) sc.advance();
-                }
+        // ON / USING clauses belong to the most recently appended right table.
+        if (try sc.matchKeyword("using")) {
+            if (validate_using and all_relations_known) {
+                try validateUsingClause(
+                    &sc,
+                    schema,
+                    buf[0..count],
+                    &merge_buf,
+                    &merge_count,
+                );
+            } else {
+                try skipJoinConstraint(&sc);
             }
+            continue;
+        }
+        if (try sc.matchKeyword("on")) {
+            try skipJoinConstraint(&sc);
             continue;
         }
 
@@ -886,10 +882,129 @@ fn parseFromJoinTables(sql: []const u8, schema: inspect.Schema, buf: *[max_table
             if (count >= max_tables) return error.TooManyTables;
             buf[count] = .{ .name = table_name, .alias = alias };
             count += 1;
+        } else {
+            all_relations_known = false;
         }
     }
 
     return buf[0..count];
+}
+
+fn skipJoinConstraint(sc: *Scanner) CheckError!void {
+    // Skip until the next JOIN keyword or clause terminator. Parentheses keep
+    // commas inside expressions / USING lists from ending the constraint.
+    var depth: i32 = 0;
+    while (sc.index < sc.sql.len) {
+        try sc.skipTrivia();
+        if (sc.index >= sc.sql.len) break;
+        if (depth == 0) {
+            if (sc.startsWithKeyword("inner") or
+                sc.startsWithKeyword("left") or
+                sc.startsWithKeyword("right") or
+                sc.startsWithKeyword("full") or
+                sc.startsWithKeyword("cross") or
+                sc.startsWithKeyword("join") or
+                sc.startsWithKeyword("where") or
+                sc.startsWithKeyword("group") or
+                sc.startsWithKeyword("order") or
+                sc.startsWithKeyword("limit") or
+                sc.startsWithKeyword("having") or
+                sc.startsWithKeyword("union") or
+                sc.startsWithKeyword("returning") or
+                sc.peek() == ',' or sc.peek() == ';')
+            {
+                break;
+            }
+        }
+        const c = sc.peek() orelse break;
+        if (c == '(') {
+            depth += 1;
+            sc.advance();
+        } else if (c == ')') {
+            depth -= 1;
+            sc.advance();
+        } else if ((try sc.readIdentOrStar()) == null) {
+            sc.advance();
+        }
+    }
+}
+
+fn validateUsingClause(
+    sc: *Scanner,
+    schema: inspect.Schema,
+    tables: []const TableRef,
+    merges: *[max_projections]UsingMerge,
+    merge_count: *usize,
+) CheckError!void {
+    if (tables.len < 2) return error.InvalidSql;
+    const right = findTable(schema, tables[tables.len - 1].name) orelse return error.UnknownTable;
+
+    try sc.skipTrivia();
+    if (sc.peek() != '(') return error.InvalidSql;
+    sc.advance();
+
+    var clause_columns: [max_projections][]const u8 = undefined;
+    var clause_count: usize = 0;
+    while (true) {
+        try sc.skipTrivia();
+        const column = try sc.readIdentOrStar() orelse return error.InvalidSql;
+        if (std.mem.eql(u8, column, "*")) return error.InvalidSql;
+        if (clause_count >= max_projections) return error.TooManyProjections;
+        for (clause_columns[0..clause_count]) |previous| {
+            if (std.mem.eql(u8, previous, column)) return error.InvalidSql;
+        }
+        clause_columns[clause_count] = column;
+        clause_count += 1;
+
+        const left_exposures = usingLeftExposureCount(schema, tables[0 .. tables.len - 1], merges[0..merge_count.*], column);
+        if (left_exposures == 0 or findColumn(right, column) == null) return error.UnknownColumn;
+        if (left_exposures > 1) return error.AmbiguousColumn;
+        try recordUsingMerge(merges, merge_count, column);
+
+        try sc.skipTrivia();
+        if (sc.peek() == ',') {
+            sc.advance();
+            continue;
+        }
+        if (sc.peek() != ')') return error.InvalidSql;
+        sc.advance();
+        return;
+    }
+}
+
+fn usingLeftExposureCount(
+    schema: inspect.Schema,
+    left: []const TableRef,
+    merges: []const UsingMerge,
+    column: []const u8,
+) usize {
+    var physical_count: usize = 0;
+    for (left) |ref| {
+        const table = findTable(schema, ref.name) orelse continue;
+        if (findColumn(table, column) != null) physical_count += 1;
+    }
+    for (merges) |merge| {
+        if (std.mem.eql(u8, merge.column, column)) {
+            return physical_count -| merge.reductions;
+        }
+    }
+    return physical_count;
+}
+
+fn recordUsingMerge(
+    merges: *[max_projections]UsingMerge,
+    merge_count: *usize,
+    column: []const u8,
+) CheckError!void {
+    for (merges[0..merge_count.*]) |*merge| {
+        if (std.mem.eql(u8, merge.column, column)) {
+            merge.reductions += 1;
+            return;
+        }
+    }
+    if (merge_count.* >= max_projections) return error.TooManyProjections;
+    merges[merge_count.*] = .{ .column = column, .reductions = 1 };
+    merge_count.* += 1;
 }
 
 /// Parse simple SELECT projections up to FROM. Portable COUNT/MIN/MAX
@@ -1332,8 +1447,8 @@ fn parseWhereColumnRefs(sql: []const u8, buf: *[max_projections]Projection) Chec
     return buf[0..count];
 }
 
-/// Collect column references from every JOIN ON clause. USING (...) lists are
-/// not scanned as expressions. Best-effort.
+/// Collect column references from every JOIN ON clause. USING lists are
+/// validated separately against both relation sides. Best-effort.
 fn parseJoinOnColumnRefs(sql: []const u8, buf: *[max_projections]Projection) CheckError![]const Projection {
     var sc = Scanner.init(sql);
     var count: usize = 0;
@@ -2432,6 +2547,105 @@ test "checkQuery join ON column refs resolve against scope" {
         .schema = schema,
         .check_join_on = false,
     });
+}
+
+test "checkQuery join USING validates both relation sides" {
+    const schema = inspect.Schema{ .tables = &.{
+        .{ .name = "a", .columns = &.{
+            .{ .name = "id", .type_name = "INTEGER", .nullable = false },
+            .{ .name = "tenant_id", .type_name = "INTEGER", .nullable = false },
+            .{ .name = "a_only", .type_name = "TEXT", .nullable = false },
+        } },
+        .{ .name = "b", .columns = &.{
+            .{ .name = "id", .type_name = "INTEGER", .nullable = false },
+            .{ .name = "tenant_id", .type_name = "INTEGER", .nullable = false },
+            .{ .name = "b_only", .type_name = "TEXT", .nullable = false },
+        } },
+        .{ .name = "c", .columns = &.{.{ .name = "id", .type_name = "INTEGER", .nullable = false }} },
+        .{ .name = "d", .columns = &.{.{ .name = "id", .type_name = "INTEGER", .nullable = false }} },
+    } };
+
+    try checkQuery(.{
+        .sql = "select x.id from a x join b y using (id, tenant_id)",
+        .schema = schema,
+        .check_join_on = true,
+    });
+    // A prior USING merge exposes one logical id on the accumulated left side.
+    try checkQuery(.{
+        .sql = "select a.id from a join b using (id) join c using (id)",
+        .schema = schema,
+        .check_join_on = true,
+    });
+
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select a.id from a join b using (a_only)",
+        .schema = schema,
+        .check_join_on = true,
+    }));
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select a.id from a join b using (b_only)",
+        .schema = schema,
+        .check_join_on = true,
+    }));
+    try std.testing.expectError(error.AmbiguousColumn, checkQuery(.{
+        .sql = "select a.id from a join b on true join c using (id)",
+        .schema = schema,
+        .check_join_on = true,
+    }));
+    try std.testing.expectError(error.AmbiguousColumn, checkQuery(.{
+        .sql = "select a.id from a join b using (id) join c on true join d using (id)",
+        .schema = schema,
+        .check_join_on = true,
+    }));
+    try std.testing.expectError(error.InvalidSql, checkQuery(.{
+        .sql = "select a.id from a join b using (id, id)",
+        .schema = schema,
+        .check_join_on = true,
+    }));
+
+    // Default off preserves the explicit bounded-check contract.
+    try checkQuery(.{
+        .sql = "select a.id from a join b using (missing)",
+        .schema = schema,
+    });
+    try std.testing.expectError(error.UnknownColumn, checkQuery(.{
+        .sql = "select a.id from a join b using (missing)",
+        .schema = schema,
+        .level = .result_types,
+    }));
+
+    const joined = checkedQuery(.{
+        .sql = "select a.id from a join b using (id)",
+        .check_join_on = true,
+    });
+    try joined.validate(schema);
+}
+
+test "checkQuery join USING rejects capacity overflow" {
+    var name_storage: [max_projections + 1][8]u8 = undefined;
+    var left_columns: [max_projections + 1]inspect.Column = undefined;
+    var right_columns: [max_projections + 1]inspect.Column = undefined;
+    var sql_storage: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&sql_storage);
+    try writer.writeAll("select l.c0 from left_table l join right_table r using (");
+    for (0..max_projections + 1) |index| {
+        const name = try std.fmt.bufPrint(name_storage[index][0..], "c{d}", .{index});
+        left_columns[index] = .{ .name = name, .type_name = "INTEGER", .nullable = false };
+        right_columns[index] = .{ .name = name, .type_name = "INTEGER", .nullable = false };
+        if (index != 0) try writer.writeAll(", ");
+        try writer.writeAll(name);
+    }
+    try writer.writeAll(")");
+
+    const schema = inspect.Schema{ .tables = &.{
+        .{ .name = "left_table", .columns = &left_columns },
+        .{ .name = "right_table", .columns = &right_columns },
+    } };
+    try std.testing.expectError(error.TooManyProjections, checkQuery(.{
+        .sql = writer.buffered(),
+        .schema = schema,
+        .check_join_on = true,
+    }));
 }
 
 test "checkQuery group by refs resolve columns and projection aliases" {

@@ -448,7 +448,7 @@ try zsql.check.checkQuery(.{
     },
     .check_projections = true, // also parse SELECT list against the scope
     .check_where = true, // resolve bare/qualified column refs in WHERE/HAVING
-    .check_join_on = true, // resolve column refs in JOIN ON clauses
+    .check_join_on = true, // resolve JOIN ON refs and schema-known USING lists
     .check_group_by = true, // resolve GROUP BY refs and unique SELECT aliases
     .check_order_by = true, // resolve column refs in ORDER BY
 });
@@ -505,6 +505,10 @@ When `from_table` / `from_tables` are omitted, `checkQuery` best-effort extracts
 `check_join_on`, `check_group_by`, and `check_order_by` are opt-in: they resolve
 simple column refs (including those inside function arguments like
 `lower(email)`), while skipping keywords, binds, casts, and function *names*.
+JOIN USING lists between schema-known tables must name one exposed column on
+the accumulated left relation and a column on the new right table; chained
+USING merges are tracked, while joins involving unknown CTE/subquery relations
+remain outside this bounded validation.
 GROUP BY validation checks reference existence and unique result aliases; it
 does not attempt to prove full SQL grouping legality. SQLite and PostgreSQL can
 build a schema graph with `Conn.inspectSchema` and render ZON via
