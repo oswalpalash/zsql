@@ -62,6 +62,8 @@ pub const Conn = struct {
     /// does not expose the peer cert after handshake (esp. TLS 1.3), so callers
     /// that need PLUS must pin the server leaf cert via Config.
     peer_cert_der: ?[]u8 = null,
+    /// Set after transport failures that make protocol reuse unsafe.
+    broken: bool = false,
 
     /// Open a TCP connection and complete the PostgreSQL startup handshake.
     ///
@@ -370,6 +372,11 @@ pub const Conn = struct {
     pub fn lastError(self: *const Conn) ?core.DbError {
         if (self.last_error) |*owned| return owned.view();
         return null;
+    }
+
+    /// True when this session is synchronized, idle, and safe for pool reuse.
+    pub fn isReusable(self: *const Conn) bool {
+        return !self.closed and !self.broken and self.tx_status == .idle;
     }
 
     /// Replace connection-local query hooks. Pass `.{}` to clear.
@@ -1543,6 +1550,7 @@ pub const Conn = struct {
     }
 
     fn mapAppReadError(self: *Conn) anyerror {
+        self.broken = true;
         if (self.tls) |*t| {
             if (t.read_err) |_| return error.ProtocolError;
         }
@@ -1550,6 +1558,7 @@ pub const Conn = struct {
     }
 
     fn mapAppWriteError(self: *Conn) anyerror {
+        self.broken = true;
         if (self.tls != null) return error.ProtocolError;
         return mapWriteError(self.writer.err);
     }

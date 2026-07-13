@@ -170,24 +170,33 @@ pub const Pool = struct {
 
     pub fn exec(self: *Pool, sql: []const u8) !core.ExecResult {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        const result = try (try lease.conn()).exec(sql);
+        errdefer if (lease.open) lease.discard() catch {};
+        const result = (try lease.conn()).exec(sql) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
         return result;
     }
 
     pub fn execParams(self: *Pool, sql: []const u8, binds: []const core.Value) !core.ExecResult {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        const result = try (try lease.conn()).execParams(sql, binds);
+        errdefer if (lease.open) lease.discard() catch {};
+        const result = (try lease.conn()).execParams(sql, binds) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
         return result;
     }
 
     pub fn execNamed(self: *Pool, sql: []const u8, binds: []const core.params.NamedValue) !core.ExecResult {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        const result = try (try lease.conn()).execNamed(sql, binds);
+        errdefer if (lease.open) lease.discard() catch {};
+        const result = (try lease.conn()).execNamed(sql, binds) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
         return result;
     }
@@ -195,8 +204,11 @@ pub const Pool = struct {
     /// Holds a lease until `PooledRows.deinit`.
     pub fn queryParams(self: *Pool, sql: []const u8, binds: []const core.Value) !PooledRows {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        const rows = try (try lease.conn()).queryParams(sql, binds);
+        errdefer if (lease.open) lease.discard() catch {};
+        const rows = (try lease.conn()).queryParams(sql, binds) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         return .{
             .lease = lease,
             .rows = rows,
@@ -206,16 +218,22 @@ pub const Pool = struct {
     /// Holds a lease until `PooledRows.deinit`.
     pub fn queryNamed(self: *Pool, sql: []const u8, binds: []const core.params.NamedValue) !PooledRows {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        const rows = try (try lease.conn()).queryNamed(sql, binds);
+        errdefer if (lease.open) lease.discard() catch {};
+        const rows = (try lease.conn()).queryNamed(sql, binds) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         return .{ .lease = lease, .rows = rows };
     }
 
     /// Acquire a short lease, fetch exactly one owned row, then release.
     pub fn queryOneParams(self: *Pool, sql: []const u8, binds: []const core.Value) !core.OwnedRow {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        const owned = try (try lease.conn()).queryOneParams(sql, binds);
+        errdefer if (lease.open) lease.discard() catch {};
+        const owned = (try lease.conn()).queryOneParams(sql, binds) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
         return owned;
     }
@@ -224,8 +242,11 @@ pub const Pool = struct {
     /// then release. Free with `core.OwnedRow.freeSlice` / `zsql.freeOwnedRows`.
     pub fn queryAllParams(self: *Pool, sql: []const u8, binds: []const core.Value) ![]core.OwnedRow {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        const owned = try (try lease.conn()).queryAllParams(sql, binds);
+        errdefer if (lease.open) lease.discard() catch {};
+        const owned = (try lease.conn()).queryAllParams(sql, binds) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
         return owned;
     }
@@ -233,8 +254,11 @@ pub const Pool = struct {
     /// Liveness check under a short-lived lease.
     pub fn ping(self: *Pool) !void {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        try (try lease.conn()).ping();
+        errdefer if (lease.open) lease.discard() catch {};
+        (try lease.conn()).ping() catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
     }
 
@@ -245,11 +269,15 @@ pub const Pool = struct {
     }
 
     /// Acquire a lease, run `body` inside `Conn.withTx`, then release the lease.
-    /// On body error the connection rolls back and the lease is discarded.
+    /// Body errors roll back and retain a synchronized connection; rollback or
+    /// transport failures discard it.
     pub fn withTx(self: *Pool, ctx: anytype, comptime body: *const fn (@TypeOf(ctx), *conn_mod.Conn) anyerror!void) !void {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        try (try lease.conn()).withTx(ctx, body);
+        errdefer if (lease.open) lease.discard() catch {};
+        (try lease.conn()).withTx(ctx, body) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
     }
 
@@ -322,6 +350,14 @@ pub const Lease = struct {
             return error.PoolClosed;
         }
 
+        if (!self.conn_value.isReusable()) {
+            self.conn_value.deinit();
+            self.pool.open_count -|= 1;
+            self.open = false;
+            self.pool.notifyAvailable();
+            return;
+        }
+
         if (self.pool.idle.items.len < self.pool.effectiveMaxIdle()) {
             try self.pool.idle.append(self.pool.allocator, self.conn_value);
         } else {
@@ -330,6 +366,14 @@ pub const Lease = struct {
         }
         self.open = false;
         self.pool.notifyAvailable();
+    }
+
+    fn finishAfterError(self: *Lease, err: anyerror) void {
+        if (isFatalPoolConnectionError(err) or !self.conn_value.isReusable()) {
+            self.discard() catch {};
+        } else {
+            self.release() catch self.discard() catch {};
+        }
     }
 
     pub fn discard(self: *Lease) !void {
@@ -344,6 +388,21 @@ pub const Lease = struct {
         self.pool.notifyAvailable();
     }
 };
+
+fn isFatalPoolConnectionError(err: anyerror) bool {
+    return switch (err) {
+        error.AuthFailed,
+        error.Canceled,
+        error.ConnectionClosed,
+        error.ConnectionTimeout,
+        error.DriverError,
+        error.OutOfMemory,
+        error.ProtocolError,
+        error.TlsFailed,
+        => true,
+        else => false,
+    };
+}
 
 pub const PooledRows = struct {
     lease: Lease,

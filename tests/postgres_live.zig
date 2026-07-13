@@ -233,7 +233,7 @@ test "postgres live: pool withTx commits and rolls back" {
     defer config.deinit();
     var pool = try pg.Pool.init(allocator, io, .{
         .database = config,
-        .max_open = 2,
+        .max_open = 1,
         .max_idle = 1,
     });
     defer pool.deinit();
@@ -266,6 +266,8 @@ test "postgres live: pool withTx commits and rolls back" {
         }
     }.run);
     try std.testing.expectError(error.ForceRollback, failed);
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().open);
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
 
     const rows = try pool.queryAllParams("select id from zsql_pool_tx order by id", &.{});
     defer zsql.freeOwnedRows(allocator, rows);
@@ -443,6 +445,44 @@ test "postgres live: pool acquire release" {
     const stats = pool.stats();
     try std.testing.expect(stats.open >= 1);
     try std.testing.expectEqual(@as(usize, 0), stats.leased);
+}
+
+test "postgres live: pool retains recoverable errors and discards unsafe releases" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var pool = try pg.Pool.init(allocator, io, .{
+        .database = config,
+        .max_open = 1,
+        .max_idle = 1,
+    });
+    defer pool.deinit();
+
+    _ = try pool.exec("create temporary table zsql_pool_session (id int primary key)");
+    try std.testing.expectError(error.InvalidSql, pool.exec("select from"));
+    try std.testing.expectError(error.NoRows, pool.queryOneParams("select id from zsql_pool_session", &.{}));
+    _ = try pool.exec("insert into zsql_pool_session (id) values (1)");
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+
+    var tx_lease = try pool.acquire();
+    try (try tx_lease.conn()).begin();
+    try tx_lease.release();
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
+
+    var closed_lease = try pool.acquire();
+    (try closed_lease.conn()).deinit();
+    try closed_lease.release();
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
+
+    var replacement = try pool.acquire();
+    try replacement.release();
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
 }
 
 test "postgres live: statement_timeout maps to QueryTimeout" {
