@@ -49,6 +49,9 @@ by `zig build consumer-smoke-system`.
 `zig build install-smoke` also installs the static library and CLI into a fresh
 temporary prefix and runs the installed `zsql doctor`, ensuring distribution
 artifacts do not depend on repository-relative files.
+`zig build version-sync` makes `build.zig.zon` authoritative for release
+metadata and fails if the library/CLI build option drifts; `install-smoke` also
+compares the installed doctor's reported version to that manifest value.
 
 ### Public names
 

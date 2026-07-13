@@ -62,6 +62,13 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run zsql tests");
     test_step.dependOn(&run_tests.step);
 
+    const version_sync = b.addSystemCommand(&.{ "sh", "scripts/check_version_sync.sh" });
+    const version_sync_test = b.addSystemCommand(&.{ "sh", "scripts/test_version_sync.sh" });
+    version_sync_test.step.dependOn(&version_sync.step);
+    const version_sync_step = b.step("version-sync", "Verify package and generated CLI versions match");
+    version_sync_step.dependOn(&version_sync_test.step);
+    test_step.dependOn(&version_sync_test.step);
+
     // Convenience aliases used in docs / local workflows.
     const test_core_step = b.step("test-core", "Alias for zig build test (driver-agnostic + postgres unit tests)");
     test_core_step.dependOn(test_step);
@@ -230,6 +237,7 @@ pub fn build(b: *std.Build) void {
     consumer_system_step.dependOn(&consumer_system.step);
 
     const install_smoke = b.addSystemCommand(&.{ "sh", "scripts/install_smoke.sh", b.graph.zig_exe });
+    install_smoke.step.dependOn(&version_sync.step);
     const install_smoke_step = b.step("install-smoke", "Install to a clean prefix and run the installed CLI");
     install_smoke_step.dependOn(&install_smoke.step);
 }

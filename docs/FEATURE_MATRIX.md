@@ -10,6 +10,7 @@ coverage; PostgreSQL rows marked live also run against PostgreSQL 16 in CI.
 | --- | --- | --- | --- |
 | Package consumption | Complete | Zig package module `zsql`; propagated core/bundled/system SQLite dependency options; documented `zig fetch --save=zsql` setup | separate-package core and leak-checked SQLite executables via `consumer-smoke` / `consumer-smoke-system` in CI |
 | Installed distribution | Complete | installed `libzsql.a` and `zsql` CLI; no repository-relative runtime resources | clean-prefix `install-smoke` runs installed `zsql doctor` in CI |
+| Version integrity | Complete | `build.zig.zon` release version projected into `zsql.version` and CLI doctor | `version-sync` source gate plus installed-doctor manifest comparison |
 | SQLite driver | Complete | `zsql.drivers.sqlite`; borrowed `InterruptHandle` | interruption and driver tests with `-Denable-sqlite=true` |
 | Native PostgreSQL driver | Complete | full-open `connect_timeout`; owned `CancelHandle`; lifecycle-aware command/COPY/notification recovery | timeout/protocol unit tests; live cancellation/COPY/notification recovery in CI |
 | Prepared statements | Complete | driver-selected `Statement(D)`; explicit direct/pool owners; reusable named-bind scratch; session-monotonic PostgreSQL names; allocation-free cache teardown; unsigned OID metadata; narrow invalidation recovery | SQLite schema-change tests and PostgreSQL protocol/direct/pool/cache/OOM tests |

@@ -18,6 +18,7 @@
         "src",
         "cli",
         "examples",
+        "scripts",
         "tests",
         "README.md",
     },
