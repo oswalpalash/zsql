@@ -531,6 +531,9 @@ zig build run-postgres-pool-example # skips cleanly if ZSQL_PG_URL unset
 
 Generated struct files import `zsql` themselves, map supported SQL domain types
 to `zsql.types.*`, and preserve database nullability with optional Zig fields.
+Column fields preserve their exact SQL names through Zig's quoted-identifier
+syntax when needed. Table types remain PascalCase; normalization collisions get
+stable ordinal suffixes instead of producing duplicate declarations.
 
 ## Development
 
