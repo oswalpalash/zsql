@@ -212,6 +212,22 @@ pub fn build(b: *std.Build) void {
 
     // Postgres pool example is optional (skips without ZSQL_PG_URL); always buildable.
     examples_step.dependOn(pg_pool_example_step);
+
+    // Build zsql through a separate package root, exactly as an application
+    // dependency does. Keep system SQLite separate so the default gate remains
+    // portable on hosts without libsqlite3 development files.
+    const consumer_core = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "run" });
+    consumer_core.setCwd(b.path("tests/consumer"));
+    const consumer_sqlite = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "run", "-Denable-sqlite=true" });
+    consumer_sqlite.setCwd(b.path("tests/consumer"));
+    consumer_sqlite.step.dependOn(&consumer_core.step);
+    const consumer_smoke_step = b.step("consumer-smoke", "Test core and bundled SQLite from a separate consumer package");
+    consumer_smoke_step.dependOn(&consumer_sqlite.step);
+
+    const consumer_system = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "run", "-Denable-sqlite=true", "-Dsqlite-system=true" });
+    consumer_system.setCwd(b.path("tests/consumer"));
+    const consumer_system_step = b.step("consumer-smoke-system", "Test system SQLite from a separate consumer package");
+    consumer_system_step.dependOn(&consumer_system.step);
 }
 
 fn buildSqliteAmalgamation(

@@ -64,6 +64,9 @@ jobs:
       - name: Offline checked-queries example
         run: zig build checked-queries-example
 
+      - name: External consumer (core + bundled SQLite)
+        run: zig build consumer-smoke
+
       - name: Postgres pool example (skips without ZSQL_PG_URL)
         run: zig build run-postgres-pool-example
 
@@ -89,6 +92,9 @@ jobs:
 
       - name: Test with SQLite (system)
         run: zig build test -Denable-sqlite=true -Dsqlite-system=true
+
+      - name: External consumer (system SQLite)
+        run: zig build consumer-smoke-system
 
       - name: Live PostgreSQL integration tests
         env:

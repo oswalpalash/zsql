@@ -25,6 +25,27 @@ It does not give you:
 
 Zig **0.16** package. Core surface is usable for SQLite end-to-end and PostgreSQL protocol/query work (live server recommended for integration).
 
+## Install
+
+Add the package to an application and import its public module:
+
+```sh
+zig fetch --save=zsql git+https://github.com/oswalpalash/zsql.git
+```
+
+```zig
+const zsql_dep = b.dependency("zsql", .{
+    .target = target,
+    .optimize = optimize,
+    .@"enable-sqlite" = true, // omit or set false for PostgreSQL/core only
+});
+app.root_module.addImport("zsql", zsql_dep.module("zsql"));
+```
+
+The repository verifies this dependency boundary from a separate Zig package
+with `zig build consumer-smoke`; the optional system-library route is covered
+by `zig build consumer-smoke-system`.
+
 ### Public names
 
 - `zsql.Database(D)`, `zsql.Connection(D)`, `zsql.Statement(D)`, `zsql.ResultRows(D)`, `zsql.ResultRow(D)`
