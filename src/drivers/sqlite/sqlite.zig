@@ -2299,6 +2299,25 @@ test "SQLite savepoint rollback discards inner changes only" {
     try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
 }
 
+test "SQLite savepoint rollback recovers after statement failure" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+    _ = try conn.exec("create table sp_failure (id integer)", &.{});
+
+    var tx = try conn.begin();
+    defer tx.rollbackIfOpen();
+    var sp = try tx.savepoint();
+    _ = try tx.exec("insert into sp_failure (id) values (1)", &.{});
+    try std.testing.expectError(error.InvalidSql, tx.exec("select from", &.{}));
+    try sp.rollback();
+    try std.testing.expectError(error.SavepointClosed, sp.release());
+    try tx.commit();
+
+    try std.testing.expectError(error.NoRows, conn.queryOne("select id from sp_failure", &.{}));
+}
+
 test "SQLite savepoint rollbackIfOpen rolls back once" {
     var db = try Database.open(std.testing.allocator, .{});
     defer db.deinit();

@@ -540,6 +540,60 @@ test "postgres live: transaction state rejects nested idle and aborted misuse" {
     try conn.ping();
 }
 
+test "postgres live: savepoint rollback recovers failed transaction state" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, io, config);
+    defer conn.deinit();
+
+    try conn.begin();
+    var sp = try conn.savepoint();
+    try std.testing.expectError(error.InvalidSql, conn.exec("select from"));
+    try std.testing.expectError(error.TransactionAborted, sp.release());
+    try sp.rollback();
+    try std.testing.expectError(error.SavepointClosed, sp.rollback());
+    var rows = try conn.query("select 1::int as n");
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try rows.next().?.as(i64, 0));
+    try conn.commit();
+}
+
+test "postgres live: pool commits after savepoint recovery" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var pool = try pg.Pool.init(allocator, io, .{
+        .database = config,
+        .max_open = 1,
+        .max_idle = 1,
+    });
+    defer pool.deinit();
+
+    try pool.withTx({}, struct {
+        fn run(_: void, conn: *pg.Conn) !void {
+            var sp = try conn.savepoint();
+            try std.testing.expectError(error.InvalidSql, conn.exec("select from"));
+            try sp.rollback();
+            _ = try conn.exec("select 1");
+        }
+    }.run);
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+    try pool.ping();
+}
+
 test "postgres live: CancelHandle cancels an active query" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

@@ -2022,7 +2022,12 @@ pub const Savepoint = struct {
 
     pub fn release(self: *Savepoint) !void {
         if (!self.open) return error.SavepointClosed;
-        if (self.conn.closed or self.conn.tx_status != .in_transaction) return error.TransactionClosed;
+        if (self.conn.closed) return error.ConnectionClosed;
+        switch (self.conn.tx_status) {
+            .idle => return error.TransactionClosed,
+            .in_transaction => {},
+            .failed => return error.TransactionAborted,
+        }
         var sql_buf: [96]u8 = undefined;
         const sql = try std.fmt.bufPrint(&sql_buf, "release savepoint {s}", .{self.nameSlice()});
         _ = try self.conn.exec(sql);
@@ -2031,7 +2036,8 @@ pub const Savepoint = struct {
 
     pub fn rollback(self: *Savepoint) !void {
         if (!self.open) return error.SavepointClosed;
-        if (self.conn.closed or self.conn.tx_status != .in_transaction) return error.TransactionClosed;
+        if (self.conn.closed) return error.ConnectionClosed;
+        if (self.conn.tx_status == .idle) return error.TransactionClosed;
         var sql_buf: [96]u8 = undefined;
         const sql = try std.fmt.bufPrint(&sql_buf, "rollback to savepoint {s}", .{self.nameSlice()});
         _ = try self.conn.exec(sql);

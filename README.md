@@ -137,6 +137,8 @@ Transaction state is explicit: starting a nested transaction returns
 `error.TransactionClosed`. PostgreSQL commands rejected inside a transaction
 put it into failed state, where `begin`/`commit` return
 `error.TransactionAborted` until `rollback` restores the session.
+`Savepoint.rollback` is also valid in PostgreSQL's failed state and performs
+`ROLLBACK TO` followed by `RELEASE`, restoring the outer transaction for use.
 
 Pool acquire timeout: `0` = non-blocking, `std.math.maxInt(u64)` = wait forever (condition), any other value = timed wait (event signal on release).
 
