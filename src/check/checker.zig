@@ -12,6 +12,8 @@ pub const CheckError = error{
     UnknownTable,
     UnknownColumn,
     AmbiguousColumn,
+    AmbiguousProjection,
+    RowFieldNotProjected,
     TypeMismatch,
     NullabilityMismatch,
     InvalidSql,
@@ -52,6 +54,8 @@ const Projection = struct {
     column: []const u8,
     /// Optional table or alias qualifier before `.`.
     qualifier: ?[]const u8 = null,
+    /// Result-column name introduced by `AS alias` or a bare alias.
+    alias: ?[]const u8 = null,
     /// True for `*` or `table.*` — skipped for type checks, still requires known table.
     is_star: bool = false,
 };
@@ -61,12 +65,12 @@ const max_projections = 64;
 
 /// Lightweight offline SQL check against a schema artifact and parameter/row specs.
 ///
-/// Validates named placeholders and that each result field exists on the named
-/// table(s). Supports multi-table / JOIN scope via `from_tables`, qualified
-/// column names (`users.email` / `u.email`), optional SELECT-list projection
-/// checks (`check_projections`), optional WHERE column checks (`check_where`),
-/// optional JOIN ON column checks (`check_join_on`), and optional ORDER BY
-/// column checks (`check_order_by`).
+/// Validates placeholders and maps each declared result field to a simple
+/// SELECT projection, including aliases and stars. Supports multi-table / JOIN
+/// scope via `from_tables`, qualified column names (`users.email` / `u.email`),
+/// optional SELECT-list projection checks (`check_projections`), optional WHERE
+/// column checks (`check_where`), optional JOIN ON column checks
+/// (`check_join_on`), and optional ORDER BY column checks (`check_order_by`).
 ///
 /// Values are never required at check time. Allocation-free.
 pub fn checkQuery(options: struct {
@@ -144,39 +148,25 @@ pub fn checkQuery(options: struct {
     var table_buf: [max_tables]TableRef = undefined;
     const scope = try resolveTableScope(options.sql, options.schema, options.from_table, options.from_tables, &table_buf);
 
-    if (options.row.len != 0) {
-        if (scope.len == 0) {
-            // Fall back: single-table schema or error on unknown columns when no scope.
-            if (options.schema.tables.len == 1) {
-                const table = options.schema.tables[0];
-                for (options.row) |field| {
-                    const resolved = try resolveField(options.schema, &.{.{ .name = table.name }}, field.name);
-                    try checkFieldAgainstColumn(field, resolved.col);
-                }
-            } else {
-                for (options.row) |field| {
-                    // Unscoped multi-table schema: only accept fully qualified names
-                    // that match a schema table, or unique unqualified names.
-                    const resolved = try resolveField(options.schema, schemaAsScope(options.schema, &table_buf), field.name);
-                    try checkFieldAgainstColumn(field, resolved.col);
-                }
-            }
-        } else {
-            for (options.row) |field| {
-                const resolved = try resolveField(options.schema, scope, field.name);
-                try checkFieldAgainstColumn(field, resolved.col);
-            }
-        }
-    }
-
     const resolve_scope = if (scope.len != 0)
         scope
     else
         schemaAsScope(options.schema, &table_buf);
 
+    var proj_buf: [max_projections]Projection = undefined;
+    const projs = if (check_projections or check_order_by or options.row.len != 0)
+        try parseSelectProjections(options.sql, &proj_buf)
+    else
+        proj_buf[0..0];
+
+    if (options.row.len != 0) {
+        for (options.row) |field| {
+            const resolved = try resolveProjectedField(options.schema, resolve_scope, projs, field.name);
+            try checkFieldAgainstColumn(field, resolved.col);
+        }
+    }
+
     if (check_projections) {
-        var proj_buf: [max_projections]Projection = undefined;
-        const projs = try parseSelectProjections(options.sql, &proj_buf);
         for (projs) |proj| {
             if (proj.is_star) {
                 if (proj.qualifier) |q| {
@@ -212,8 +202,94 @@ pub fn checkQuery(options: struct {
     if (check_order_by) {
         var order_buf: [max_projections]Projection = undefined;
         const refs = try parseOrderByColumnRefs(options.sql, &order_buf);
-        try resolveProjectionRefs(options.schema, resolve_scope, refs);
+        try resolveOrderRefs(options.schema, resolve_scope, refs, projs);
     }
+}
+
+fn resolveOrderRefs(
+    schema: inspect.Schema,
+    scope: []const TableRef,
+    refs: []const Projection,
+    projections: []const Projection,
+) CheckError!void {
+    for (refs) |ref| {
+        if (ref.qualifier == null) {
+            var alias_matches: usize = 0;
+            for (projections) |projection| {
+                if (projection.alias) |alias| {
+                    if (std.mem.eql(u8, alias, ref.column)) alias_matches += 1;
+                }
+            }
+            if (alias_matches > 1) return error.AmbiguousProjection;
+            if (alias_matches == 1) continue;
+        }
+        if (ref.qualifier) |qualifier| {
+            _ = try resolveQualified(schema, scope, qualifier, ref.column);
+        } else {
+            _ = try resolveField(schema, scope, ref.column);
+        }
+    }
+}
+
+fn resolveProjectedField(
+    schema: inspect.Schema,
+    scope: []const TableRef,
+    projections: []const Projection,
+    field_name: []const u8,
+) CheckError!ResolvedColumn {
+    var match: ?ResolvedColumn = null;
+    for (projections) |projection| {
+        if (projection.is_star) continue;
+        if (!projectionMatchesField(projection, field_name)) continue;
+        const resolved = if (projection.qualifier) |qualifier|
+            try resolveQualified(schema, scope, qualifier, projection.column)
+        else
+            try resolveField(schema, scope, projection.column);
+        try addProjectionMatch(&match, resolved);
+    }
+
+    const dot = std.mem.indexOfScalar(u8, field_name, '.');
+    const field_qualifier = if (dot) |index| field_name[0..index] else null;
+    const column_name = if (dot) |index| field_name[index + 1 ..] else field_name;
+    for (projections) |projection| {
+        if (!projection.is_star) continue;
+        if (projection.qualifier) |star_qualifier| {
+            const table_ref = findTableRef(scope, star_qualifier) orelse return error.UnknownTable;
+            if (field_qualifier) |qualifier| {
+                const field_ref = findTableRef(scope, qualifier) orelse return error.RowFieldNotProjected;
+                if (!std.mem.eql(u8, field_ref.name, table_ref.name)) continue;
+            }
+            const table = findTable(schema, table_ref.name) orelse return error.UnknownTable;
+            const column = findColumn(table, column_name) orelse continue;
+            try addProjectionMatch(&match, .{ .table = table, .col = column });
+        } else {
+            for (scope) |table_ref| {
+                if (field_qualifier) |qualifier| {
+                    const field_ref = findTableRef(scope, qualifier) orelse return error.RowFieldNotProjected;
+                    if (!std.mem.eql(u8, field_ref.name, table_ref.name)) continue;
+                }
+                const table = findTable(schema, table_ref.name) orelse continue;
+                const column = findColumn(table, column_name) orelse continue;
+                try addProjectionMatch(&match, .{ .table = table, .col = column });
+            }
+        }
+    }
+    return match orelse error.RowFieldNotProjected;
+}
+
+fn addProjectionMatch(match: *?ResolvedColumn, candidate: ResolvedColumn) CheckError!void {
+    if (match.* != null) return error.AmbiguousProjection;
+    match.* = candidate;
+}
+
+fn projectionMatchesField(projection: Projection, field_name: []const u8) bool {
+    if (projection.alias) |alias| return std.mem.eql(u8, alias, field_name);
+    if (std.mem.indexOfScalar(u8, field_name, '.')) |dot| {
+        const qualifier = projection.qualifier orelse return false;
+        return std.mem.eql(u8, qualifier, field_name[0..dot]) and
+            std.mem.eql(u8, projection.column, field_name[dot + 1 ..]);
+    }
+    return std.mem.eql(u8, projection.column, field_name);
 }
 
 fn resolveProjectionRefs(schema: inspect.Schema, scope: []const TableRef, refs: []const Projection) CheckError!void {
@@ -798,6 +874,7 @@ fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) Ch
         }
 
         // first may be *, table, or column
+        const projection_index = count;
         if (std.mem.eql(u8, first.?, "*")) {
             buf[count] = .{ .column = "*", .is_star = true };
             count += 1;
@@ -815,15 +892,22 @@ fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) Ch
             count += 1;
         }
 
-        // Optional AS alias — consume and ignore
+        // Optional AS alias or bare alias.
         try sc.skipTrivia();
         if (try sc.matchKeyword("as")) {
-            _ = try sc.readIdentOrStar();
+            const alias = try sc.readIdentOrStar() orelse return error.InvalidSql;
+            if (std.mem.eql(u8, alias, "*")) return error.InvalidSql;
+            buf[projection_index].alias = alias;
         } else {
             // bare alias before comma/from
             const save = sc.index;
             if (!sc.startsWithKeyword("from") and sc.peek() != ',' and sc.peek() != ';') {
-                if ((try sc.readIdentOrStar()) == null) sc.index = save;
+                if (try sc.readIdentOrStar()) |alias| {
+                    if (std.mem.eql(u8, alias, "*")) return error.InvalidSql;
+                    buf[projection_index].alias = alias;
+                } else {
+                    sc.index = save;
+                }
             }
         }
 
@@ -1720,6 +1804,58 @@ test "checkQuery projections validate select list" {
     });
 }
 
+test "checked row fields must be returned projections" {
+    const schema = inspect.Schema{ .tables = &.{
+        .{ .name = "users", .columns = &.{
+            .{ .name = "id", .type_name = "int8", .nullable = false },
+            .{ .name = "email", .type_name = "text", .nullable = false },
+        } },
+        .{ .name = "posts", .columns = &.{
+            .{ .name = "id", .type_name = "int8", .nullable = false },
+            .{ .name = "title", .type_name = "text", .nullable = false },
+        } },
+    } };
+
+    try std.testing.expectError(error.RowFieldNotProjected, checkQuery(.{
+        .sql = "select id from users",
+        .schema = schema,
+        .row = &.{ .{ .name = "id", .type_name = "INT8" }, .{ .name = "email", .type_name = "TEXT" } },
+    }));
+
+    const aliased = checkedQuery(.{
+        .sql = "select email as address from users",
+        .row = struct { address: []const u8 },
+    });
+    try aliased.validate(schema);
+    try std.testing.expectError(error.RowFieldNotProjected, checkQuery(.{
+        .sql = "select email as address from users",
+        .schema = schema,
+        .row = &.{.{ .name = "email", .type_name = "TEXT" }},
+    }));
+
+    try checkQuery(.{
+        .sql = "select u.* from users u join posts p on true",
+        .schema = schema,
+        .row = &.{.{ .name = "email", .type_name = "TEXT" }},
+    });
+    try std.testing.expectError(error.RowFieldNotProjected, checkQuery(.{
+        .sql = "select u.* from users u join posts p on true",
+        .schema = schema,
+        .row = &.{.{ .name = "title", .type_name = "TEXT" }},
+    }));
+
+    try std.testing.expectError(error.AmbiguousProjection, checkQuery(.{
+        .sql = "select u.email as value, p.title as value from users u join posts p on true",
+        .schema = schema,
+        .row = &.{.{ .name = "value", .type_name = "TEXT" }},
+    }));
+    try std.testing.expectError(error.AmbiguousProjection, checkQuery(.{
+        .sql = "select * from users u join posts p on true",
+        .schema = schema,
+        .row = &.{.{ .name = "id", .type_name = "INT8" }},
+    }));
+}
+
 test "check level enables result-shape validation" {
     const schema = inspect.Schema{ .tables = &.{.{ .name = "users", .columns = &.{
         .{ .name = "id", .type_name = "INTEGER", .nullable = false },
@@ -2014,6 +2150,18 @@ test "checkQuery order by column refs resolve against scope" {
         .sql = "select id, email from users order by email asc, created_at desc nulls last",
         .schema = schema,
         .from_table = "users",
+        .check_order_by = true,
+    });
+
+    try checkQuery(.{
+        .sql = "select email as address from users order by address",
+        .schema = schema,
+        .row = &.{.{ .name = "address", .type_name = "TEXT" }},
+        .check_order_by = true,
+    });
+    try checkQuery(.{
+        .sql = "select email as address from users order by address",
+        .schema = schema,
         .check_order_by = true,
     });
 

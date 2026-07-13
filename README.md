@@ -469,6 +469,13 @@ and `checkedQuery` preserve it. `result_shape` checks projections;
 `result_types` additionally enables WHERE/HAVING, JOIN ON, and ORDER BY
 reference validation.
 
+Every declared row field must map to a returned simple column projection.
+Projection aliases are the result field names and retain the source column's
+type and nullability checks. Qualified and unqualified stars are supported;
+an output name supplied by more than one projection is rejected as ambiguous.
+`ORDER BY` may refer to a unique projection alias. Complex expression
+projections remain outside this bounded checker and are skipped.
+
 Placeholder validation is exact for anonymous `?`, SQLite indexed `?NNN`,
 PostgreSQL indexed `$N`, and named `:name` / `@name` / `$name` forms. Repeated
 indexes share one bind slot, anonymous indexes advance after explicit indexes,
