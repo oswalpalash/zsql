@@ -75,14 +75,17 @@ test "postgres live: handshake, params, tx, errors, inspect" {
     try std.testing.expectEqualStrings("named@example.com", try (try named_rows.next().?.value("email")).asText());
 
     // Unique violation should map + populate lastError, and leave conn usable.
+    const dup_sql = "insert into zsql_live_users (email) values ($1)";
     const dup = conn.execParams(
-        "insert into zsql_live_users (email) values ($1)",
+        dup_sql,
         &.{.{ .text = "ada@example.com" }},
     );
     try std.testing.expectError(error.UniqueViolation, dup);
     const db_err = conn.lastError() orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("23505", db_err.code.?);
     try std.testing.expect(db_err.constraint != null);
+    try std.testing.expectEqualStrings(dup_sql, db_err.sql.?);
+    try std.testing.expect(std.mem.indexOf(u8, db_err.sql.?, "ada@example.com") == null);
 
     // Connection recovered after ErrorResponse drain.
     var count_rows = try conn.query("select count(*)::bigint as n from zsql_live_users");
@@ -205,7 +208,7 @@ test "postgres live: reusable prepared statement exec query and close" {
     try select.close();
     try std.testing.expectError(error.StatementClosed, select.query(&.{.{ .integer = 1 }}));
     try std.testing.expectError(error.InvalidSql, conn.prepare("select from"));
-    try std.testing.expect(conn.lastError() != null);
+    try std.testing.expectEqualStrings("select from", conn.lastError().?.sql.?);
     try conn.ping();
 }
 

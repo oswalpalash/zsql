@@ -242,7 +242,7 @@ Failed commands map SQLSTATE into fine-grained errors (`UniqueViolation`, `Forei
 ```zig
 conn.execParams(...) catch |err| {
     if (conn.lastError()) |db_err| {
-        // db_err.code / .table / .constraint — never includes bind params you sent
+        // zsql does not copy the bind array; server detail may quote data values
         _ = db_err;
     }
     return err;
@@ -252,6 +252,9 @@ conn.execParams(...) catch |err| {
 After `ErrorResponse`, the driver drains to `ReadyForQuery` so the connection stays usable.
 PostgreSQL `lastError()` is borrowed until the next SQL operation or `deinit`;
 starting a later operation clears stale metadata, including when it succeeds.
+For SQL operations it also owns the exact statement template sent to PostgreSQL
+in `db_err.sql`; bind arguments are never interpolated into that text. Server
+fields such as `detail` remain verbatim and may themselves quote data values.
 
 SQLite exposes the same borrowed `Conn.lastError()` shape with its numeric
 extended result code, diagnostic message, and statement text. It duplicates

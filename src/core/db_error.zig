@@ -27,7 +27,8 @@ pub const ErrorCategory = enum {
 /// the lifetime of the owning connection/message buffer unless duplicated by
 /// the caller (see `OwnedDbError`).
 ///
-/// Never includes bind parameter values.
+/// zsql never copies bind arguments into this object. Database-provided
+/// diagnostic fields such as `detail` may themselves quote stored/input data.
 pub const DbError = struct {
     category: ErrorCategory,
     driver: DriverKind,
@@ -120,7 +121,8 @@ pub const DbError = struct {
 ///
 /// Callers that need metadata after an operation returns should use
 /// `Conn.lastError()` (borrowed from this storage) rather than parsing server
-/// messages themselves. Never contains bind parameter values.
+/// messages themselves. zsql never copies bind arguments into this storage;
+/// database-provided diagnostic text may itself quote stored/input data.
 pub const OwnedDbError = struct {
     category: ErrorCategory,
     driver: DriverKind,
@@ -169,6 +171,7 @@ pub const OwnedDbError = struct {
         allocator: std.mem.Allocator,
         fields: PostgresErrorFields,
         zig_err: anyerror,
+        sql: ?[]const u8,
     ) !OwnedDbError {
         const message = try allocator.dupe(u8, fields.message orelse @errorName(zig_err));
         errdefer allocator.free(message);
@@ -187,6 +190,7 @@ pub const OwnedDbError = struct {
         if (fields.table) |v| owned.table = try allocator.dupe(u8, v);
         if (fields.column) |v| owned.column = try allocator.dupe(u8, v);
         if (fields.constraint) |v| owned.constraint = try allocator.dupe(u8, v);
+        if (sql) |v| owned.sql = try allocator.dupe(u8, v);
         return owned;
     }
 };
@@ -241,6 +245,7 @@ test "OwnedDbError duplicates postgres fields without secrets" {
         std.testing.allocator,
         fields,
         error.UniqueViolation,
+        "insert into users (email) values ($1)",
     );
     defer owned.deinit(std.testing.allocator);
 
@@ -250,8 +255,9 @@ test "OwnedDbError duplicates postgres fields without secrets" {
     try std.testing.expectEqualStrings("23505", view.code.?);
     try std.testing.expectEqualStrings("users", view.table.?);
     try std.testing.expectEqualStrings("users_email_key", view.constraint.?);
-    // Message and detail are preserved for diagnostics; they may contain
-    // row key values from the server, but never client bind parameters we sent.
+    try std.testing.expectEqualStrings("insert into users (email) values ($1)", view.sql.?);
+    // Message and detail are preserved verbatim and may echo a bound/stored
+    // value; zsql itself never copies the caller's bind array into metadata.
     try std.testing.expect(std.mem.indexOf(u8, view.message, "duplicate") != null);
 }
 

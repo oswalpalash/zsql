@@ -444,7 +444,7 @@ pub const Conn = struct {
                     self.tx_status = try protocol.parseReadyForQuery(msg.body);
                     return;
                 },
-                .error_response => return self.failFromErrorResponse(msg.body, true),
+                .error_response => return self.failFromErrorResponse(msg.body, true, null),
                 else => {
                     self.drainUntilReady();
                     return error.ProtocolError;
@@ -486,7 +486,7 @@ pub const Conn = struct {
                     self.tx_status = try protocol.parseReadyForQuery(msg.body);
                     return .{ .rows_affected = rows_affected };
                 },
-                .error_response => return self.failFromErrorResponse(msg.body, true),
+                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
                 .row_description, .data_row => {
                     self.drainUntilReady();
                     return error.UnexpectedRow;
@@ -644,7 +644,7 @@ pub const Conn = struct {
                     if (!parsed or parameter_oids == null) return error.ProtocolError;
                     return parameter_oids.?;
                 },
-                .error_response => return self.failFromErrorResponse(msg.body, true),
+                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
                 else => {
                     self.drainUntilReady();
                     return error.ProtocolError;
@@ -657,10 +657,10 @@ pub const Conn = struct {
         if (self.closed) return error.ConnectionClosed;
         try self.sendExtended(sql, binds, false);
 
-        return self.collectExtendedExec();
+        return self.collectExtendedExec(sql);
     }
 
-    fn collectExtendedExec(self: *Conn) !core.ExecResult {
+    fn collectExtendedExec(self: *Conn, sql: []const u8) !core.ExecResult {
         var rows_affected: u64 = 0;
         while (true) {
             const msg = try self.readMessage();
@@ -676,7 +676,7 @@ pub const Conn = struct {
                     self.tx_status = try protocol.parseReadyForQuery(msg.body);
                     return .{ .rows_affected = rows_affected };
                 },
-                .error_response => return self.failFromErrorResponse(msg.body, true),
+                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
                 .row_description, .data_row => {
                     self.drainUntilReady();
                     return error.UnexpectedRow;
@@ -703,7 +703,7 @@ pub const Conn = struct {
             });
             return err;
         };
-        const result = self.collectExtendedExec() catch |err| {
+        const result = self.collectExtendedExec(sql) catch |err| {
             if (observe) self.hooks.emitAfter(.{
                 .driver = .postgres,
                 .sql = sql,
@@ -735,7 +735,7 @@ pub const Conn = struct {
             });
             return err;
         };
-        const rows = self.collectExtendedRows() catch |err| {
+        const rows = self.collectExtendedRows(sql) catch |err| {
             if (observe) self.hooks.emitAfter(.{
                 .driver = .postgres,
                 .sql = sql,
@@ -825,7 +825,7 @@ pub const Conn = struct {
             switch (msg.tag) {
                 .notification_response => return Notification.parse(self.allocator, msg.body),
                 .parameter_status, .notice_response => {},
-                .error_response => return self.failFromErrorResponse(msg.body, true),
+                .error_response => return self.failFromErrorResponse(msg.body, true, null),
                 else => return error.ProtocolError,
             }
         }
@@ -864,7 +864,7 @@ pub const Conn = struct {
                     return if (started) .{ .rows_affected = rows_affected } else error.ProtocolError;
                 },
                 .parameter_status, .notice_response, .notification_response => {},
-                .error_response => return self.failFromErrorResponse(msg.body, true),
+                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
                 else => return error.ProtocolError,
             }
         }
@@ -900,7 +900,7 @@ pub const Conn = struct {
                     return out.toOwnedSlice(self.allocator);
                 },
                 .parameter_status, .notice_response, .notification_response => {},
-                .error_response => return self.failFromErrorResponse(msg.body, true),
+                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
                 else => return error.ProtocolError,
             }
         }
@@ -941,7 +941,7 @@ pub const Conn = struct {
             }
             return err;
         };
-        const rows = self.collectExtendedRows() catch |err| {
+        const rows = self.collectExtendedRows(sql) catch |err| {
             self.invalidateCachedStatementAfterError(sql, err);
             if (observe) {
                 self.hooks.emitAfter(.{
@@ -1328,7 +1328,7 @@ pub const Conn = struct {
         }
     }
 
-    fn collectExtendedRows(self: *Conn) !SimpleRows {
+    fn collectExtendedRows(self: *Conn, sql: []const u8) !SimpleRows {
         var columns: []protocol.FieldDescription = &.{};
         var column_names: std.ArrayListUnmanaged([]u8) = .empty;
         errdefer {
@@ -1398,7 +1398,7 @@ pub const Conn = struct {
                         .rows_affected = rows_affected,
                     };
                 },
-                .error_response => return self.failFromErrorResponse(msg.body, true),
+                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
                 .parameter_status, .notice_response, .notification_response => {},
                 else => {
                     self.drainUntilReady();
@@ -1520,7 +1520,7 @@ pub const Conn = struct {
                         .rows_affected = rows_affected,
                     };
                 },
-                .error_response => return self.failFromErrorResponse(msg.body, true),
+                .error_response => return self.failFromErrorResponse(msg.body, true, sql),
                 .parameter_status, .notice_response, .notification_response => {},
                 else => {
                     self.drainUntilReady();
@@ -1659,7 +1659,7 @@ pub const Conn = struct {
                 .error_response => {
                     // Startup failures usually close the socket; still record
                     // metadata and map SQLSTATE when present.
-                    const err = self.captureSqlError(msg.body);
+                    const err = self.captureSqlError(msg.body, null);
                     // Prefer AuthFailed for handshake failures without a clear code.
                     if (err == error.DriverError) return error.AuthFailed;
                     return err;
@@ -1674,13 +1674,13 @@ pub const Conn = struct {
     /// Record ErrorResponse metadata and return the mapped Zig error.
     /// When `drain` is true, consume messages until ReadyForQuery so the
     /// connection remains usable for subsequent commands.
-    fn failFromErrorResponse(self: *Conn, body: []const u8, drain: bool) anyerror {
-        const err = self.captureSqlError(body);
+    fn failFromErrorResponse(self: *Conn, body: []const u8, drain: bool, sql: ?[]const u8) anyerror {
+        const err = self.captureSqlError(body, sql);
         if (drain) self.drainUntilReady();
         return err;
     }
 
-    fn captureSqlError(self: *Conn, body: []const u8) anyerror {
+    fn captureSqlError(self: *Conn, body: []const u8, sql: ?[]const u8) anyerror {
         self.clearLastError();
         const fields = protocol.parseErrorFields(body) catch return error.DriverError;
         const zig_err = if (fields.code) |code|
@@ -1699,7 +1699,7 @@ pub const Conn = struct {
             .constraint = fields.constraint,
         };
         // Best-effort ownership; OOM must not hide the original SQL error.
-        self.last_error = core.OwnedDbError.fromPostgresFields(self.allocator, pg_fields, zig_err) catch null;
+        self.last_error = core.OwnedDbError.fromPostgresFields(self.allocator, pg_fields, zig_err, sql) catch null;
         return zig_err;
     }
 
@@ -2471,12 +2471,13 @@ test "captureSqlError stores OwnedDbError for lastError()" {
         .table = fields.table,
         .column = fields.column,
         .constraint = fields.constraint,
-    }, zig_err);
+    }, zig_err, "insert into users (email) values ($1)");
     defer owned.deinit(std.testing.allocator);
 
     const view = owned.view();
     try std.testing.expectEqualStrings("users", view.table.?);
     try std.testing.expectEqualStrings("users_email_key", view.constraint.?);
+    try std.testing.expectEqualStrings("insert into users (email) values ($1)", view.sql.?);
     try std.testing.expect(view.category == .constraint);
 }
 
