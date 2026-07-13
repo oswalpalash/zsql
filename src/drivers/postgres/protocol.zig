@@ -463,6 +463,7 @@ pub fn parseErrorFields(body: []const u8) !ErrorFields {
 }
 
 pub fn appendCString(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidArguments;
     try list.appendSlice(allocator, value);
     try list.append(allocator, 0);
 }
@@ -678,6 +679,26 @@ test "parse parameter description" {
     defer std.testing.allocator.free(oids);
     try std.testing.expectEqualSlices(u32, &.{ 20, 0xf0000001 }, oids);
     try std.testing.expectError(error.ProtocolError, parseParameterDescription(body.items[0 .. body.items.len - 1], std.testing.allocator));
+}
+
+test "frontend C strings reject embedded NUL without mutation" {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try list.appendSlice(std.testing.allocator, "prefix");
+    try std.testing.expectError(
+        error.InvalidArguments,
+        appendCString(&list, std.testing.allocator, "unsafe\x00suffix"),
+    );
+    try std.testing.expectEqualStrings("prefix", list.items);
+
+    try std.testing.expectError(
+        error.InvalidArguments,
+        buildQueryMessage(std.testing.allocator, "select 1\x00; drop table users"),
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        buildParseMessageNamed(std.testing.allocator, "stmt\x00other", "select 1"),
+    );
 }
 
 pub fn appendI16(list: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: i16) !void {

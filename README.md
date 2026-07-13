@@ -122,6 +122,9 @@ check failures to the corresponding public `zsql.Error` categories.
 
 Native wire protocol. Prefer parameterized APIs:
 
+PostgreSQL protocol C-string fields reject embedded NUL bytes before any
+request is sent. Length-prefixed bind values remain binary-safe.
+
 ```zig
 // $1-style placeholders; values never concatenated into SQL
 _ = try conn.execParams("insert into users (email) values ($1)", &.{.{ .text = "ada@example.com" }});
