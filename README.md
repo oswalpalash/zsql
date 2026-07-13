@@ -50,6 +50,8 @@ façade and driver lifecycle declarations before exercising runtime behavior.
 `zig build install-smoke` also installs the static library and CLI into a fresh
 temporary prefix and runs the installed `zsql doctor`, ensuring distribution
 artifacts do not depend on repository-relative files.
+`zig build portability-smoke` cross-builds the installed library and CLI for
+`x86_64-windows` and static `aarch64-linux-musl` in isolated prefixes.
 `zig build version-sync` makes `build.zig.zon` authoritative for release
 metadata and fails if the library/CLI build option drifts; `install-smoke` also
 compares the installed doctor's reported version to that manifest value.
@@ -64,8 +66,9 @@ zig build release-verify
 ```
 
 This covers formatting, default and SQLite tests, version integrity, checked
-queries, examples, external consumers, clean installation, and the fetched
-release payload. PostgreSQL protocol tests are included in the default suite;
+queries, examples, external consumers, clean installation, Windows/static-
+Linux cross-builds, and the fetched release payload. PostgreSQL protocol tests
+are included in the default suite;
 live server behavior remains the explicit final service-backed gate:
 
 ```sh

@@ -241,6 +241,10 @@ pub fn build(b: *std.Build) void {
     const install_smoke_step = b.step("install-smoke", "Install to a clean prefix and run the installed CLI");
     install_smoke_step.dependOn(&install_smoke.step);
 
+    const portability_smoke = b.addSystemCommand(&.{ "sh", "scripts/portability_smoke.sh", b.graph.zig_exe });
+    const portability_smoke_step = b.step("portability-smoke", "Cross-build the installed library and CLI for Windows and static Linux");
+    portability_smoke_step.dependOn(&portability_smoke.step);
+
     const package_smoke = b.addSystemCommand(&.{ "sh", "scripts/package_smoke.sh", b.graph.zig_exe });
     const package_smoke_step = b.step("package-smoke", "Fetch and test the manifest-selected clean package payload");
     package_smoke_step.dependOn(&package_smoke.step);
