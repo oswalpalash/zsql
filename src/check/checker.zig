@@ -69,6 +69,8 @@ const Projection = struct {
     column: []const u8,
     /// Optional table or alias qualifier before `.`.
     qualifier: ?[]const u8 = null,
+    /// Optional schema qualifier before `table.column`.
+    schema_qualifier: ?[]const u8 = null,
     /// Result-column name introduced by `AS alias` or a bare alias.
     alias: ?[]const u8 = null,
     kind: ProjectionKind = .column,
@@ -192,8 +194,8 @@ pub fn checkQuery(options: struct {
             switch (proj.kind) {
                 .star => {
                     if (proj.qualifier) |q| {
-                        // table.* — qualifier must resolve to a known table/alias in scope.
-                        _ = findTableRefSql(resolve_scope, q, options.schema.dialect) orelse return error.UnknownTable;
+                        // table.* / schema.table.* must resolve in scope.
+                        _ = findProjectionTableRef(options.schema, resolve_scope, proj.schema_qualifier, q) orelse return error.UnknownTable;
                     }
                 },
                 .column, .count, .min, .max => _ = try resolveProjectionColumn(options.schema, resolve_scope, proj),
@@ -240,7 +242,7 @@ fn resolveOutputRefs(
     projections: []const Projection,
 ) CheckError!void {
     for (refs) |ref| {
-        if (ref.qualifier == null) {
+        if (ref.qualifier == null and ref.schema_qualifier == null) {
             var alias_matches: usize = 0;
             var alias_projection: ?Projection = null;
             for (projections) |projection| {
@@ -257,11 +259,7 @@ fn resolveOutputRefs(
                 continue;
             }
         }
-        if (ref.qualifier) |qualifier| {
-            _ = try resolveQualifiedSql(schema, scope, qualifier, ref.column);
-        } else {
-            _ = try resolveUnqualifiedSql(schema, scope, ref.column);
-        }
+        _ = try resolveProjectionRef(schema, scope, ref);
     }
 }
 
@@ -287,7 +285,7 @@ fn resolveProjectedField(
     for (projections) |projection| {
         if (projection.kind != .star) continue;
         if (projection.qualifier) |star_qualifier| {
-            const table_ref = findTableRefSql(scope, star_qualifier, schema.dialect) orelse return error.UnknownTable;
+            const table_ref = findProjectionTableRef(schema, scope, projection.schema_qualifier, star_qualifier) orelse return error.UnknownTable;
             if (field_qualifier) |qualifier| {
                 const field_ref = findTableRef(scope, qualifier, schema.dialect) orelse return error.RowFieldNotProjected;
                 if (!sameTable(field_ref.table, table_ref.table)) continue;
@@ -312,10 +310,7 @@ fn resolveProjectedField(
 
 fn resolveProjectionColumn(schema: inspect.Schema, scope: []const TableRef, projection: Projection) CheckError!inspect.Column {
     return switch (projection.kind) {
-        .column => if (projection.qualifier) |qualifier|
-            (try resolveQualifiedSql(schema, scope, qualifier, projection.column)).col
-        else
-            (try resolveUnqualifiedSql(schema, scope, projection.column)).col,
+        .column => (try resolveProjectionRef(schema, scope, projection)).col,
         .count, .min, .max => try resolveAggregateProjection(schema, scope, projection),
         .star => unreachable,
     };
@@ -324,10 +319,8 @@ fn resolveProjectionColumn(schema: inspect.Schema, scope: []const TableRef, proj
 fn resolveAggregateProjection(schema: inspect.Schema, scope: []const TableRef, projection: Projection) CheckError!inspect.Column {
     const source = if (sqlIdentEql(projection.column, "*"))
         null
-    else if (projection.qualifier) |qualifier|
-        try resolveQualifiedSql(schema, scope, qualifier, projection.column)
     else
-        try resolveUnqualifiedSql(schema, scope, projection.column);
+        try resolveProjectionRef(schema, scope, projection);
 
     return switch (projection.kind) {
         .count => .{
@@ -375,12 +368,19 @@ fn projectionMatchesField(
 
 fn resolveProjectionRefs(schema: inspect.Schema, scope: []const TableRef, refs: []const Projection) CheckError!void {
     for (refs) |ref| {
-        if (ref.qualifier) |q| {
-            _ = try resolveQualifiedSql(schema, scope, q, ref.column);
-        } else {
-            _ = try resolveUnqualifiedSql(schema, scope, ref.column);
-        }
+        _ = try resolveProjectionRef(schema, scope, ref);
     }
+}
+
+fn resolveProjectionRef(schema: inspect.Schema, scope: []const TableRef, ref: Projection) CheckError!ResolvedColumn {
+    if (ref.schema_qualifier) |schema_qualifier| {
+        const qualifier = ref.qualifier orelse return error.InvalidSql;
+        const table_ref = findTableRefQualifiedSql(scope, schema_qualifier, qualifier, schema.dialect) orelse return error.UnknownTable;
+        const column = findColumnSql(table_ref.table, ref.column, schema.dialect) orelse return error.UnknownColumn;
+        return .{ .table = table_ref.table, .col = column };
+    }
+    if (ref.qualifier) |qualifier| return resolveQualifiedSql(schema, scope, qualifier, ref.column);
+    return resolveUnqualifiedSql(schema, scope, ref.column);
 }
 
 fn schemaAsScope(schema: inspect.Schema, buf: *[max_tables]TableRef) CheckError![]const TableRef {
@@ -504,6 +504,38 @@ fn findTableRefSql(scope: []const TableRef, qualifier: []const u8, dialect: insp
             continue;
         }
         if (sqlIdentsResolveEql(ref.relation_name, qualifier, dialect)) return ref;
+    }
+    return null;
+}
+
+fn findProjectionTableRef(
+    schema: inspect.Schema,
+    scope: []const TableRef,
+    schema_qualifier: ?[]const u8,
+    qualifier: []const u8,
+) ?TableRef {
+    if (schema_qualifier) |schema_name| {
+        return findTableRefQualifiedSql(scope, schema_name, qualifier, schema.dialect);
+    }
+    return findTableRefSql(scope, qualifier, schema.dialect);
+}
+
+fn findTableRefQualifiedSql(
+    scope: []const TableRef,
+    schema_qualifier: []const u8,
+    relation_qualifier: []const u8,
+    dialect: inspect.Dialect,
+) ?TableRef {
+    for (scope) |ref| {
+        // A relation alias hides both its original qualified and bare names.
+        if (ref.alias != null) continue;
+        if (!sqlIdentsResolveEql(ref.relation_name, relation_qualifier, dialect)) continue;
+        if (ref.table.schema) |schema_name| {
+            if (sqlSchemaIdentEql(schema_qualifier, schema_name, dialect)) return ref;
+        } else if (sqlQualifiedIdentEql(schema_qualifier, relation_qualifier, ref.table.name, dialect)) {
+            // Backward compatibility for old flattened `schema.table` tables.
+            return ref;
+        }
     }
     return null;
 }
@@ -1333,7 +1365,18 @@ fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) Ch
             } else if (sc.peek() == '.') {
                 sc.advance();
                 const second = try sc.readIdentOrStar() orelse return error.InvalidSql;
-                if (sqlIdentEql(second, "*")) {
+                try sc.skipTrivia();
+                if (sc.peek() == '.') {
+                    if (sqlIdentEql(second, "*")) return error.InvalidSql;
+                    sc.advance();
+                    const third = try sc.readIdentOrStar() orelse return error.InvalidSql;
+                    buf[count] = .{
+                        .column = third,
+                        .qualifier = second,
+                        .schema_qualifier = first.?,
+                        .kind = if (sqlIdentEql(third, "*")) .star else .column,
+                    };
+                } else if (sqlIdentEql(second, "*")) {
                     buf[count] = .{ .column = "*", .qualifier = first.?, .kind = .star };
                 } else {
                     buf[count] = .{ .column = second, .qualifier = first.? };
@@ -1386,8 +1429,18 @@ fn parseAggregateProjection(sc: *Scanner, kind: ProjectionKind) CheckError!?Proj
             sc.advance();
             const second = try sc.readIdentOrStar() orelse return null;
             if (sqlIdentEql(second, "*")) return null;
-            projection.qualifier = first;
-            projection.column = second;
+            try sc.skipTrivia();
+            if (sc.peek() == '.') {
+                sc.advance();
+                const third = try sc.readIdentOrStar() orelse return null;
+                if (sqlIdentEql(third, "*")) return null;
+                projection.schema_qualifier = first;
+                projection.qualifier = second;
+                projection.column = third;
+            } else {
+                projection.qualifier = first;
+                projection.column = second;
+            }
         }
     }
 
@@ -1656,11 +1709,28 @@ fn collectColumnRefs(sc: *Scanner, buf: *[max_projections]Projection, start_coun
             continue;
         }
 
-        // Qualified name: qual.col or schema.func(...)
+        // Qualified name: qual.col, schema.table.col, or schema.func(...)
         if (sc.peek() == '.') {
             sc.advance();
             const second = try sc.readIdentOrStar() orelse return error.InvalidSql;
             try sc.skipTrivia();
+            if (sc.peek() == '.') {
+                if (sqlIdentEql(second, "*")) return error.InvalidSql;
+                sc.advance();
+                const third = try sc.readIdentOrStar() orelse return error.InvalidSql;
+                try sc.skipTrivia();
+                if (sc.peek() == '(') {
+                    // catalog.schema.func(...) — scan arguments only.
+                    count = try collectParenExpr(sc, buf, count);
+                    continue;
+                }
+                if (sqlIdentEql(third, "*") or isSqlNoiseIdent(third)) continue;
+                if (isSqlNoiseIdent(first.?) or isSqlNoiseIdent(second)) continue;
+                if (count >= max_projections) return error.TooManyProjections;
+                buf[count] = .{ .column = third, .qualifier = second, .schema_qualifier = first.? };
+                count += 1;
+                continue;
+            }
             if (sc.peek() == '(') {
                 // schema.func(...) — do not treat func as a column; scan args.
                 count = try collectParenExpr(sc, buf, count);
@@ -2554,6 +2624,50 @@ test "checkQuery resolves structured PostgreSQL schema-qualified relations" {
         .from_table = "audit.events",
         .row = &.{.{ .name = "id", .type_name = "int8" }},
     });
+    try checkQuery(.{
+        .sql =
+        \\select audit.events.id as event_id,
+        \\       min(audit.events.user_id) as min_user
+        \\from audit.events
+        \\where audit.events.user_id > 0
+        \\group by audit.events.id
+        \\having min(audit.events.user_id) > 0
+        \\order by audit.events.id
+        ,
+        .schema = schema,
+        .row = &.{
+            .{ .name = "event_id", .type_name = "int8" },
+            .{ .name = "min_user", .type_name = "int8", .nullable = true },
+        },
+        .check_where = true,
+        .check_group_by = true,
+        .check_order_by = true,
+    });
+    try checkQuery(.{
+        .sql = "select audit.events.* from audit.events",
+        .schema = schema,
+        .row = &.{
+            .{ .name = "id", .type_name = "int8" },
+            .{ .name = "user_id", .type_name = "int8" },
+        },
+        .check_projections = true,
+    });
+    try checkQuery(.{
+        .sql =
+        \\select audit.events.id as audit_id
+        \\from audit.events
+        \\join archive.events on audit.events.id = archive.events.id
+        ,
+        .schema = schema,
+        .row = &.{.{ .name = "audit_id", .type_name = "int8" }},
+        .check_join_on = true,
+    });
+    try checkQuery(.{
+        .sql = "select \"Audit\".\"Events\".\"Camel\" as \"Result\" from \"Audit\".\"Events\" where \"Audit\".\"Events\".\"Camel\" is not null",
+        .schema = schema,
+        .row = &.{.{ .name = "Result", .type_name = "text" }},
+        .check_where = true,
+    });
     // Once a relation has an alias, PostgreSQL hides its original table name.
     try std.testing.expectError(error.UnknownTable, checkQuery(.{
         .sql = "select events.id from audit.events as e",
@@ -2562,6 +2676,16 @@ test "checkQuery resolves structured PostgreSQL schema-qualified relations" {
     }));
     try std.testing.expectError(error.UnknownTable, checkQuery(.{
         .sql = "select users.id from users as u",
+        .schema = schema,
+        .check_projections = true,
+    }));
+    try std.testing.expectError(error.UnknownTable, checkQuery(.{
+        .sql = "select audit.events.id from audit.events as e",
+        .schema = schema,
+        .check_projections = true,
+    }));
+    try std.testing.expectError(error.UnknownTable, checkQuery(.{
+        .sql = "select missing.events.id from audit.events",
         .schema = schema,
         .check_projections = true,
     }));

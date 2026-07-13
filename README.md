@@ -541,6 +541,11 @@ non-public tables must be schema-qualified. A SQL alias hides the original
 relation name, matching PostgreSQL visibility rules. Legacy artifacts that used
 a single `schema.table` display name remain readable.
 
+Fully qualified PostgreSQL column references (`schema.table.column`) are
+validated in SELECT projections, qualified stars, portable aggregate
+arguments, WHERE/HAVING expressions, JOIN ON, GROUP BY, and ORDER BY. Quoted
+components remain exact; unquoted components use PostgreSQL lowercase folding.
+
 ### CLI
 
 Migration applies are transactional and serialized per driver. If migration SQL
