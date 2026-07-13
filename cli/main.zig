@@ -35,7 +35,7 @@ pub fn main(init: std.process.Init) !void {
             try cmdMigrateNew(init, name);
             return;
         }
-        if (std.mem.eql(u8, sub, "status") or std.mem.eql(u8, sub, "up")) {
+        if (std.mem.eql(u8, sub, "status") or std.mem.eql(u8, sub, "up") or std.mem.eql(u8, sub, "repair")) {
             try cmdMigrateDb(init, sub, &args);
             return;
         }
@@ -76,8 +76,10 @@ fn printHelp(io: std.Io) !void {
         \\  zsql migrate new <name>
         \\  zsql migrate status --database <path> [--dir migrations]
         \\  zsql migrate up --database <path> [--dir migrations]
+        \\  zsql migrate repair --database <path> --version <n> [--dir migrations]
         \\  zsql migrate status --url <postgres-url> [--dir migrations]
         \\  zsql migrate up --url <postgres-url> [--dir migrations]
+        \\  zsql migrate repair --url <postgres-url> --version <n> [--dir migrations]
         \\  zsql inspect --database <path> [--out schema.zon]
         \\  zsql inspect --url <postgres-url> [--out schema.zon]
         \\  zsql gen structs --schema <schema.zon> --out <schema.zig>
@@ -96,8 +98,10 @@ fn printMigrateHelp(io: std.Io) !void {
         \\  zsql migrate new <name>
         \\  zsql migrate status --database <path> [--dir migrations]
         \\  zsql migrate up --database <path> [--dir migrations]
+        \\  zsql migrate repair --database <path> --version <n> [--dir migrations]
         \\  zsql migrate status --url <postgres-url> [--dir migrations]
         \\  zsql migrate up --url <postgres-url> [--dir migrations]
+        \\  zsql migrate repair --url <postgres-url> --version <n> [--dir migrations]
         \\
     );
 }
@@ -186,6 +190,7 @@ fn cmdMigrateDb(init: std.process.Init, sub: []const u8, args: *std.process.Args
     var database_path: ?[]const u8 = null;
     var url: ?[]const u8 = null;
     var dir_path: []const u8 = "migrations";
+    var repair_version: ?u64 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--database")) {
             database_path = args.next() orelse return error.InvalidArguments;
@@ -193,6 +198,8 @@ fn cmdMigrateDb(init: std.process.Init, sub: []const u8, args: *std.process.Args
             url = args.next() orelse return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--dir")) {
             dir_path = args.next() orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            repair_version = try parseMigrationVersion(args.next() orelse return error.InvalidArguments);
         } else {
             try writeOut(init.io, .stderr, "unknown flag; use --database or --url and optional --dir\n");
             return error.InvalidArguments;
@@ -203,9 +210,14 @@ fn cmdMigrateDb(init: std.process.Init, sub: []const u8, args: *std.process.Args
         try writeOut(init.io, .stderr, "use either --database (sqlite) or --url (postgres), not both\n");
         return error.InvalidArguments;
     }
+    const repairing = std.mem.eql(u8, sub, "repair");
+    if (repairing != (repair_version != null)) {
+        try writeOut(init.io, .stderr, "repair requires --version <n>; other migrate commands do not accept it\n");
+        return error.InvalidArguments;
+    }
 
     if (url) |pg_url| {
-        return cmdMigratePostgres(init, sub, pg_url, dir_path);
+        return cmdMigratePostgres(init, sub, pg_url, dir_path, repair_version);
     }
 
     const db_path = database_path orelse {
@@ -237,6 +249,12 @@ fn cmdMigrateDb(init: std.process.Init, sub: []const u8, args: *std.process.Args
 
     const migrator = zsql.drivers.sqlite.Migrator.init(&conn);
     try migrator.ensureTable();
+    if (repair_version) |version| {
+        const migration = findMigrationByVersion(migrations.files, version) orelse return error.MigrationNotFound;
+        try migrator.repairDirty(version, migration.checksum);
+        try printRepairResult(io, allocator, version);
+        return;
+    }
     try migrator.validate(migrations.files);
 
     if (std.mem.eql(u8, sub, "up")) {
@@ -251,7 +269,13 @@ fn cmdMigrateDb(init: std.process.Init, sub: []const u8, args: *std.process.Args
     try printMigrationStatus(io, allocator, status.records);
 }
 
-fn cmdMigratePostgres(init: std.process.Init, sub: []const u8, pg_url: []const u8, dir_path: []const u8) !void {
+fn cmdMigratePostgres(
+    init: std.process.Init,
+    sub: []const u8,
+    pg_url: []const u8,
+    dir_path: []const u8,
+    repair_version: ?u64,
+) !void {
     const allocator = init.gpa;
     const io = init.io;
     const pg = zsql.drivers.postgres;
@@ -270,6 +294,12 @@ fn cmdMigratePostgres(init: std.process.Init, sub: []const u8, pg_url: []const u
 
     const migrator = pg.Migrator.init(&conn);
     try migrator.ensureTable();
+    if (repair_version) |version| {
+        const migration = findMigrationByVersion(migrations.files, version) orelse return error.MigrationNotFound;
+        try migrator.repairDirty(version, migration.checksum);
+        try printRepairResult(io, allocator, version);
+        return;
+    }
     try migrator.validate(migrations.files);
 
     if (std.mem.eql(u8, sub, "up")) {
@@ -282,6 +312,23 @@ fn cmdMigratePostgres(init: std.process.Init, sub: []const u8, pg_url: []const u
     var status = try migrator.status(allocator);
     defer status.deinit();
     try printMigrationStatus(io, allocator, status.records);
+}
+
+fn parseMigrationVersion(value: []const u8) !u64 {
+    return std.fmt.parseUnsigned(u64, value, 10) catch error.InvalidArguments;
+}
+
+fn findMigrationByVersion(migrations: []const zsql.migrate.MigrationFile, version: u64) ?zsql.migrate.MigrationFile {
+    for (migrations) |migration| {
+        if (migration.id.version == version) return migration;
+    }
+    return null;
+}
+
+fn printRepairResult(io: std.Io, allocator: std.mem.Allocator, version: u64) !void {
+    const message = try std.fmt.allocPrint(allocator, "repaired dirty migration V{d}; edit if needed, then rerun migrate up\n", .{version});
+    defer allocator.free(message);
+    try writeOut(io, .stdout, message);
 }
 
 fn printMigrationStatus(io: std.Io, allocator: std.mem.Allocator, records: anytype) !void {
@@ -374,6 +421,23 @@ fn isValidMigrationName(name: []const u8) bool {
         if (!ok) return false;
     }
     return true;
+}
+
+test "migration repair version parser is strict" {
+    try std.testing.expectEqual(@as(u64, 42), try parseMigrationVersion("42"));
+    try std.testing.expectError(error.InvalidArguments, parseMigrationVersion("-1"));
+    try std.testing.expectError(error.InvalidArguments, parseMigrationVersion("abc"));
+}
+
+test "migration repair finds exact version" {
+    const sql = "select 1";
+    const migrations = [_]zsql.migrate.MigrationFile{.{
+        .id = .{ .version = 7, .name = "seven", .filename = "V0007__seven.sql" },
+        .sql = sql,
+        .checksum = zsql.migrate.checksumSql(sql),
+    }};
+    try std.testing.expectEqual(@as(u64, 7), findMigrationByVersion(&migrations, 7).?.id.version);
+    try std.testing.expect(findMigrationByVersion(&migrations, 8) == null);
 }
 
 fn nextMigrationVersion(io: std.Io, dir_path: []const u8) !u64 {

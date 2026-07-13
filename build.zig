@@ -86,6 +86,9 @@ pub fn build(b: *std.Build) void {
         .name = "zsql",
         .root_module = cli_mod,
     });
+    const cli_tests = b.addTest(.{ .root_module = cli_mod });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    test_step.dependOn(&run_cli_tests.step);
     b.installArtifact(cli_exe);
     const run_cli = b.addRunArtifact(cli_exe);
     if (b.args) |args| run_cli.addArgs(args);

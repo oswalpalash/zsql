@@ -16,7 +16,7 @@ coverage; PostgreSQL rows marked live also run against PostgreSQL 16 in CI.
 | Explicit owned rows | Complete | `OwnedRow`, `Row.getOwned`, `zsql.freeOwnedRows` | allocator-backed core and driver tests |
 | Connection pooling | Complete | `Pool(D)`, `Lease(D)`, health-aware release, stats and timeouts | SQLite recovery tests; PostgreSQL live tests |
 | Transactions and savepoints | Complete | explicit nested/idle/aborted states; failed-state savepoint recovery; `Tx(D)`, `Savepoint(D)`, `withTx` | SQLite state tests and PostgreSQL direct/pool live tests |
-| Migrations | Complete | transactional apply, durable dirty failures, checksum-guarded explicit repair; `Migrator(D).up`, `.status`; CLI commands | SQLite repair workflow, PostgreSQL live repair tests, migration example |
+| Migrations | Complete | transactional apply, durable dirty failures, checksum-guarded API/CLI repair; `Migrator(D).up`, `.status` | SQLite repair workflow, PostgreSQL live repair tests, CLI parser tests, migration example |
 | Schema inspection | Complete | driver `inspectSchema`; CLI `inspect` | inspector tests and PostgreSQL live tests |
 | Optional offline query checks | Complete within documented bounded scope | `zsql.check`, `zsql.checkedQuery` | `zig build check-sql` |
 | Query builder | Complete | `QueryBuilder`, `ident`, `identPath`, `bind`, `rawUnsafe` | core unit tests |

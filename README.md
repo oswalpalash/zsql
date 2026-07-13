@@ -414,6 +414,10 @@ primitive. It locks migration history, requires an existing dirty row and exact
 checksum match, then deletes only that row so corrected migration SQL can rerun.
 It never marks schema state clean.
 
+The CLI derives that checksum from the matching file in `--dir`: run repair
+while the failed file is unchanged, then edit it if needed and run `migrate up`.
+If the file was already changed, repair stops with `MigrationChecksumMismatch`.
+
 ```sh
 zig build run -- --help
 zig build run -- doctor
@@ -423,11 +427,13 @@ zig build run -- migrate new create_users
 zig build -Denable-sqlite=true
 ./zig-out/bin/zsql migrate up --database app.db --dir migrations
 ./zig-out/bin/zsql migrate status --database app.db --dir migrations
+./zig-out/bin/zsql migrate repair --database app.db --version 1 --dir migrations
 ./zig-out/bin/zsql inspect --database app.db --out schema.zon
 
 # Postgres migrate/inspect (native driver; no -Denable-sqlite required):
 ./zig-out/bin/zsql migrate up --url 'postgres://user:pass@127.0.0.1:5432/db?sslmode=disable'
 ./zig-out/bin/zsql migrate status --url 'postgres://user:pass@127.0.0.1:5432/db?sslmode=disable'
+./zig-out/bin/zsql migrate repair --url 'postgres://user:pass@127.0.0.1:5432/db?sslmode=disable' --version 1 --dir migrations
 ./zig-out/bin/zsql inspect --url 'postgres://user:pass@127.0.0.1:5432/db?sslmode=disable' --out schema.zon
 
 # Optional schema-to-Zig struct generation:
