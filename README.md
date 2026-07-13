@@ -256,6 +256,14 @@ For SQL operations it also owns the exact statement template sent to PostgreSQL
 in `db_err.sql`; bind arguments are never interpolated into that text. Server
 fields such as `detail` remain verbatim and may themselves quote data values.
 
+Format rich errors with `{f}` (or call `formatSafe`) for logs. The safe format
+keeps the driver, category, code, and escaped object identifiers while omitting
+`message`, `detail`, `hint`, and `sql`, all of which may contain data or SQL
+literals. `formatSensitive` exposes the complete escaped diagnostic only when
+the caller deliberately opts in at a trusted boundary. Zig's structural
+`{any}` formatting bypasses this policy and should not be used for `DbError` in
+logs.
+
 SQLite exposes the same borrowed `Conn.lastError()` shape with its numeric
 extended result code, diagnostic message, and statement text. It duplicates
 connection-owned metadata immediately and never stores bind parameter values;
@@ -327,7 +335,8 @@ Unsafe raw append is named `rawUnsafe` on purpose.
 ### Query hooks
 
 Connection-local observability (no global registry). Hooks receive statement text
-and duration — never bind parameter values.
+and duration — never bind parameter values. Statement text is not otherwise
+redacted, so caller-written SQL literals remain visible to the hook.
 
 ```zig
 var state: Counter = .{};

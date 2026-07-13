@@ -42,6 +42,49 @@ pub const DbError = struct {
     constraint: ?[]const u8 = null,
     sql: ?[]const u8 = null,
 
+    /// Default formatter suitable for logs. This intentionally omits
+    /// `message`, `detail`, `hint`, and `sql`: databases may echo stored or
+    /// bound data in diagnostics, and SQL text may contain caller-written
+    /// literals. Use `formatSensitive` only at an explicit trusted boundary.
+    pub fn format(self: DbError, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        return self.formatSafe(writer);
+    }
+
+    /// Write a redacted diagnostic summary. Retained metadata is escaped so a
+    /// server-controlled identifier cannot inject extra log lines.
+    pub fn formatSafe(self: DbError, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print(
+            "DbError{{ driver={s}, category={s}",
+            .{ @tagName(self.driver), @tagName(self.category) },
+        );
+        try writeOptionalField(writer, "code", self.code);
+        try writeOptionalField(writer, "schema", self.schema);
+        try writeOptionalField(writer, "table", self.table);
+        try writeOptionalField(writer, "column", self.column);
+        try writeOptionalField(writer, "constraint", self.constraint);
+        try writer.writeAll(" }");
+    }
+
+    /// Write all available diagnostics, including fields that may contain
+    /// stored/input data or SQL literals. The output is escaped for one-line
+    /// logging, but it is not redacted.
+    pub fn formatSensitive(self: DbError, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print(
+            "DbError{{ driver={s}, category={s}",
+            .{ @tagName(self.driver), @tagName(self.category) },
+        );
+        try writeOptionalField(writer, "code", self.code);
+        try writeField(writer, "message", self.message);
+        try writeOptionalField(writer, "detail", self.detail);
+        try writeOptionalField(writer, "hint", self.hint);
+        try writeOptionalField(writer, "schema", self.schema);
+        try writeOptionalField(writer, "table", self.table);
+        try writeOptionalField(writer, "column", self.column);
+        try writeOptionalField(writer, "constraint", self.constraint);
+        try writeOptionalField(writer, "sql", self.sql);
+        try writer.writeAll(" }");
+    }
+
     pub fn fromZigError(err: anyerror, driver: DriverKind) DbError {
         return .{
             .category = categoryOf(err),
@@ -117,6 +160,18 @@ pub const DbError = struct {
     }
 };
 
+fn writeField(writer: *std.Io.Writer, name: []const u8, value: []const u8) std.Io.Writer.Error!void {
+    try writer.print(", {s}=\"{f}\"", .{ name, std.zig.fmtString(value) });
+}
+
+fn writeOptionalField(
+    writer: *std.Io.Writer,
+    name: []const u8,
+    value: ?[]const u8,
+) std.Io.Writer.Error!void {
+    if (value) |present| try writeField(writer, name, present);
+}
+
 /// Allocator-owned copy of `DbError` string fields for connection-level storage.
 ///
 /// Callers that need metadata after an operation returns should use
@@ -135,6 +190,21 @@ pub const OwnedDbError = struct {
     column: ?[]u8 = null,
     constraint: ?[]u8 = null,
     sql: ?[]u8 = null,
+
+    /// Default redacted formatter; equivalent to formatting `view()`.
+    pub fn format(self: *const OwnedDbError, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        return self.view().formatSafe(writer);
+    }
+
+    pub fn formatSafe(self: *const OwnedDbError, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        return self.view().formatSafe(writer);
+    }
+
+    /// Explicitly include all owned diagnostic fields. See
+    /// `DbError.formatSensitive` for the sensitivity contract.
+    pub fn formatSensitive(self: *const OwnedDbError, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        return self.view().formatSensitive(writer);
+    }
 
     pub fn deinit(self: *OwnedDbError, allocator: std.mem.Allocator) void {
         if (self.code) |v| allocator.free(v);
@@ -259,6 +329,65 @@ test "OwnedDbError duplicates postgres fields without secrets" {
     // Message and detail are preserved verbatim and may echo a bound/stored
     // value; zsql itself never copies the caller's bind array into metadata.
     try std.testing.expect(std.mem.indexOf(u8, view.message, "duplicate") != null);
+
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writer.print("{f}", .{&owned});
+    const text = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, text, "ada@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "insert into") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "users_email_key") != null);
+}
+
+test "DbError default and safe formatting omit sensitive diagnostics" {
+    const db_err: DbError = .{
+        .category = .constraint,
+        .driver = .postgres,
+        .code = "23505",
+        .message = "duplicate value super-secret",
+        .detail = "Key (email)=(ada@example.com) already exists.",
+        .hint = "retry with another secret",
+        .table = "users\nforged-log-line",
+        .constraint = "users_email_key",
+        .sql = "insert into users values ('super-secret')",
+    };
+
+    var default_buffer: [512]u8 = undefined;
+    var default_writer = std.Io.Writer.fixed(&default_buffer);
+    try default_writer.print("{f}", .{db_err});
+    const default_text = default_writer.buffered();
+
+    try std.testing.expectEqualStrings(
+        "DbError{ driver=postgres, category=constraint, code=\"23505\", table=\"users\\nforged-log-line\", constraint=\"users_email_key\" }",
+        default_text,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, default_text, "super-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, default_text, "ada@example.com") == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, default_text, '\n') == null);
+
+    var safe_buffer: [512]u8 = undefined;
+    var safe_writer = std.Io.Writer.fixed(&safe_buffer);
+    try db_err.formatSafe(&safe_writer);
+    try std.testing.expectEqualStrings(default_text, safe_writer.buffered());
+}
+
+test "DbError sensitive formatting is explicit and escaped" {
+    const db_err: DbError = .{
+        .category = .invalid_sql,
+        .driver = .sqlite,
+        .code = "1",
+        .message = "near secret\nsecond line",
+        .sql = "select 'secret'",
+    };
+
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try db_err.formatSensitive(&writer);
+    const text = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "near secret\\nsecond line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "select 'secret'") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, text, '\n') == null);
 }
 
 // Keep Error import used for documentation of the dual error surface.
