@@ -669,6 +669,10 @@ pub const Conn = struct {
         return 0;
     }
 
+    fn clearStmtCache(self: *Conn) void {
+        if (self.prepared_cache) |*cache| cache.clear();
+    }
+
     pub fn prepare(self: *Conn, sql: []const u8) !Stmt {
         if (self.closed) return error.ConnectionClosed;
         self.clearLastError();
@@ -722,7 +726,8 @@ pub const Conn = struct {
             }
             return err;
         };
-        defer prepared.release();
+        var prepared_open = true;
+        defer if (prepared_open) prepared.release();
         const result = prepared.stmt.exec(binds) catch |err| {
             self.captureLastError(err, sql);
             if (observe) {
@@ -735,6 +740,9 @@ pub const Conn = struct {
             }
             return err;
         };
+        prepared.release();
+        prepared_open = false;
+        if (isSchemaChangingSql(sql)) self.clearStmtCache();
         if (observe) {
             self.hooks.emitAfter(.{
                 .driver = .sqlite,
@@ -753,6 +761,8 @@ pub const Conn = struct {
             self.captureLastError(err, sql);
             return err;
         };
+        // Scripts may contain schema changes after arbitrary leading statements.
+        self.clearStmtCache();
     }
 
     pub fn query(self: *Conn, sql: []const u8, binds: []const core.Value) !Rows {
@@ -843,11 +853,16 @@ pub const Conn = struct {
             self.captureLastError(err, sql);
             return err;
         };
-        defer prepared.release();
-        return prepared.stmt.execNamed(binds) catch |err| {
+        var prepared_open = true;
+        defer if (prepared_open) prepared.release();
+        const result = prepared.stmt.execNamed(binds) catch |err| {
             self.captureLastError(err, sql);
             return err;
         };
+        prepared.release();
+        prepared_open = false;
+        if (isSchemaChangingSql(sql)) self.clearStmtCache();
+        return result;
     }
 
     pub fn queryNamed(self: *Conn, sql: []const u8, binds: []const NamedValue) !Rows {
@@ -1045,12 +1060,17 @@ const PreparedCache = struct {
     }
 
     fn deinit(self: *PreparedCache) void {
+        self.clear();
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn clear(self: *PreparedCache) void {
         for (self.entries.items) |*entry| {
             entry.stmt.close();
             self.allocator.free(entry.sql);
         }
-        self.entries.deinit(self.allocator);
-        self.* = undefined;
+        self.entries.clearRetainingCapacity();
     }
 
     fn len(self: *const PreparedCache) usize {
@@ -1112,6 +1132,35 @@ const PreparedCache = struct {
         });
     }
 };
+
+fn isSchemaChangingSql(sql: []const u8) bool {
+    const keyword = firstSqlKeyword(sql);
+    inline for (.{ "alter", "analyze", "attach", "create", "detach", "drop", "pragma", "reindex", "vacuum" }) |candidate| {
+        if (std.ascii.eqlIgnoreCase(keyword, candidate)) return true;
+    }
+    return false;
+}
+
+fn firstSqlKeyword(sql: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < sql.len) {
+        while (i < sql.len and std.ascii.isWhitespace(sql[i])) i += 1;
+        if (i + 1 < sql.len and sql[i] == '-' and sql[i + 1] == '-') {
+            i += 2;
+            while (i < sql.len and sql[i] != '\n') i += 1;
+            continue;
+        }
+        if (i + 1 < sql.len and sql[i] == '/' and sql[i + 1] == '*') {
+            const end = std.mem.indexOfPos(u8, sql, i + 2, "*/") orelse return "";
+            i = end + 2;
+            continue;
+        }
+        break;
+    }
+    const start = i;
+    while (i < sql.len and (std.ascii.isAlphabetic(sql[i]) or sql[i] == '_')) i += 1;
+    return sql[start..i];
+}
 
 pub fn freeInspectedSchema(allocator: std.mem.Allocator, schema: core.inspect.Schema) void {
     freeInspectedTables(allocator, @constCast(schema.tables));
@@ -2021,21 +2070,45 @@ test "SQLite prepared statement cache reuses handles" {
     try conn.enableStmtCache(4);
     _ = try conn.exec("create table cache_probe (id integer primary key, n integer)", &.{});
     _ = try conn.exec("insert into cache_probe (id, n) values (?, ?)", &.{ .{ .integer = 1 }, .{ .integer = 10 } });
-    try std.testing.expectEqual(@as(usize, 2), conn.stmtCacheLen());
+    // CREATE invalidates older entries while leaving caching enabled.
+    try std.testing.expectEqual(@as(usize, 1), conn.stmtCacheLen());
 
     var rows1 = try conn.query("select n from cache_probe where id = ?", &.{.{ .integer = 1 }});
     try std.testing.expectEqual(@as(i64, 10), try (try (try rows1.next()).?.value("n")).asInt());
     rows1.deinit();
-    try std.testing.expectEqual(@as(usize, 3), conn.stmtCacheLen());
+    try std.testing.expectEqual(@as(usize, 2), conn.stmtCacheLen());
 
     var rows2 = try conn.query("select n from cache_probe where id = ?", &.{.{ .integer = 1 }});
     try std.testing.expectEqual(@as(i64, 10), try (try (try rows2.next()).?.value("n")).asInt());
     rows2.deinit();
     // Same SQL should not grow the cache.
-    try std.testing.expectEqual(@as(usize, 3), conn.stmtCacheLen());
+    try std.testing.expectEqual(@as(usize, 2), conn.stmtCacheLen());
 
     conn.disableStmtCache();
     try std.testing.expectEqual(@as(usize, 0), conn.stmtCacheLen());
+}
+
+test "SQLite statement cache refreshes result metadata after schema change" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+    try conn.enableStmtCache(4);
+    _ = try conn.exec("create table cache_shape (id integer primary key)", &.{});
+    _ = try conn.exec("insert into cache_shape (id) values (1)", &.{});
+
+    const sql = "select * from cache_shape where id = ?";
+    var before = try conn.query(sql, &.{.{ .integer = 1 }});
+    try std.testing.expectEqual(@as(usize, 1), (try before.next()).?.len());
+    before.deinit();
+
+    _ = try conn.exec("alter table cache_shape add column name text", &.{});
+    _ = try conn.exec("update cache_shape set name = 'ada' where id = 1", &.{});
+    var after = try conn.query(sql, &.{.{ .integer = 1 }});
+    defer after.deinit();
+    const row = (try after.next()).?;
+    try std.testing.expectEqual(@as(usize, 2), row.len());
+    try std.testing.expectEqualStrings("ada", try (try row.getName("name")).asText());
 }
 
 test "SQLite inspectSchema exports tables and columns" {

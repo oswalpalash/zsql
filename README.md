@@ -229,6 +229,8 @@ try conn.disableStmtCache();
 ```
 
 SQLite (`-Denable-sqlite=true`) has the same `enableStmtCache` API, caching `sqlite3_stmt` handles.
+Schema-changing SQLite statements and scripts clear cached handles while keeping
+the configured cache enabled, preventing stale result-column metadata after DDL.
 
 Schema inspection (for offline checks):
 
