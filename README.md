@@ -134,6 +134,10 @@ try pg_pool.withTx({}, struct {
 
 Pool acquire timeout: `0` = non-blocking, `std.math.maxInt(u64)` = wait forever (condition), any other value = timed wait (event signal on release).
 
+Pools retain synchronized connections after recoverable SQL errors and discard
+closed, protocol-broken, or transaction-busy leases. A lease released with an
+open transaction is never returned to another borrower.
+
 TLS uses Zig's `std.crypto.tls.Client` (no OpenSSL). Behavior by `sslmode`:
 
 - `disable` / `allow`: plain connection

@@ -272,8 +272,11 @@ pub const Pool = struct {
     /// or discarded on failure.
     pub fn exec(self: *Pool, sql: []const u8, binds: []const core.Value) !core.ExecResult {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        const result = try (try lease.conn()).exec(sql, binds);
+        errdefer if (lease.open) lease.discard() catch {};
+        const result = (try lease.conn()).exec(sql, binds) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
         return result;
     }
@@ -281,8 +284,11 @@ pub const Pool = struct {
     /// Execute named SQLite binds under a short-lived lease.
     pub fn execNamed(self: *Pool, sql: []const u8, binds: []const NamedValue) !core.ExecResult {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        const result = try (try lease.conn()).execNamed(sql, binds);
+        errdefer if (lease.open) lease.discard() catch {};
+        const result = (try lease.conn()).execNamed(sql, binds) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
         return result;
     }
@@ -293,8 +299,11 @@ pub const Pool = struct {
     /// the lease) stay open. On query setup failure the lease is discarded.
     pub fn query(self: *Pool, sql: []const u8, binds: []const core.Value) !PooledRows {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        const rows = try (try lease.conn()).query(sql, binds);
+        errdefer if (lease.open) lease.discard() catch {};
+        const rows = (try lease.conn()).query(sql, binds) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         return .{
             .lease = lease,
             .rows = rows,
@@ -304,16 +313,22 @@ pub const Pool = struct {
     /// Run a named query while holding the lease until `PooledRows.deinit`.
     pub fn queryNamed(self: *Pool, sql: []const u8, binds: []const NamedValue) !PooledRows {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        const rows = try (try lease.conn()).queryNamed(sql, binds);
+        errdefer if (lease.open) lease.discard() catch {};
+        const rows = (try lease.conn()).queryNamed(sql, binds) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         return .{ .lease = lease, .rows = rows };
     }
 
     /// Acquire a short lease, fetch exactly one owned row, then release.
     pub fn queryOne(self: *Pool, sql: []const u8, binds: []const core.Value) !core.OwnedRow {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        const owned = try (try lease.conn()).queryOne(sql, binds);
+        errdefer if (lease.open) lease.discard() catch {};
+        const owned = (try lease.conn()).queryOne(sql, binds) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
         return owned;
     }
@@ -322,8 +337,11 @@ pub const Pool = struct {
     /// Free with `core.OwnedRow.freeSlice` / `zsql.freeOwnedRows`.
     pub fn queryAll(self: *Pool, sql: []const u8, binds: []const core.Value) ![]core.OwnedRow {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        const owned = try (try lease.conn()).queryAll(sql, binds);
+        errdefer if (lease.open) lease.discard() catch {};
+        const owned = (try lease.conn()).queryAll(sql, binds) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
         return owned;
     }
@@ -331,24 +349,33 @@ pub const Pool = struct {
     /// Liveness check under a short-lived lease.
     pub fn ping(self: *Pool) !void {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        try (try lease.conn()).ping();
+        errdefer if (lease.open) lease.discard() catch {};
+        (try lease.conn()).ping() catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
     }
 
     /// Acquire a lease, run `body` in a transaction, then release the lease.
     pub fn withTx(self: *Pool, ctx: anytype, comptime body: *const fn (@TypeOf(ctx), *Tx) anyerror!void) !void {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        try (try lease.conn()).withTx(ctx, body);
+        errdefer if (lease.open) lease.discard() catch {};
+        (try lease.conn()).withTx(ctx, body) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
     }
 
     /// Same as `withTx` but uses `BEGIN IMMEDIATE` on the leased connection.
     pub fn withTxImmediate(self: *Pool, ctx: anytype, comptime body: *const fn (@TypeOf(ctx), *Tx) anyerror!void) !void {
         var lease = try self.acquire();
-        errdefer lease.discard() catch {};
-        try (try lease.conn()).withTxImmediate(ctx, body);
+        errdefer if (lease.open) lease.discard() catch {};
+        (try lease.conn()).withTxImmediate(ctx, body) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
         try lease.release();
     }
 
@@ -396,6 +423,15 @@ pub const Lease = struct {
             return error.PoolClosed;
         }
 
+        if (!self.conn_value.isReusable()) {
+            self.conn_value.close();
+            self.db.deinit();
+            self.pool.open_count -|= 1;
+            self.open = false;
+            self.pool.notifyAvailable();
+            return;
+        }
+
         if (self.pool.idle.items.len < self.pool.effectiveMaxIdle()) {
             try self.pool.idle.append(self.pool.allocator, self.db);
             self.conn_value.close();
@@ -406,6 +442,14 @@ pub const Lease = struct {
         }
         self.open = false;
         self.pool.notifyAvailable();
+    }
+
+    fn finishAfterError(self: *Lease, err: anyerror) void {
+        if (isFatalPoolConnectionError(err) or !self.conn_value.isReusable()) {
+            self.discard() catch {};
+        } else {
+            self.release() catch self.discard() catch {};
+        }
     }
 
     pub fn discard(self: *Lease) !void {
@@ -428,21 +472,34 @@ pub const PooledRows = struct {
     lease: Lease,
     rows: Rows,
     closed: bool = false,
+    poisoned: bool = false,
 
     pub fn next(self: *PooledRows) !?core.Row {
         if (self.closed) return error.LeaseClosed;
-        return self.rows.next();
+        return self.rows.next() catch |err| {
+            self.poisoned = isFatalPoolConnectionError(err);
+            return err;
+        };
     }
 
     pub fn deinit(self: *PooledRows) void {
         if (self.closed) return;
         self.rows.deinit();
-        self.lease.release() catch {
+        if (self.poisoned) {
             self.lease.discard() catch {};
-        };
+        } else {
+            self.lease.release() catch self.lease.discard() catch {};
+        }
         self.closed = true;
     }
 };
+
+fn isFatalPoolConnectionError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionClosed, error.DriverError => true,
+        else => false,
+    };
+}
 
 pub const Database = struct {
     allocator: std.mem.Allocator,
@@ -509,6 +566,7 @@ pub const Conn = struct {
     allocator: std.mem.Allocator,
     handle: *c.sqlite3,
     closed: bool = false,
+    transaction_open: bool = false,
     /// Optional prepared-statement handle cache for this connection.
     prepared_cache: ?PreparedCache = null,
     /// Connection-local observability hooks (no global registry).
@@ -517,6 +575,11 @@ pub const Conn = struct {
     pub fn close(self: *Conn) void {
         self.disableStmtCache();
         self.closed = true;
+    }
+
+    /// True when this connection is safe to return to an idle pool.
+    pub fn isReusable(self: *const Conn) bool {
+        return !self.closed and !self.transaction_open;
     }
 
     /// Create a borrowed cross-task interrupt handle.
@@ -710,7 +773,9 @@ pub const Conn = struct {
 
     pub fn begin(self: *Conn) !Tx {
         if (self.closed) return error.ConnectionClosed;
+        if (self.transaction_open) return error.ConnectionBusy;
         _ = try self.exec("begin", &.{});
+        self.transaction_open = true;
         return .{
             .conn = self,
         };
@@ -718,7 +783,9 @@ pub const Conn = struct {
 
     pub fn beginImmediate(self: *Conn) !Tx {
         if (self.closed) return error.ConnectionClosed;
+        if (self.transaction_open) return error.ConnectionBusy;
         _ = try self.exec("begin immediate", &.{});
+        self.transaction_open = true;
         return .{
             .conn = self,
         };
@@ -1100,17 +1167,21 @@ pub const Tx = struct {
         if (!self.open) return error.TransactionClosed;
         _ = try self.conn.exec("commit", &.{});
         self.open = false;
+        self.conn.transaction_open = false;
     }
 
     pub fn rollback(self: *Tx) !void {
         if (!self.open) return error.TransactionClosed;
         _ = try self.conn.exec("rollback", &.{});
         self.open = false;
+        self.conn.transaction_open = false;
     }
 
     pub fn rollbackIfOpen(self: *Tx) void {
         if (!self.open) return;
-        _ = self.conn.exec("rollback", &.{}) catch {};
+        if (self.conn.exec("rollback", &.{})) |_| {
+            self.conn.transaction_open = false;
+        } else |_| {}
         self.open = false;
     }
 
@@ -2449,6 +2520,81 @@ test "SQLite pool queryOne returns single owned row" {
     defer owned.deinit();
     try std.testing.expectEqualStrings("ada", try (try owned.getName("name")).asText());
     try std.testing.expectError(error.NoRows, pool.queryOne("select id from pool_one where id = ?", &.{.{ .integer = 99 }}));
+    try pool.ping();
+}
+
+test "SQLite pool retains healthy connections after recoverable SQL errors" {
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
+    defer pool.deinit();
+
+    _ = try pool.exec("create table pool_reuse (id integer primary key)", &.{});
+    try std.testing.expectError(error.InvalidSql, pool.exec("select from", &.{}));
+    try std.testing.expectError(error.NoRows, pool.queryOne("select id from pool_reuse", &.{}));
+
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().open);
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+    _ = try pool.exec("insert into pool_reuse (id) values (1)", &.{});
+}
+
+test "SQLite pool releases a rolled-back application error connection" {
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
+    defer pool.deinit();
+    _ = try pool.exec("create table pool_tx_error (id integer primary key)", &.{});
+
+    try std.testing.expectError(error.TestAbort, pool.withTx({}, struct {
+        fn run(_: void, tx: *Tx) !void {
+            _ = try tx.exec("insert into pool_tx_error (id) values (1)", &.{});
+            return error.TestAbort;
+        }
+    }.run));
+
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+    try std.testing.expectError(error.NoRows, pool.queryOne("select id from pool_tx_error", &.{}));
+}
+
+test "SQLite pool release discards closed and transaction-busy connections" {
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
+    defer pool.deinit();
+
+    var closed_lease = try pool.acquire();
+    (try closed_lease.conn()).close();
+    try closed_lease.release();
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
+
+    var tx_lease = try pool.acquire();
+    _ = try (try tx_lease.conn()).begin();
+    try tx_lease.release();
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
+
+    var replacement = try pool.acquire();
+    try replacement.release();
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+}
+
+fn advancePooledRowsForInterrupt(rows: *PooledRows) anyerror!?core.Row {
+    return rows.next();
+}
+
+test "SQLite pooled rows return interrupted healthy connections to idle" {
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
+    defer pool.deinit();
+
+    var rows = try pool.query(
+        \\with recursive counter(n) as (
+        \\  values(0)
+        \\  union all select n + 1 from counter where n < 1000000000
+        \\)
+        \\select sum(n) from counter
+    , &.{});
+    const interrupt = try (try rows.lease.conn()).interruptHandle();
+    var query = std.testing.io.async(advancePooledRowsForInterrupt, .{&rows});
+    defer _ = query.cancel(std.testing.io) catch {};
+    try std.testing.io.sleep(.{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake);
+    interrupt.request();
+    try std.testing.expectError(error.QueryTimeout, query.await(std.testing.io));
+    rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
     try pool.ping();
 }
 

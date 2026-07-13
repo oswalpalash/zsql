@@ -14,7 +14,7 @@ coverage; PostgreSQL rows marked live also run against PostgreSQL 16 in CI.
 | Safe parameter binding | Complete | positional and named bind APIs on both drivers | driver tests; `tests/postgres_live.zig` |
 | Typed row decoding | Complete | `Row.as`, `Row.asName`, `Row.to`, `zsql.decode` | core and driver tests |
 | Explicit owned rows | Complete | `OwnedRow`, `Row.getOwned`, `zsql.freeOwnedRows` | allocator-backed core and driver tests |
-| Connection pooling | Complete | `Pool(D)`, `Lease(D)`, pool stats and timeouts | pool unit tests; PostgreSQL live tests |
+| Connection pooling | Complete | `Pool(D)`, `Lease(D)`, health-aware release, stats and timeouts | SQLite recovery tests; PostgreSQL live tests |
 | Transactions and savepoints | Complete | `Tx(D)`, `Savepoint(D)`, `withTx` | SQLite tests and PostgreSQL live tests |
 | Migrations | Complete | `Migrator(D).up`, `.status`; CLI `migrate` commands | migration unit tests and SQLite example |
 | Schema inspection | Complete | driver `inspectSchema`; CLI `inspect` | inspector tests and PostgreSQL live tests |
