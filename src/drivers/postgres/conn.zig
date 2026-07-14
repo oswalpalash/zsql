@@ -1425,7 +1425,7 @@ pub const Conn = struct {
                     for (column_names.items) |name| self.allocator.free(name);
                     column_names.clearRetainingCapacity();
                     for (columns) |field| {
-                        try column_names.append(self.allocator, try self.allocator.dupe(u8, field.name));
+                        try appendColumnName(self.allocator, &column_names, field.name);
                     }
                 },
                 .no_data => {},
@@ -1446,18 +1446,11 @@ pub const Conn = struct {
                         self.broken = true;
                         return error.ProtocolError;
                     };
-                    const names = try column_names.toOwnedSlice(self.allocator);
-                    column_names = .empty;
                     if (columns.len != 0) {
                         self.allocator.free(columns);
                         columns = &.{};
                     }
-                    return .{
-                        .allocator = self.allocator,
-                        .column_names = names,
-                        .rows = try rows.toOwnedSlice(self.allocator),
-                        .rows_affected = rows_affected,
-                    };
+                    return finishSimpleRows(self.allocator, &column_names, &rows, rows_affected);
                 },
                 .error_response => return self.failFromErrorResponse(msg.body, false, sql),
                 .parameter_status, .notice_response, .notification_response => {},
@@ -1547,7 +1540,7 @@ pub const Conn = struct {
                     for (column_names.items) |name| self.allocator.free(name);
                     column_names.clearRetainingCapacity();
                     for (columns) |field| {
-                        try column_names.append(self.allocator, try self.allocator.dupe(u8, field.name));
+                        try appendColumnName(self.allocator, &column_names, field.name);
                     }
                 },
                 .data_row => {
@@ -1577,19 +1570,12 @@ pub const Conn = struct {
                         self.broken = true;
                         return error.ProtocolError;
                     };
-                    const names = try column_names.toOwnedSlice(self.allocator);
-                    column_names = .empty;
                     // Free protocol field metadata; names are owned separately.
                     if (columns.len != 0) {
                         self.allocator.free(columns);
                         columns = &.{};
                     }
-                    return .{
-                        .allocator = self.allocator,
-                        .column_names = names,
-                        .rows = try rows.toOwnedSlice(self.allocator),
-                        .rows_affected = rows_affected,
-                    };
+                    return finishSimpleRows(self.allocator, &column_names, &rows, rows_affected);
                 },
                 .error_response => return self.failFromErrorResponse(msg.body, false, sql),
                 .parameter_status, .notice_response, .notification_response => {},
@@ -2173,6 +2159,93 @@ const OwnedSimpleRow = struct {
         self.* = undefined;
     }
 };
+
+fn appendColumnName(
+    allocator: std.mem.Allocator,
+    column_names: *std.ArrayListUnmanaged([]const u8),
+    name: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned);
+    try column_names.append(allocator, owned);
+}
+
+fn finishSimpleRows(
+    allocator: std.mem.Allocator,
+    column_names: *std.ArrayListUnmanaged([]const u8),
+    rows: *std.ArrayListUnmanaged(OwnedSimpleRow),
+    rows_affected: u64,
+) !SimpleRows {
+    const names = try column_names.toOwnedSlice(allocator);
+    errdefer {
+        for (names) |name| allocator.free(name);
+        allocator.free(names);
+    }
+    const owned_rows = try rows.toOwnedSlice(allocator);
+    return .{
+        .allocator = allocator,
+        .column_names = names,
+        .rows = owned_rows,
+        .rows_affected = rows_affected,
+    };
+}
+
+fn exerciseColumnNameAppendAllocationFailures(allocator: std.mem.Allocator) !void {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+    try appendColumnName(allocator, &names, "account_identifier");
+    try std.testing.expectEqualStrings("account_identifier", names.items[0]);
+}
+
+fn appendTestOwnedSimpleRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayListUnmanaged(OwnedSimpleRow),
+) !void {
+    const values = try allocator.alloc(core.OwnedValue, 1);
+    errdefer allocator.free(values);
+    values[0] = .{ .integer = 42 };
+    try rows.append(allocator, .{ .values = values });
+}
+
+test "PostgreSQL row result ownership transfer is failure atomic" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseColumnNameAppendAllocationFailures,
+        .{},
+    );
+
+    var column_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (column_names.items) |name| std.testing.allocator.free(name);
+        column_names.deinit(std.testing.allocator);
+    }
+    try appendColumnName(std.testing.allocator, &column_names, "answer");
+
+    var rows: std.ArrayListUnmanaged(OwnedSimpleRow) = .empty;
+    defer {
+        for (rows.items) |*row| row.deinit(std.testing.allocator);
+        rows.deinit(std.testing.allocator);
+    }
+    try appendTestOwnedSimpleRow(std.testing.allocator, &rows);
+
+    // Force both toOwnedSlice calls down their allocate-and-copy path. The
+    // first allocation transfers column-name ownership; the second fails while
+    // transferring rows and must release those already-transferred names.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 1,
+        .resize_fail_index = 0,
+    });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        finishSimpleRows(failing.allocator(), &column_names, &rows, 1),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), column_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+}
 
 fn decodeDataValues(
     allocator: std.mem.Allocator,

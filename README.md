@@ -562,6 +562,9 @@ separate query calls instead.
 Both simple and extended row collectors drain on any local parse, decode, or
 allocation error before `ReadyForQuery`. If synchronization itself fails, the
 connection is closed so a pool cannot reuse unread protocol state.
+After `ReadyForQuery`, column-name duplication and final column/row ownership
+transfers are failure-atomic, so an OOM preserves connection reuse without
+leaking any partially collected result storage.
 
 `zsql.types.Text`, `Blob`, `Numeric`, and canonical-text `Uuid` decode through
 the same borrowed row path. PostgreSQL `date`, `time`, `timestamp`, and
