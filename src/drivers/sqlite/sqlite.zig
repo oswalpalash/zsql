@@ -195,9 +195,10 @@ pub const Pool = struct {
                     // Return the handle to idle on connect failure after unlock
                     // is unsafe here; close it and drop open_count instead.
                     db.deinit();
-                    self.open_count -|= 1;
+                    self.dropOpenSlotLocked();
                 }
                 var conn = try db.connect();
+                errdefer conn.close();
                 try self.configureConn(&conn);
                 return .{
                     .pool = self,
@@ -207,13 +208,17 @@ pub const Pool = struct {
             }
 
             if (self.open_count < self.config.max_open) {
-                var opened = try Database.open(self.allocator, self.config.database);
                 self.open_count += 1;
+                var opened = Database.open(self.allocator, self.config.database) catch |err| {
+                    self.dropOpenSlotLocked();
+                    return err;
+                };
                 errdefer {
                     opened.deinit();
-                    self.open_count -|= 1;
+                    self.dropOpenSlotLocked();
                 }
                 var conn = try opened.connect();
+                errdefer conn.close();
                 try self.configureConn(&conn);
                 return .{
                     .pool = self,
@@ -264,6 +269,15 @@ pub const Pool = struct {
 
     fn notifyAvailable(self: *Pool) void {
         self.available.signal(self.io);
+    }
+
+    /// Release one reserved/open slot while holding `mutex` and wake another
+    /// waiter. Acquisition failures must signal just like lease release or an
+    /// infinite waiter can sleep after capacity becomes available.
+    fn dropOpenSlotLocked(self: *Pool) void {
+        std.debug.assert(self.open_count > 0);
+        self.open_count -= 1;
+        self.notifyAvailable();
     }
 
     /// Execute a statement under a short-lived lease that is released on success
@@ -3611,6 +3625,71 @@ test "SQLite pool infinite wait unblocks via condition signal" {
     try holder.release();
     thread.join();
     try std.testing.expect(ctx.ok.load(.acquire));
+}
+
+test "SQLite pool acquisition failure wakes the next infinite waiter" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var pool = try Pool.init(failing.allocator(), std.testing.io, .{
+        .max_open = 1,
+        .acquire_timeout_ns = std.math.maxInt(u64),
+    });
+    defer pool.deinit();
+
+    // Model one in-flight reservation so both workers enter the infinite wait.
+    pool.open_count = 1;
+    const Result = enum { pending, out_of_memory, other, unexpected_success };
+    const Ctx = struct {
+        pool: *Pool,
+        ready: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        result: Result = .pending,
+
+        fn worker(self: *@This()) void {
+            self.ready.store(true, .release);
+            var lease = self.pool.acquire() catch |err| {
+                self.result = if (err == error.OutOfMemory) .out_of_memory else .other;
+                self.done.store(true, .release);
+                return;
+            };
+            lease.discard() catch {};
+            self.result = .unexpected_success;
+            self.done.store(true, .release);
+        }
+    };
+
+    var first = Ctx{ .pool = &pool };
+    var second = Ctx{ .pool = &pool };
+    const first_thread = try std.Thread.spawn(.{}, Ctx.worker, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, Ctx.worker, .{&second});
+    while (!first.ready.load(.acquire) or !second.ready.load(.acquire)) {
+        try std.testing.io.sleep(.{ .nanoseconds = std.time.ns_per_ms }, .awake);
+    }
+    try std.testing.io.sleep(.{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake);
+
+    pool.mutex.lockUncancelable(pool.io);
+    pool.dropOpenSlotLocked();
+    pool.mutex.unlock(pool.io);
+    try std.testing.io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake);
+    const completed_without_rescue = first.done.load(.acquire) and second.done.load(.acquire);
+
+    // Keep a broken implementation from hanging the suite: rescue any waiter,
+    // then fail the assertion below because it needed this broadcast.
+    var rescue_attempts: usize = 0;
+    while ((!first.done.load(.acquire) or !second.done.load(.acquire)) and rescue_attempts < 20) : (rescue_attempts += 1) {
+        pool.mutex.lockUncancelable(pool.io);
+        pool.available.broadcast(pool.io);
+        pool.mutex.unlock(pool.io);
+        try std.testing.io.sleep(.{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake);
+    }
+    first_thread.join();
+    second_thread.join();
+
+    try std.testing.expect(completed_without_rescue);
+    try std.testing.expect(first.result == .out_of_memory);
+    try std.testing.expect(second.result == .out_of_memory);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
 }
 
 test "SQLite pool query holds lease until rows deinit" {
