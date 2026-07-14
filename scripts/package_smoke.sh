@@ -40,4 +40,7 @@ portable_prefix="$tmp/package-linux-aarch64-musl-sqlite"
     "$zig_exe" build -Dtarget=aarch64-linux-musl -Denable-sqlite=true -p "$portable_prefix"
     test -x "$portable_prefix/bin/zsql"
     test -f "$portable_prefix/lib/libzsql.a"
+    provenance="$portable_prefix/share/zsql/build.zon"
+    test -f "$provenance"
+    grep -q '^[[:space:]]*\.sqlite = "bundled",[[:space:]]*$' "$provenance"
 )

@@ -27,7 +27,10 @@ test "$status" -eq 0
 
 test -x "$root/out-a/bin/zsql"
 test -f "$root/out-a/lib/libzsql.a"
+test -f "$root/out-a/share/zsql/build.zon"
 test -x "$root/out-b/bin/zsql"
 test -f "$root/out-b/lib/libzsql.a"
+test -f "$root/out-b/share/zsql/build.zon"
 cmp "$root/out-a/bin/zsql" "$root/out-b/bin/zsql"
 cmp "$root/out-a/lib/libzsql.a" "$root/out-b/lib/libzsql.a"
+cmp "$root/out-a/share/zsql/build.zon" "$root/out-b/share/zsql/build.zon"

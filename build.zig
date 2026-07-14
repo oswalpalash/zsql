@@ -1,4 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const package_version = "0.0.2";
 
 /// Compile flags for the bundled SQLite amalgamation.
 /// Keep conservative: threadsafe, URI filenames, no loadable extensions.
@@ -29,7 +32,41 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "enable_sqlite", enable_sqlite);
     options.addOption(bool, "sqlite_amalgamation", use_amalgamation);
     // Keep in sync with build.zig.zon version for `zsql doctor`.
-    options.addOption([]const u8, "package_version", "0.0.2");
+    options.addOption([]const u8, "package_version", package_version);
+
+    const target_triple = target.result.zigTriple(b.allocator) catch @panic("OOM");
+    const sqlite_mode = if (!enable_sqlite)
+        "disabled"
+    else if (sqlite_system)
+        "system"
+    else
+        "bundled";
+    const provenance_files = b.addWriteFiles();
+    const provenance_file = provenance_files.add("build.zon", b.fmt(
+        \\.{{
+        \\    .format_version = 1,
+        \\    .package = .{{
+        \\        .name = "zsql",
+        \\        .version = "{s}",
+        \\    }},
+        \\    .build = .{{
+        \\        .zig_version = "{s}",
+        \\        .target = "{s}",
+        \\        .optimize = "{s}",
+        \\        .strip = {},
+        \\        .sqlite = "{s}",
+        \\    }},
+        \\}}
+        \\
+    , .{
+        package_version,
+        builtin.zig_version_string,
+        target_triple,
+        @tagName(optimize),
+        strip,
+        sqlite_mode,
+    }));
+    b.getInstallStep().dependOn(&b.addInstallFile(provenance_file, "share/zsql/build.zon").step);
 
     // Build the amalgamation static library once when requested. Lazy so
     // default (non-sqlite) builds never fetch the SQLite tarball.

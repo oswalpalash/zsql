@@ -49,15 +49,17 @@ façade and driver lifecycle declarations before exercising runtime behavior.
 
 `zig build install-smoke` also installs the static library and CLI into a fresh
 temporary prefix and runs the installed `zsql doctor`, ensuring distribution
-artifacts do not depend on repository-relative files.
+artifacts do not depend on repository-relative files. Every install also writes
+`share/zsql/build.zon` with its package version, Zig version, target,
+optimization, strip policy, and SQLite linkage mode.
 `zig build portability-smoke` cross-builds the installed library and CLI for
 `x86_64-windows` and static `aarch64-linux-musl` in isolated prefixes, both
 with the libc-free default configuration and with bundled SQLite enabled.
 `zig build reproducibility-smoke` performs two stripped `ReleaseSafe` native
 installs with separate local caches and prefixes, then requires byte-identical
-CLI and static-library outputs. zsql canonicalizes the installed archive member
-name because Zig 0.16 otherwise embeds its full cache path. Use `-Dstrip=true`
-for the same install mode.
+CLI, static-library, and build-provenance outputs. zsql canonicalizes the
+installed archive member name because Zig 0.16 otherwise embeds its full cache
+path. Use `-Dstrip=true` for the same install mode.
 `zig build version-sync` makes `build.zig.zon` authoritative for release
 metadata and fails if the library/CLI build option drifts; `install-smoke` also
 compares the installed doctor's reported version to that manifest value.
