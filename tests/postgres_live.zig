@@ -819,6 +819,67 @@ test "postgres live: failed migration persists dirty state after rollback" {
     try conn.ping();
 }
 
+test "postgres live: migration surfaces dirty marker persistence failure" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, std.testing.io, config);
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists zsql_migrations");
+    _ = try conn.exec("drop function if exists zsql_reject_second_dirty()");
+    _ = try conn.exec("drop sequence if exists zsql_dirty_attempt_seq");
+    defer _ = conn.exec("drop sequence if exists zsql_dirty_attempt_seq") catch {};
+    defer _ = conn.exec("drop function if exists zsql_reject_second_dirty()") catch {};
+    defer _ = conn.exec("drop table if exists zsql_migrations") catch {};
+
+    const migrator = pg.Migrator.init(&conn);
+    try migrator.ensureTable();
+    _ = try conn.exec("create sequence zsql_dirty_attempt_seq");
+    _ = try conn.exec(
+        \\create function zsql_reject_second_dirty() returns trigger
+        \\language plpgsql as $$
+        \\begin
+        \\  if nextval('zsql_dirty_attempt_seq') > 1 then
+        \\    raise exception 'blocked dirty persistence';
+        \\  end if;
+        \\  return new;
+        \\end
+        \\$$
+    );
+    _ = try conn.exec(
+        \\create trigger zsql_reject_second_dirty
+        \\before insert or update on zsql_migrations
+        \\for each row execute function zsql_reject_second_dirty()
+    );
+
+    // Sequence advancement is not rolled back: the in-transaction marker is
+    // attempt one, while the post-rollback durable marker is rejected on two.
+    const bad_sql = "select * from zsql_missing_migration_relation";
+    const migrations = [_]zsql.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "untracked_failure",
+            .filename = "V0001__untracked_failure.sql",
+        },
+        .sql = bad_sql,
+        .checksum = zsql.migrate.checksumSql(bad_sql),
+    }};
+    try std.testing.expectError(error.DriverError, migrator.apply(&migrations));
+    const db_err = conn.lastError() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("P0001", db_err.code.?);
+
+    var status = try migrator.status(allocator);
+    defer status.deinit();
+    try std.testing.expectEqual(@as(usize, 0), status.records.len);
+    try conn.ping();
+}
+
 test "postgres live: copy in and out bytes" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

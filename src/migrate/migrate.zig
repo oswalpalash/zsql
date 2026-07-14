@@ -35,6 +35,22 @@ pub const MigrationList = struct {
     }
 };
 
+/// Persist a dirty marker after a failed transactional migration.
+///
+/// The original migration error remains authoritative only after persistence
+/// succeeds. If the marker cannot be recorded, return that error instead so a
+/// caller never mistakes an untracked/uncertain failure for a durably guarded
+/// dirty migration.
+pub fn dirtyFailure(
+    context: anytype,
+    migration: MigrationFile,
+    original: anyerror,
+    comptime persist: fn (@TypeOf(context), MigrationFile) anyerror!void,
+) anyerror {
+    persist(context, migration) catch |err| return err;
+    return original;
+}
+
 pub fn parseFilename(path_or_filename: []const u8) !MigrationId {
     const filename = std.fs.path.basename(path_or_filename);
     if (!std.mem.startsWith(u8, filename, "V")) return error.InvalidMigrationFilename;
@@ -128,6 +144,40 @@ fn isValidName(name: []const u8) bool {
 fn migrationFileLessThan(_: void, lhs: MigrationFile, rhs: MigrationFile) bool {
     if (lhs.id.version != rhs.id.version) return lhs.id.version < rhs.id.version;
     return std.mem.lessThan(u8, lhs.id.filename, rhs.id.filename);
+}
+
+test "dirty failure preserves original only after marker persistence" {
+    const Recorder = struct {
+        called: bool = false,
+        failure: ?anyerror = null,
+
+        fn persist(self: *@This(), _: MigrationFile) !void {
+            self.called = true;
+            if (self.failure) |err| return err;
+        }
+    };
+    const migration: MigrationFile = .{
+        .id = .{ .version = 1, .name = "broken", .filename = "V0001__broken.sql" },
+        .checksum = undefined,
+    };
+
+    var recorded: Recorder = .{};
+    try std.testing.expect(dirtyFailure(
+        &recorded,
+        migration,
+        error.InvalidSql,
+        Recorder.persist,
+    ) == error.InvalidSql);
+    try std.testing.expect(recorded.called);
+
+    var failed: Recorder = .{ .failure = error.OutOfMemory };
+    try std.testing.expect(dirtyFailure(
+        &failed,
+        migration,
+        error.InvalidSql,
+        Recorder.persist,
+    ) == error.OutOfMemory);
+    try std.testing.expect(failed.called);
 }
 
 test "migration filename parser accepts versioned sql filenames" {

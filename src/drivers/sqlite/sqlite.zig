@@ -1366,17 +1366,33 @@ pub fn applyMigrations(conn: *Conn, migrations: []const core.migrate.MigrationFi
     var status = try migrationStatus(conn.allocator, conn);
     defer status.deinit();
 
-    var tx = try conn.beginImmediate();
     var active_migration: ?core.migrate.MigrationFile = null;
-    errdefer {
-        tx.rollbackIfOpen();
-        if (active_migration) |migration| persistDirtyMigration(conn, migration) catch {};
-    }
+    return applyMigrationsTransaction(conn, migrations, status.records, &active_migration) catch |apply_err| {
+        if (active_migration) |migration| {
+            return core.migrate.dirtyFailure(
+                conn,
+                migration,
+                apply_err,
+                persistDirtyMigration,
+            );
+        }
+        return apply_err;
+    };
+}
+
+fn applyMigrationsTransaction(
+    conn: *Conn,
+    migrations: []const core.migrate.MigrationFile,
+    records: []const MigrationRecord,
+    active_migration: *?core.migrate.MigrationFile,
+) !ApplyResult {
+    var tx = try conn.beginImmediate();
+    errdefer tx.rollbackIfOpen();
 
     var applied: usize = 0;
     for (migrations) |migration| {
-        if (findMigrationRecord(status.records, migration.id.version) != null) continue;
-        active_migration = migration;
+        if (findMigrationRecord(records, migration.id.version) != null) continue;
+        active_migration.* = migration;
         if (std.mem.trim(u8, migration.sql, " \t\r\n").len == 0) return error.InvalidSql;
 
         _ = try tx.exec(
@@ -1400,7 +1416,7 @@ pub fn applyMigrations(conn: *Conn, migrations: []const core.migrate.MigrationFi
             .{ .integer = elapsed_ms },
             .{ .integer = try sqliteVersion(migration.id.version) },
         });
-        active_migration = null;
+        active_migration.* = null;
         applied += 1;
     }
 
@@ -4194,6 +4210,36 @@ test "SQLite migration apply persists dirty marker after rollback" {
     try std.testing.expectEqual(@as(usize, 1), (try migrator.apply(&fixed)).applied);
     try std.testing.expectError(error.MigrationNotDirty, migrator.repairDirty(1, fixed_checksum));
     try conn.ping();
+}
+
+test "SQLite migration apply surfaces dirty marker persistence failure" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+    defer _ = conn.exec("pragma query_only = off", &.{}) catch {};
+
+    // query_only is connection-local and survives transaction rollback. The
+    // missing relation supplies the original InvalidSql; the follow-up dirty
+    // marker write then fails with DriverError and must take precedence.
+    const bad_sql = "pragma query_only = on; select * from missing_migration_table;";
+    const migrations = [_]core.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "untracked_failure",
+            .filename = "V0001__untracked_failure.sql",
+        },
+        .sql = bad_sql,
+        .checksum = core.migrate.checksumSql(bad_sql),
+    }};
+
+    try std.testing.expectError(error.DriverError, applyMigrations(&conn, &migrations));
+    _ = try conn.exec("pragma query_only = off", &.{});
+
+    var status = try migrationStatus(std.testing.allocator, &conn);
+    defer status.deinit();
+    try std.testing.expectEqual(@as(usize, 0), status.records.len);
 }
 
 test "SQLite migration apply refuses existing dirty migration state" {

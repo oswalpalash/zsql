@@ -718,6 +718,9 @@ fails, schema changes roll back and zsql persists that version/checksum as
 `dirty` after rollback. Later applies return `error.MigrationDirty` until an
 operator inspects and repairs or removes the failed record; zsql does not hide
 or automatically retry an uncertain migration.
+If the post-rollback marker write itself fails, that persistence error takes
+precedence over the original SQL error: zsql never reports the original failure
+as durably guarded when it could not record the guard.
 
 `Migrator(D).repairDirty(version, expected_checksum)` is the guarded repair
 primitive. It locks migration history, requires an existing dirty row and exact

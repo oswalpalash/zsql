@@ -154,17 +154,33 @@ pub const Migrator = struct {
         var st = try self.status(self.conn.allocator);
         defer st.deinit();
 
-        try self.conn.begin();
         var active_migration: ?core.migrate.MigrationFile = null;
-        errdefer {
-            self.conn.rollbackIfOpen();
-            if (active_migration) |migration| self.persistDirty(migration) catch {};
-        }
+        return self.applyTransaction(migrations, st.records, &active_migration) catch |apply_err| {
+            if (active_migration) |migration| {
+                return core.migrate.dirtyFailure(
+                    self,
+                    migration,
+                    apply_err,
+                    Migrator.persistDirty,
+                );
+            }
+            return apply_err;
+        };
+    }
+
+    fn applyTransaction(
+        self: Migrator,
+        migrations: []const core.migrate.MigrationFile,
+        records: []const MigrationRecord,
+        active_migration: *?core.migrate.MigrationFile,
+    ) !ApplyResult {
+        try self.conn.begin();
+        errdefer self.conn.rollbackIfOpen();
 
         var applied: usize = 0;
         for (migrations) |migration| {
-            if (findRecord(st.records, migration.id.version) != null) continue;
-            active_migration = migration;
+            if (findRecord(records, migration.id.version) != null) continue;
+            active_migration.* = migration;
             if (std.mem.trim(u8, migration.sql, " \t\r\n").len == 0) return error.InvalidSql;
 
             // Mark dirty before executing migration SQL.
@@ -194,7 +210,7 @@ pub const Migrator = struct {
                     .{ .integer = try toI64(migration.id.version) },
                 },
             );
-            active_migration = null;
+            active_migration.* = null;
             applied += 1;
         }
 
