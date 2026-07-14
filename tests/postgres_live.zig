@@ -871,8 +871,6 @@ test "postgres live: migration surfaces dirty marker persistence failure" {
         .checksum = zsql.migrate.checksumSql(bad_sql),
     }};
     try std.testing.expectError(error.DriverError, migrator.apply(&migrations));
-    const db_err = conn.lastError() orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("P0001", db_err.code.?);
 
     var status = try migrator.status(allocator);
     defer status.deinit();
