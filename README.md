@@ -55,7 +55,9 @@ optimization, strip policy, SQLite linkage mode, and optional source revision.
 Release builders can pass a validated 40- or 64-digit lowercase hexadecimal
 revision with `-Dsource-revision=<revision>`; ordinary builds record `null` and
 never require Git metadata. `zig build provenance-validation` checks accepted
-and rejected revision forms without compiling artifacts.
+and rejected revision forms without compiling artifacts. The CLI reports the
+recorded value—or `unrecorded`—through `zsql doctor`; this is a CLI-private build
+option and does not add a public library symbol.
 `zig build portability-smoke` cross-builds the installed library and CLI for
 `x86_64-windows` and static `aarch64-linux-musl` in isolated prefixes, both
 with the libc-free default configuration and with bundled SQLite enabled.

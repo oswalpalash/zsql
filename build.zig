@@ -142,6 +142,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
     });
+    const cli_options = b.addOptions();
+    cli_options.addOption([]const u8, "source_revision", source_revision orelse "unrecorded");
+    cli_mod.addOptions("zsql_cli_options", cli_options);
     cli_mod.addImport("zsql", zsql_mod);
     if (enable_sqlite) {
         // Amalgamation symbols come via the zsql module; system builds still

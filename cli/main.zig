@@ -1,5 +1,6 @@
 const std = @import("std");
 const zsql = @import("zsql");
+const cli_options = @import("zsql_cli_options");
 const builtin = @import("builtin");
 
 pub fn main(init: std.process.Init) !void {
@@ -202,6 +203,9 @@ fn cmdDoctor(io: std.Io) !void {
     try writeOut(io, .stdout, "  package: zsql\n");
     try writeOut(io, .stdout, "  version: ");
     try writeOut(io, .stdout, zsql.version);
+    try writeOut(io, .stdout, "\n");
+    try writeOut(io, .stdout, "  source revision: ");
+    try writeOut(io, .stdout, cli_options.source_revision);
     try writeOut(io, .stdout, "\n");
     try writeOut(io, .stdout, "  sqlite driver: ");
     if (zsql.enable_sqlite) {

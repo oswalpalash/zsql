@@ -38,3 +38,6 @@ cmp "$root/out-a/lib/libzsql.a" "$root/out-b/lib/libzsql.a"
 cmp "$root/out-a/share/zsql/build.zon" "$root/out-b/share/zsql/build.zon"
 grep -q "^[[:space:]]*\\.source_revision = \"$source_revision\",[[:space:]]*$" \
     "$root/out-a/share/zsql/build.zon"
+doctor_output=$("$root/out-a/bin/zsql" doctor)
+actual_revision=$(printf '%s\n' "$doctor_output" | sed -n 's/^  source revision: //p')
+test "$actual_revision" = "$source_revision"

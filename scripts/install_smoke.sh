@@ -20,8 +20,10 @@ grep -q '^[[:space:]]*\.strip = false,[[:space:]]*$' "$provenance"
 grep -q '^[[:space:]]*\.source_revision = null,[[:space:]]*$' "$provenance"
 doctor_output=$("$prefix/bin/zsql" doctor)
 actual_version=$(printf '%s\n' "$doctor_output" | sed -n 's/^  version: //p')
+actual_revision=$(printf '%s\n' "$doctor_output" | sed -n 's/^  source revision: //p')
 if [ "$actual_version" != "$expected_version" ]; then
     echo "installed CLI version mismatch: manifest=$expected_version doctor=$actual_version" >&2
     exit 1
 fi
+test "$actual_revision" = "unrecorded"
 printf '%s\n' "$doctor_output"
