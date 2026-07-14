@@ -93,6 +93,7 @@ pub const Migrator = struct {
 };
 
 pub const PoolConfig = struct {
+    /// `Pool.init` clones `database.path`; the caller retains its source path.
     database: Config = .{},
     max_open: usize = 4,
     max_idle: usize = 4,
@@ -127,7 +128,8 @@ pub const PoolStats = struct {
 ///
 /// State is protected by an `std.Io.Mutex`. Timed acquire uses deadline polling
 /// (≤1ms) so waiters wake promptly after a concurrent release without requiring
-/// a dedicated condition-variable timeout API.
+/// a dedicated condition-variable timeout API. The database path is
+/// allocator-owned by the pool; hook context remains borrowed.
 pub const Pool = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -135,16 +137,22 @@ pub const Pool = struct {
     idle: std.ArrayListUnmanaged(Database) = .empty,
     open_count: usize = 0,
     closed: bool = false,
+    config_live: bool = true,
+    owned_path: ?[]u8,
     mutex: std.Io.Mutex = .init,
     /// Signaled on release/discard so infinite waiters (`maxInt` timeout) wake.
     available: std.Io.Condition = .init,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: PoolConfig) !Pool {
         if (config.max_open == 0) return error.InvalidArguments;
+        const owned_path = try allocator.dupe(u8, config.database.path);
+        var owned_config = config;
+        owned_config.database.path = owned_path;
         return .{
             .allocator = allocator,
             .io = io,
-            .config = config,
+            .config = owned_config,
+            .owned_path = owned_path,
         };
     }
 
@@ -160,7 +168,9 @@ pub const Pool = struct {
         }
         self.idle.deinit(self.allocator);
         self.idle = .empty;
+        std.debug.assert(self.open_count >= idle_count);
         self.open_count -= idle_count;
+        self.deinitConfigIfUnusedLocked();
 
         // Existing leases close themselves when returned. Infinite waiters are
         // broadcast; finite waiters observe `closed` within their ≤1ms poll.
@@ -277,7 +287,17 @@ pub const Pool = struct {
     fn dropOpenSlotLocked(self: *Pool) void {
         std.debug.assert(self.open_count > 0);
         self.open_count -= 1;
+        self.deinitConfigIfUnusedLocked();
         self.notifyAvailable();
+    }
+
+    /// The pool owns its database path and keeps it live through any lease or
+    /// in-flight open that survives `deinit`.
+    fn deinitConfigIfUnusedLocked(self: *Pool) void {
+        if (!self.closed or self.open_count != 0 or !self.config_live) return;
+        self.allocator.free(self.owned_path.?);
+        self.owned_path = null;
+        self.config_live = false;
     }
 
     /// Execute a statement under a short-lived lease that is released on success
@@ -432,7 +452,7 @@ pub const Lease = struct {
         if (self.pool.closed) {
             self.conn_value.close();
             self.db.deinit();
-            self.pool.open_count -|= 1;
+            self.pool.dropOpenSlotLocked();
             self.open = false;
             return error.PoolClosed;
         }
@@ -440,9 +460,8 @@ pub const Lease = struct {
         if (!self.conn_value.isReusable()) {
             self.conn_value.close();
             self.db.deinit();
-            self.pool.open_count -|= 1;
+            self.pool.dropOpenSlotLocked();
             self.open = false;
-            self.pool.notifyAvailable();
             return;
         }
 
@@ -450,19 +469,18 @@ pub const Lease = struct {
             self.pool.idle.append(self.pool.allocator, self.db) catch |err| {
                 self.conn_value.close();
                 self.db.deinit();
-                self.pool.open_count -|= 1;
+                self.pool.dropOpenSlotLocked();
                 self.open = false;
-                self.pool.notifyAvailable();
                 return err;
             };
             self.conn_value.close();
         } else {
             self.conn_value.close();
             self.db.deinit();
-            self.pool.open_count -|= 1;
+            self.pool.dropOpenSlotLocked();
         }
         self.open = false;
-        self.pool.notifyAvailable();
+        if (self.pool.idle.items.len > 0) self.pool.notifyAvailable();
     }
 
     fn finishAfterError(self: *Lease, err: anyerror) void {
@@ -481,9 +499,8 @@ pub const Lease = struct {
 
         self.conn_value.close();
         self.db.deinit();
-        self.pool.open_count -|= 1;
+        self.pool.dropOpenSlotLocked();
         self.open = false;
-        self.pool.notifyAvailable();
     }
 };
 
@@ -3238,6 +3255,60 @@ test "SQLite pool releases and reuses leases" {
     try std.testing.expectEqual(@as(i64, 1), try (try row.value("id")).asInt());
 }
 
+test "SQLite pool owns database path after source teardown" {
+    const source_path = try std.testing.allocator.dupe(
+        u8,
+        "file:zsql_pool_owned_config?mode=memory&cache=private",
+    );
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{
+        .database = .{ .path = source_path, .mode = .file },
+        .max_open = 1,
+    });
+    try std.testing.expect(pool.config.database.path.ptr != source_path.ptr);
+    std.testing.allocator.free(source_path);
+    defer pool.deinit();
+
+    try std.testing.expectEqualStrings(
+        "file:zsql_pool_owned_config?mode=memory&cache=private",
+        pool.config.database.path,
+    );
+    var lease = try pool.acquire();
+    try (try lease.conn()).ping();
+    try lease.release();
+}
+
+test "SQLite pool retains owned path through deferred shutdown" {
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{
+        .database = .{ .path = "file:deferred?mode=memory", .mode = .file },
+        .max_open = 1,
+    });
+
+    pool.open_count = 1;
+    pool.deinit();
+    try std.testing.expect(pool.config_live);
+    try std.testing.expect(pool.owned_path != null);
+    pool.mutex.lockUncancelable(pool.io);
+    pool.dropOpenSlotLocked();
+    pool.mutex.unlock(pool.io);
+    try std.testing.expect(!pool.config_live);
+    try std.testing.expect(pool.owned_path == null);
+}
+
+test "SQLite pool config ownership cleans init allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        struct {
+            fn init(allocator: std.mem.Allocator) !void {
+                var pool = try Pool.init(allocator, std.testing.io, .{
+                    .database = .{ .path = "file:pool-oom?mode=memory", .mode = .file },
+                });
+                defer pool.deinit();
+            }
+        }.init,
+        .{},
+    );
+}
+
 test "SQLite pool applies default hooks on acquire" {
     const State = struct { after: usize = 0 };
     var state: State = .{};
@@ -3630,12 +3701,13 @@ test "SQLite pool infinite wait unblocks via condition signal" {
 test "SQLite pool acquisition failure wakes the next infinite waiter" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var pool = try Pool.init(failing.allocator(), std.testing.io, .{
         .max_open = 1,
         .acquire_timeout_ns = std.math.maxInt(u64),
     });
     defer pool.deinit();
+    failing.fail_index = failing.alloc_index;
 
     // Model one in-flight reservation so both workers enter the infinite wait.
     pool.open_count = 1;

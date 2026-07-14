@@ -283,6 +283,11 @@ Pool acquire timeout: `0` = non-blocking, `std.math.maxInt(u64)` = wait forever
 Pools retain synchronized connections after recoverable SQL errors and discard
 closed, protocol-broken, or transaction-busy leases. A lease released with an
 open transaction is never returned to another borrower.
+`Pool.init` clones connection configuration needed by future opens: PostgreSQL
+URL fields and optional peer-certificate bytes, or the SQLite database path.
+Callers retain and may immediately deinitialize their source configuration.
+Query-hook context pointers remain borrowed and must outlive their use by the
+pool.
 Connection setup failures return their reserved capacity and wake another
 acquirer, including wait-forever acquirers, so usable capacity cannot remain
 stranded behind a failed open.

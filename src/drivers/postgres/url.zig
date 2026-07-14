@@ -86,6 +86,40 @@ pub const Config = struct {
     /// (TLS 1.3 via `std.crypto.tls.Client`). Not freed by `deinit`.
     peer_cert_der: ?[]const u8 = null,
 
+    /// Clone every allocator-owned field into `allocator`. The optional peer
+    /// certificate remains borrowed; owners that need an independent lifetime
+    /// must duplicate it separately.
+    pub fn clone(self: Config, allocator: std.mem.Allocator) !Config {
+        const host = try allocator.dupe(u8, self.host);
+        errdefer allocator.free(host);
+        const user = try allocator.dupe(u8, self.user);
+        errdefer allocator.free(user);
+        const password = try allocator.dupe(u8, self.password);
+        errdefer {
+            @memset(password, 0);
+            allocator.free(password);
+        }
+        const database = try allocator.dupe(u8, self.database);
+        errdefer allocator.free(database);
+        const application_name = try allocator.dupe(u8, self.application_name);
+        errdefer allocator.free(application_name);
+
+        return .{
+            .allocator = allocator,
+            .host = host,
+            .port = self.port,
+            .user = user,
+            .password = password,
+            .database = database,
+            .ssl_mode = self.ssl_mode,
+            .channel_binding = self.channel_binding,
+            .application_name = application_name,
+            .connect_timeout_secs = self.connect_timeout_secs,
+            .statement_timeout_ms = self.statement_timeout_ms,
+            .peer_cert_der = self.peer_cert_der,
+        };
+    }
+
     pub fn deinit(self: *Config) void {
         self.allocator.free(self.host);
         self.allocator.free(self.user);
@@ -300,4 +334,39 @@ test "redacted format never includes password" {
         text,
     );
     try std.testing.expect(std.mem.indexOf(u8, text, "super-secret") == null);
+}
+
+test "Config clone owns all connection strings and cleans partial allocation" {
+    var source = try parse(
+        std.testing.allocator,
+        "postgres://ada:secret@db.example:6543/app?sslmode=require&application_name=clone-test",
+    );
+    defer source.deinit();
+    const peer_cert = "peer certificate bytes";
+    source.peer_cert_der = peer_cert;
+
+    var cloned = try source.clone(std.testing.allocator);
+    defer cloned.deinit();
+    try std.testing.expect(cloned.host.ptr != source.host.ptr);
+    try std.testing.expect(cloned.user.ptr != source.user.ptr);
+    try std.testing.expect(cloned.password.ptr != source.password.ptr);
+    try std.testing.expect(cloned.database.ptr != source.database.ptr);
+    try std.testing.expect(cloned.application_name.ptr != source.application_name.ptr);
+    try std.testing.expectEqualStrings(source.host, cloned.host);
+    try std.testing.expectEqualStrings(source.user, cloned.user);
+    try std.testing.expectEqualStrings(source.password, cloned.password);
+    try std.testing.expectEqualStrings(source.database, cloned.database);
+    try std.testing.expectEqualStrings(source.application_name, cloned.application_name);
+    try std.testing.expectEqual(peer_cert.ptr, cloned.peer_cert_der.?.ptr);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        struct {
+            fn clone(allocator: std.mem.Allocator, original: Config) !void {
+                var copy = try original.clone(allocator);
+                defer copy.deinit();
+            }
+        }.clone,
+        .{source},
+    );
 }

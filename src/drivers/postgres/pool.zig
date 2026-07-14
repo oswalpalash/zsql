@@ -6,6 +6,8 @@ const conn_mod = @import("conn.zig");
 const Io = std.Io;
 
 pub const PoolConfig = struct {
+    /// Cloned by `Pool.init`, including the optional peer certificate bytes.
+    /// The caller retains ownership of this source configuration.
     database: url.Config,
     max_open: usize = 4,
     max_idle: usize = 4,
@@ -35,7 +37,8 @@ pub const PoolStats = struct {
 ///
 /// Connections are established with `Conn.open` using the pool's `Io` and
 /// config. `deinit` closes idle connections and marks the pool closed; existing
-/// leases remain usable and close their connection when released.
+/// leases remain usable and close their connection when released. Connection
+/// configuration is allocator-owned by the pool; hook context remains borrowed.
 pub const Pool = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -43,15 +46,28 @@ pub const Pool = struct {
     idle: std.ArrayListUnmanaged(conn_mod.Conn) = .empty,
     open_count: usize = 0,
     closed: bool = false,
+    config_live: bool = true,
+    owned_peer_cert_der: ?[]u8 = null,
     mutex: Io.Mutex = .init,
     available: Io.Condition = .init,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, config: PoolConfig) !Pool {
         if (config.max_open == 0) return error.InvalidArguments;
+        var owned_database = try config.database.clone(allocator);
+        errdefer owned_database.deinit();
+        const owned_peer_cert_der = if (config.database.peer_cert_der) |der|
+            try allocator.dupe(u8, der)
+        else
+            null;
+        owned_database.peer_cert_der = owned_peer_cert_der;
+
+        var owned_config = config;
+        owned_config.database = owned_database;
         return .{
             .allocator = allocator,
             .io = io,
-            .config = config,
+            .config = owned_config,
+            .owned_peer_cert_der = owned_peer_cert_der,
         };
     }
 
@@ -65,7 +81,9 @@ pub const Pool = struct {
         for (self.idle.items) |*c| c.deinit();
         self.idle.deinit(self.allocator);
         self.idle = .empty;
+        std.debug.assert(self.open_count >= idle_count);
         self.open_count -= idle_count;
+        self.deinitConfigIfUnusedLocked();
 
         self.available.broadcast(self.io);
     }
@@ -167,7 +185,18 @@ pub const Pool = struct {
     fn dropOpenSlotLocked(self: *Pool) void {
         std.debug.assert(self.open_count > 0);
         self.open_count -= 1;
+        self.deinitConfigIfUnusedLocked();
         self.notifyAvailable();
+    }
+
+    /// Pool connection settings are allocator-owned and remain live through
+    /// any lease or in-flight open that survives `deinit`.
+    fn deinitConfigIfUnusedLocked(self: *Pool) void {
+        if (!self.closed or self.open_count != 0 or !self.config_live) return;
+        self.config.database.deinit();
+        if (self.owned_peer_cert_der) |der| self.allocator.free(der);
+        self.owned_peer_cert_der = null;
+        self.config_live = false;
     }
 
     pub fn exec(self: *Pool, sql: []const u8) !core.ExecResult {
@@ -396,16 +425,15 @@ pub const Lease = struct {
 
         if (self.pool.closed) {
             self.conn_value.deinit();
-            self.pool.open_count -|= 1;
+            self.pool.dropOpenSlotLocked();
             self.open = false;
             return error.PoolClosed;
         }
 
         if (!self.conn_value.isReusable()) {
             self.conn_value.deinit();
-            self.pool.open_count -|= 1;
+            self.pool.dropOpenSlotLocked();
             self.open = false;
-            self.pool.notifyAvailable();
             return;
         }
 
@@ -415,17 +443,16 @@ pub const Lease = struct {
                 // grow, close allocation-free instead of transferring a
                 // cleanup obligation back to the caller.
                 self.conn_value.deinit();
-                self.pool.open_count -|= 1;
+                self.pool.dropOpenSlotLocked();
                 self.open = false;
-                self.pool.notifyAvailable();
                 return err;
             };
         } else {
             self.conn_value.deinit();
-            self.pool.open_count -|= 1;
+            self.pool.dropOpenSlotLocked();
         }
         self.open = false;
-        self.pool.notifyAvailable();
+        if (self.pool.idle.items.len > 0) self.pool.notifyAvailable();
     }
 
     fn finishAfterError(self: *Lease, err: anyerror) void {
@@ -443,9 +470,8 @@ pub const Lease = struct {
         defer self.pool.mutex.unlock(self.pool.io);
 
         self.conn_value.deinit();
-        self.pool.open_count -|= 1;
+        self.pool.dropOpenSlotLocked();
         self.open = false;
-        self.pool.notifyAvailable();
     }
 };
 
@@ -599,18 +625,72 @@ test "postgres pool stats start empty" {
     }, pool.stats());
 }
 
+test "postgres pool owns connection config through deferred shutdown" {
+    var source = try url.parse(
+        std.testing.allocator,
+        "postgres://ada:secret@db.example:6543/app?sslmode=require&application_name=pool-owned",
+    );
+    const peer_cert = "pool peer certificate";
+    source.peer_cert_der = peer_cert;
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{
+        .database = source,
+        .max_open = 1,
+    });
+    source.deinit();
+
+    try std.testing.expectEqualStrings("db.example", pool.config.database.host);
+    try std.testing.expectEqualStrings("ada", pool.config.database.user);
+    try std.testing.expectEqualStrings("secret", pool.config.database.password);
+    try std.testing.expectEqualStrings("app", pool.config.database.database);
+    try std.testing.expectEqualStrings("pool-owned", pool.config.database.application_name);
+    try std.testing.expect(pool.config.database.peer_cert_der.?.ptr != peer_cert.ptr);
+    try std.testing.expectEqualStrings(peer_cert, pool.config.database.peer_cert_der.?);
+
+    // A reservation represents either an outstanding lease or an unlocked
+    // connection open. Shutdown must retain configuration until it is gone.
+    pool.open_count = 1;
+    pool.deinit();
+    try std.testing.expect(pool.config_live);
+    pool.mutex.lockUncancelable(pool.io);
+    pool.dropOpenSlotLocked();
+    pool.mutex.unlock(pool.io);
+    try std.testing.expect(!pool.config_live);
+    try std.testing.expectEqual(@as(?[]u8, null), pool.owned_peer_cert_der);
+}
+
+test "postgres pool config ownership cleans every init allocation failure" {
+    var source = try url.parse(
+        std.testing.allocator,
+        "postgres://ada:secret@db.example/app?application_name=pool-oom",
+    );
+    defer source.deinit();
+    source.peer_cert_der = "certificate";
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        struct {
+            fn init(allocator: std.mem.Allocator, database: url.Config) !void {
+                var pool = try Pool.init(allocator, std.testing.io, .{ .database = database });
+                defer pool.deinit();
+            }
+        }.init,
+        .{source},
+    );
+}
+
 test "postgres pool acquisition failure wakes the next infinite waiter" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var config = try url.parse(std.testing.allocator, "postgres://u@127.0.0.1:1/db?sslmode=disable");
     defer config.deinit();
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var pool = try Pool.init(failing.allocator(), std.testing.io, .{
         .database = config,
         .max_open = 1,
         .acquire_timeout_ns = std.math.maxInt(u64),
     });
     defer pool.deinit();
+    failing.fail_index = failing.alloc_index;
 
     // Model one in-flight reservation so both workers enter the infinite wait.
     pool.open_count = 1;
