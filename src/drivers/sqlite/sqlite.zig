@@ -1684,10 +1684,20 @@ pub const Stmt = struct {
         const count = try sqliteParameterCount(self.handle);
         if (binds.len != count) return error.BindCountMismatch;
 
+        var max_probe_len: usize = 0;
+        for (binds) |bind| {
+            if (bind.name.len == 0) return error.InvalidBindValue;
+            const prefix_len: usize = if (isBindMarker(bind.name[0])) 0 else 1;
+            const probe_len = std.math.add(usize, bind.name.len, prefix_len) catch return error.OutOfMemory;
+            max_probe_len = @max(max_probe_len, probe_len);
+        }
+
         const indices = try self.allocator.alloc(c_int, binds.len);
         errdefer self.allocator.free(indices);
+        const probe = try self.allocator.allocSentinel(u8, max_probe_len, 0);
+        defer self.allocator.free(probe);
         for (binds, 0..) |bind, index| {
-            indices[index] = try self.namedBindIndex(bind.name);
+            indices[index] = try self.namedBindIndexWithProbe(bind.name, probe);
             for (binds[0..index]) |previous| {
                 if (sameBindName(bind.name, previous.name)) return error.InvalidBindValue;
             }
@@ -1695,30 +1705,23 @@ pub const Stmt = struct {
         return indices;
     }
 
-    fn namedBindIndex(self: Stmt, name: []const u8) !c_int {
-        if (name.len == 0) return error.InvalidBindValue;
+    fn namedBindIndexWithProbe(self: Stmt, name: []const u8, probe: [:0]u8) !c_int {
+        if (isBindMarker(name[0])) {
+            @memcpy(probe[0..name.len], name);
+            probe.ptr[name.len] = 0;
+            const index = c.sqlite3_bind_parameter_index(self.handle, probe.ptr);
+            return if (index != 0) index else error.InvalidBindValue;
+        }
 
-        if (isBindMarker(name[0])) return self.lookupNamedBindIndex(name);
-
-        const prefixed = try self.allocator.allocSentinel(u8, name.len + 1, 0);
-        defer self.allocator.free(prefixed);
-        @memcpy(prefixed[1..], name);
+        @memcpy(probe[1 .. name.len + 1], name);
+        probe.ptr[name.len + 1] = 0;
         inline for (.{ ':', '@', '$' }) |marker| {
-            prefixed[0] = marker;
-            const index = c.sqlite3_bind_parameter_index(self.handle, prefixed.ptr);
+            probe[0] = marker;
+            const index = c.sqlite3_bind_parameter_index(self.handle, probe.ptr);
             if (index != 0) return index;
         }
 
         return error.InvalidBindValue;
-    }
-
-    fn lookupNamedBindIndex(self: Stmt, name: []const u8) !c_int {
-        const lookup_z = try self.allocator.dupeZ(u8, name);
-        defer self.allocator.free(lookup_z);
-
-        const index = c.sqlite3_bind_parameter_index(self.handle, lookup_z.ptr);
-        if (index == 0) return error.InvalidBindValue;
-        return index;
     }
 
     fn bindValue(self: *Stmt, index: c_int, value: core.Value) !void {
@@ -2872,6 +2875,13 @@ test "SQLite bare named binds support long names with bounded allocation" {
     );
     try std.testing.expect(failing.has_induced_failure);
 
+    // Allow the index slice, then fail the shared marker-probe buffer.
+    failing.fail_index = failing.alloc_index + 1;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        stmt.bindNamedValues(&.{.{ .name = name, .value = .{ .integer = 42 } }}),
+    );
+
     failing.fail_index = std.math.maxInt(usize);
     try stmt.bindNamedValues(&.{.{ .name = name, .value = .{ .integer = 42 } }});
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt.handle));
@@ -2893,9 +2903,9 @@ test "SQLite named binds resolve once before statement mutation" {
         .{ .name = "second", .value = .{ .integer = 2 } },
         .{ .name = "third", .value = .{ .integer = 3 } },
     };
-    // One index slice and one marker-probe buffer per name. The former second
-    // lookup pass required six allocations for these three bare names.
-    failing.fail_index = failing.alloc_index + 4;
+    // One index slice and one shared marker-probe buffer serve every name. The
+    // former per-name probes required four allocations after single-resolution.
+    failing.fail_index = failing.alloc_index + 2;
     try stmt.bindNamedValues(&valid);
     try std.testing.expect(!failing.has_induced_failure);
 
