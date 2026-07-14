@@ -1,6 +1,10 @@
 const std = @import("std");
 const Certificate = std.crypto.Certificate;
 
+test {
+    _ = @import("saslprep.zig");
+}
+
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const pbkdf2 = std.crypto.pwhash.pbkdf2;

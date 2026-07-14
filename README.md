@@ -72,6 +72,9 @@ path. Use `-Dstrip=true` for the same install mode.
 `zig build version-sync` makes `build.zig.zon` authoritative for release
 metadata and fails if the library/CLI build option drifts; `install-smoke` also
 compares the installed doctor's reported version to that manifest value.
+`zig build saslprep-tables-check` verifies the generated Unicode 3.2 tables
+used by the native PostgreSQL SCRAM implementation. It requires Python 3 only
+for this maintainer check; library builds have no Python or Unicode dependency.
 `zig build package-smoke` snapshots the current worktree through an isolated Git
 index, runs `zig fetch` into a clean cache, extracts the manifest-selected
 payload, and repeats its test, consumer, and install gates from that package. A
@@ -84,8 +87,8 @@ Before tagging, run the complete deterministic release contract:
 zig build release-verify
 ```
 
-This covers formatting, default and SQLite tests, version integrity, checked
-queries, examples, external consumers, clean installation, default/bundled-
+This covers formatting, generated SASLprep table drift, default and SQLite
+tests, version integrity, checked queries, examples, external consumers, clean installation, default/bundled-
 SQLite Windows and static-Linux cross-builds, stripped native CLI
 and static-library reproducibility, and the fetched release payload. PostgreSQL
 protocol tests are included in the default suite;

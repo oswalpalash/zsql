@@ -30,8 +30,8 @@ zig build release-verify
 git diff --check
 ```
 
-`release-verify` covers formatting, default and SQLite builds/tests, version
-integrity, checked queries, examples, separate-package consumers, clean-prefix
+`release-verify` covers formatting, generated SASLprep table drift, default and
+SQLite builds/tests, version integrity, checked queries, examples, separate-package consumers, clean-prefix
 installation, default and bundled-SQLite cross-builds for Windows and static
 Linux, byte-identical stripped `ReleaseSafe` native CLI and static-library
 installs with matching build provenance, and a Zig-fetched manifest payload that
