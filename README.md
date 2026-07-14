@@ -481,6 +481,9 @@ try qb.bind(@as(i64, 1)); // Zig scalars OK
 ```
 
 Unsafe raw append is named `rawUnsafe` on purpose.
+`bind` owns copied text/blob payloads and is failure-atomic: allocation failure
+leaves SQL, bind order, ownership, and the next PostgreSQL placeholder unchanged,
+so callers may handle OOM and retry the same builder safely.
 
 ### Query hooks
 

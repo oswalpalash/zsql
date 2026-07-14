@@ -80,6 +80,12 @@ pub const QueryBuilder = struct {
     /// floats, `[]const u8` text, optionals, and `null`). Values are never
     /// concatenated into the SQL string.
     pub fn bind(self: *QueryBuilder, value: anytype) !void {
+        const sql_len = self.sql.items.len;
+        const binds_len = self.binds.items.len;
+        const owned_len = self.owned.items.len;
+        const next_index = self.next_index;
+        errdefer self.rollbackBind(sql_len, binds_len, owned_len, next_index);
+
         const coerced = try coerceValue(value);
         const stored = try self.storeValue(coerced);
         try self.binds.append(self.allocator, stored);
@@ -87,8 +93,9 @@ pub const QueryBuilder = struct {
             .postgres => {
                 var buf: [32]u8 = undefined;
                 const placeholder = try std.fmt.bufPrint(&buf, "${d}", .{self.next_index});
-                self.next_index += 1;
                 try self.sql.appendSlice(self.allocator, placeholder);
+                self.next_index = std.math.add(usize, self.next_index, 1) catch
+                    return error.IntegerOverflow;
             },
             .sqlite => {
                 try self.sql.append(self.allocator, '?');
@@ -104,6 +111,21 @@ pub const QueryBuilder = struct {
         return self.binds.items;
     }
 
+    fn rollbackBind(
+        self: *QueryBuilder,
+        sql_len: usize,
+        binds_len: usize,
+        owned_len: usize,
+        next_index: usize,
+    ) void {
+        self.sql.shrinkRetainingCapacity(sql_len);
+        self.binds.shrinkRetainingCapacity(binds_len);
+        while (self.owned.items.len > owned_len) {
+            self.allocator.free(self.owned.pop().?);
+        }
+        self.next_index = next_index;
+    }
+
     fn storeValue(self: *QueryBuilder, value: Value) !Value {
         return switch (value) {
             .null => .{ .null = {} },
@@ -112,11 +134,13 @@ pub const QueryBuilder = struct {
             .boolean => |v| .{ .boolean = v },
             .text => |t| blk: {
                 const owned = try self.allocator.dupe(u8, t);
+                errdefer self.allocator.free(owned);
                 try self.owned.append(self.allocator, owned);
                 break :blk .{ .text = owned };
             },
             .blob => |b| blk: {
                 const owned = try self.allocator.dupe(u8, b);
+                errdefer self.allocator.free(owned);
                 try self.owned.append(self.allocator, owned);
                 break :blk .{ .blob = owned };
             },
@@ -309,4 +333,77 @@ test "QueryBuilder.bind coerces Zig scalars and optionals" {
 test "coerceValue rejects integer overflow into i64" {
     // u64 max does not fit i64.
     try std.testing.expectError(error.IntegerOverflow, coerceValue(@as(u64, std.math.maxInt(u64))));
+}
+
+fn exerciseQueryBuilderBindAllocations(
+    allocator: std.mem.Allocator,
+    dialect: QueryBuilder.Dialect,
+) !void {
+    var qb = QueryBuilder.init(allocator, dialect);
+    defer qb.deinit();
+    try qb.appendTrustedSql("values (");
+    try qb.bind(@as([]const u8, "owned text"));
+    try qb.appendTrustedSql(", ");
+    try qb.bind(Value{ .blob = "\x00\x01" });
+    try qb.appendTrustedSql(")");
+}
+
+test "QueryBuilder.bind cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseQueryBuilderBindAllocations,
+        .{QueryBuilder.Dialect.postgres},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseQueryBuilderBindAllocations,
+        .{QueryBuilder.Dialect.sqlite},
+    );
+}
+
+test "QueryBuilder.bind is failure-atomic and retryable" {
+    inline for (.{ QueryBuilder.Dialect.postgres, QueryBuilder.Dialect.sqlite }) |dialect| {
+        for (0..5) |fail_index| {
+            var qb = QueryBuilder.init(std.testing.allocator, dialect);
+            try qb.sql.ensureTotalCapacityPrecise(std.testing.allocator, 1);
+            qb.sql.appendAssumeCapacity('x');
+
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+                .fail_index = fail_index,
+            });
+            qb.allocator = failing.allocator();
+            defer {
+                qb.allocator = std.testing.allocator;
+                qb.deinit();
+            }
+
+            const result = qb.bind(@as([]const u8, "payload"));
+            if (fail_index < 4) {
+                try std.testing.expectError(error.OutOfMemory, result);
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqualStrings("x", qb.sqlSlice());
+                try std.testing.expectEqual(@as(usize, 0), qb.bindsSlice().len);
+                try std.testing.expectEqual(@as(usize, 0), qb.owned.items.len);
+                try std.testing.expectEqual(@as(usize, 1), qb.next_index);
+
+                failing.fail_index = std.math.maxInt(usize);
+                try qb.bind(@as([]const u8, "payload"));
+            } else {
+                try result;
+                try std.testing.expect(!failing.has_induced_failure);
+            }
+
+            try std.testing.expectEqualStrings(
+                if (dialect == .postgres) "x$1" else "x?",
+                qb.sqlSlice(),
+            );
+            try std.testing.expectEqual(@as(usize, 1), qb.bindsSlice().len);
+            try std.testing.expectEqualStrings("payload", qb.bindsSlice()[0].text);
+            try std.testing.expectEqual(@as(usize, 1), qb.owned.items.len);
+            try std.testing.expectEqual(
+                @as(usize, if (dialect == .postgres) 2 else 1),
+                qb.next_index,
+            );
+        }
+    }
 }
