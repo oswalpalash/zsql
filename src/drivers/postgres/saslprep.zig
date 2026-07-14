@@ -15,23 +15,40 @@ const hangul = struct {
 
 pub fn normalizeNfkc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     const view = std.unicode.Utf8View.init(input) catch return error.InvalidUtf8;
+
+    var scalar_count: usize = 0;
+    var counting_iterator = view.iterator();
+    while (counting_iterator.nextCodepoint()) |codepoint| {
+        const additional: usize = if (codepoint >= hangul.s_base and codepoint < hangul.s_base + hangul.s_count)
+            if ((codepoint - hangul.s_base) % hangul.t_count == 0) 2 else 3
+        else if (decomposition(codepoint)) |scalars|
+            scalars.len
+        else
+            1;
+        scalar_count = std.math.add(usize, scalar_count, additional) catch return error.OutOfMemory;
+    }
+
     var decomposed: std.ArrayListUnmanaged(u21) = .empty;
-    defer decomposed.deinit(allocator);
+    defer {
+        secureFreeSlice(u21, allocator, decomposed.allocatedSlice());
+    }
+    try decomposed.ensureTotalCapacityPrecise(allocator, scalar_count);
 
     var iterator = view.iterator();
     while (iterator.nextCodepoint()) |codepoint| {
         if (codepoint >= hangul.s_base and codepoint < hangul.s_base + hangul.s_count) {
             const index = codepoint - hangul.s_base;
-            try appendCanonical(allocator, &decomposed, hangul.l_base + index / hangul.n_count);
-            try appendCanonical(allocator, &decomposed, hangul.v_base + (index % hangul.n_count) / hangul.t_count);
+            appendCanonical(&decomposed, hangul.l_base + index / hangul.n_count);
+            appendCanonical(&decomposed, hangul.v_base + (index % hangul.n_count) / hangul.t_count);
             const trailing = index % hangul.t_count;
-            if (trailing != 0) try appendCanonical(allocator, &decomposed, hangul.t_base + trailing);
+            if (trailing != 0) appendCanonical(&decomposed, hangul.t_base + trailing);
         } else if (decomposition(codepoint)) |scalars| {
-            for (scalars) |scalar| try appendCanonical(allocator, &decomposed, scalar);
+            for (scalars) |scalar| appendCanonical(&decomposed, scalar);
         } else {
-            try appendCanonical(allocator, &decomposed, codepoint);
+            appendCanonical(&decomposed, codepoint);
         }
     }
+    std.debug.assert(decomposed.items.len == scalar_count);
 
     const composed_len = composeCanonical(decomposed.items);
 
@@ -53,12 +70,78 @@ pub fn normalizeNfkc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return encoded;
 }
 
-fn appendCanonical(
+fn secureFreeSlice(
+    comptime T: type,
     allocator: std.mem.Allocator,
-    output: *std.ArrayListUnmanaged(u21),
-    codepoint: u21,
-) !void {
-    try output.append(allocator, codepoint);
+    memory: []T,
+) void {
+    if (memory.len == 0) return;
+    const bytes = std.mem.sliceAsBytes(memory);
+    std.crypto.secureZero(u8, bytes);
+    allocator.rawFree(bytes, .of(T), @returnAddress());
+}
+
+/// Apply PostgreSQL-compatible SASLprep to UTF-8 password bytes.
+///
+/// The returned bytes are allocator-owned and may contain a credential. The
+/// caller must securely zero them before freeing. Invalid UTF-8 and prohibited
+/// input are intentionally distinct so the authentication layer can implement
+/// PostgreSQL's raw-password fallback without masking allocation failure.
+pub fn prepare(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const view = std.unicode.Utf8View.init(input) catch return error.InvalidUtf8;
+    var mapped: std.ArrayListUnmanaged(u8) = .empty;
+    defer {
+        secureFreeSlice(u8, allocator, mapped.allocatedSlice());
+    }
+    try mapped.ensureTotalCapacityPrecise(allocator, input.len);
+
+    var iterator = view.iterator();
+    while (iterator.nextCodepoint()) |codepoint| {
+        if (inRanges(codepoint, &tables.non_ascii_space_ranges)) {
+            mapped.appendAssumeCapacity(' ');
+        } else if (!inRanges(codepoint, &tables.mapped_to_nothing_ranges)) {
+            var encoded: [4]u8 = undefined;
+            const len = std.unicode.utf8Encode(codepoint, &encoded) catch unreachable;
+            mapped.appendSliceAssumeCapacity(encoded[0..len]);
+        }
+    }
+    if (mapped.items.len == 0) return error.Prohibited;
+
+    const normalized = try normalizeNfkc(allocator, mapped.items);
+    errdefer {
+        secureFreeSlice(u8, allocator, normalized);
+    }
+
+    const normalized_view = std.unicode.Utf8View.init(normalized) catch unreachable;
+    var normalized_iterator = normalized_view.iterator();
+    var first: ?u21 = null;
+    var last: u21 = undefined;
+    var has_randal = false;
+    var has_lcat = false;
+    while (normalized_iterator.nextCodepoint()) |codepoint| {
+        if (inRanges(codepoint, &tables.prohibited_ranges) or
+            inRanges(codepoint, &tables.unassigned_ranges))
+        {
+            return error.Prohibited;
+        }
+        if (first == null) first = codepoint;
+        last = codepoint;
+        has_randal = has_randal or inRanges(codepoint, &tables.randal_ranges);
+        has_lcat = has_lcat or inRanges(codepoint, &tables.lcat_ranges);
+    }
+
+    if (first == null) return error.Prohibited;
+    if (has_randal and (has_lcat or
+        !inRanges(first.?, &tables.randal_ranges) or
+        !inRanges(last, &tables.randal_ranges)))
+    {
+        return error.Prohibited;
+    }
+    return normalized;
+}
+
+fn appendCanonical(output: *std.ArrayListUnmanaged(u21), codepoint: u21) void {
+    output.appendAssumeCapacity(codepoint);
     const class = combiningClass(codepoint);
     if (class == 0) return;
 
@@ -286,4 +369,140 @@ test "Unicode 3.2 NFKC cleans up every allocation failure" {
         normalizeNfkcWithFailures,
         .{},
     );
+}
+
+test "PostgreSQL SASLprep maps and normalizes RFC vectors" {
+    const vectors = [_]struct { input: []const u8, expected: []const u8 }{
+        .{ .input = "user", .expected = "user" },
+        .{ .input = "USER", .expected = "USER" },
+        .{ .input = "I\xc2\xadX", .expected = "IX" },
+        .{ .input = "\xc2\xaa", .expected = "a" },
+        .{ .input = "\xe2\x85\xa8", .expected = "IX" },
+        .{ .input = "a\xc2\xa0b", .expected = "a b" },
+        // U+200B appears in both mapping tables; PostgreSQL applies C.1.2 first.
+        .{ .input = "a\xe2\x80\x8bb", .expected = "a b" },
+        .{ .input = "\xd8\xa7\x31\xd8\xa8", .expected = "\xd8\xa7\x31\xd8\xa8" },
+    };
+    for (vectors) |vector| {
+        const prepared = try prepare(std.testing.allocator, vector.input);
+        defer {
+            std.crypto.secureZero(u8, prepared);
+            std.testing.allocator.free(prepared);
+        }
+        try std.testing.expectEqualStrings(vector.expected, prepared);
+    }
+}
+
+test "PostgreSQL SASLprep rejects invalid prohibited unassigned and bidi input" {
+    inline for (.{
+        "",
+        "\xc2\xad", // maps to empty
+        "password\x07", // ASCII control
+        "password\xc8\xa1", // U+0221 was unassigned in Unicode 3.2
+        "\xd8\xa7A\xd8\xa8", // RandALCat mixed with LCat
+        "\xd8\xa7\x31", // RandALCat string must end with RandALCat
+        "\x31\xd8\xa7", // RandALCat string must begin with RandALCat
+    }) |input| {
+        try std.testing.expectError(error.Prohibited, prepare(std.testing.allocator, input));
+    }
+    try std.testing.expectError(error.InvalidUtf8, prepare(std.testing.allocator, "\xff"));
+}
+
+fn prepareWithFailures(allocator: std.mem.Allocator) !void {
+    const prepared = try prepare(allocator, "S\xc2\xade\xcc\x81cret\xc2\xa0");
+    defer {
+        std.crypto.secureZero(u8, prepared);
+        allocator.free(prepared);
+    }
+    try std.testing.expectEqualStrings("S\xc3\xa9cret ", prepared);
+}
+
+test "PostgreSQL SASLprep cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        prepareWithFailures,
+        .{},
+    );
+}
+
+const WipeCheckingAllocator = struct {
+    child: std.mem.Allocator,
+    free_count: usize = 0,
+    all_freed_zero: bool = true,
+
+    fn allocator(self: *WipeCheckingAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(
+        context: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *WipeCheckingAllocator = @ptrCast(@alignCast(context));
+        return self.child.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) bool {
+        _ = context;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = return_address;
+        return false;
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        _ = context;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = return_address;
+        return null;
+    }
+
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *WipeCheckingAllocator = @ptrCast(@alignCast(context));
+        self.free_count += 1;
+        for (memory) |byte| {
+            if (byte != 0) {
+                self.all_freed_zero = false;
+                break;
+            }
+        }
+        self.child.rawFree(memory, alignment, return_address);
+    }
+};
+
+test "PostgreSQL SASLprep erases intermediates before allocator release" {
+    var checking = WipeCheckingAllocator{ .child = std.testing.allocator };
+    try std.testing.expectError(error.Prohibited, prepare(checking.allocator(), "Sensitive\x00Password"));
+    try std.testing.expect(checking.free_count != 0);
+    try std.testing.expect(checking.all_freed_zero);
 }
