@@ -32,6 +32,25 @@ pub fn main() !void {
     };
     defer owned.deinit();
 
+    {
+        var stmt = try conn.prepare("select label from smoke where id = ?");
+        defer stmt.close();
+
+        {
+            var first = try stmt.query(&.{.{ .integer = 1 }});
+            defer first.deinit();
+            const first_row = (try first.next()) orelse return error.MissingPreparedRow;
+            if (!std.mem.eql(u8, try first_row.asName([]const u8, "label"), "durable"))
+                return error.InvalidPreparedText;
+        }
+
+        var second = try stmt.query(&.{.{ .integer = 1 }});
+        defer second.deinit();
+        const second_row = (try second.next()) orelse return error.MissingPreparedRow;
+        if (!std.mem.eql(u8, try second_row.asName([]const u8, "label"), "durable"))
+            return error.InvalidPreparedText;
+    }
+
     const duplicate_sql = "insert into smoke (id, label, payload) values (?, ?, ?)";
     const duplicate_result = conn.exec(
         duplicate_sql,

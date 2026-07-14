@@ -200,6 +200,12 @@ SQLite accepts. Marker probing uses one temporary allocation per resolution,
 and allocation failure remains `error.OutOfMemory` rather than a bind-name
 error.
 
+SQLite `Stmt.query` / `queryNamed` borrow and temporarily mark the prepared
+statement busy. Keep the `Stmt` at a stable address until `Rows.deinit`; rows
+teardown resets it for reuse. Calling `close` while rows are active defers
+finalization until their teardown, so rows remain valid without a double-close
+hazard.
+
 ### PostgreSQL
 
 Native wire protocol. Prefer parameterized APIs:

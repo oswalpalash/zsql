@@ -1546,6 +1546,8 @@ pub const Stmt = struct {
     placeholders: core.params.Summary,
     owned_bind_buffers: std.ArrayListUnmanaged([]u8) = .empty,
     closed: bool = false,
+    rows_open: bool = false,
+    close_requested: bool = false,
     /// When false, `close` only resets/clears binds (borrowed from a cache).
     finalize_on_close: bool = true,
 
@@ -1567,7 +1569,15 @@ pub const Stmt = struct {
     }
 
     pub fn close(self: *Stmt) void {
-        if (self.closed) return;
+        if (self.closed or self.close_requested) return;
+        if (self.rows_open) {
+            self.close_requested = true;
+            return;
+        }
+        self.finishClose();
+    }
+
+    fn finishClose(self: *Stmt) void {
         self.freeBindBuffers();
         if (self.finalize_on_close) {
             // Finalize always releases the statement but returns its most
@@ -1579,6 +1589,7 @@ pub const Stmt = struct {
         }
         self.owned_bind_buffers.deinit(self.allocator);
         self.closed = true;
+        self.close_requested = false;
     }
 
     /// Reset a cached statement for reuse without finalizing.
@@ -1591,13 +1602,13 @@ pub const Stmt = struct {
     }
 
     pub fn exec(self: *Stmt, binds: []const core.Value) !core.ExecResult {
-        if (self.closed) return error.StatementClosed;
+        try self.requireAvailable();
         try self.bindValues(binds);
         return self.stepExec();
     }
 
     pub fn execNamed(self: *Stmt, binds: []const NamedValue) !core.ExecResult {
-        if (self.closed) return error.StatementClosed;
+        try self.requireAvailable();
         try self.bindNamedValues(binds);
         return self.stepExec();
     }
@@ -1622,16 +1633,20 @@ pub const Stmt = struct {
         }
     }
 
-    pub fn query(self: Stmt, binds: []const core.Value) !Rows {
-        return Rows.init(self, binds);
+    /// Query through this reusable statement. The returned Rows borrows `self`:
+    /// keep the Stmt at a stable address and call Rows.deinit before reuse or
+    /// scope exit. Other statement operations return ConnectionBusy meanwhile.
+    pub fn query(self: *Stmt, binds: []const core.Value) !Rows {
+        return Rows.initBorrowed(self, binds);
     }
 
-    pub fn queryNamed(self: Stmt, binds: []const NamedValue) !Rows {
-        return Rows.initNamed(self, binds);
+    /// Named-bind variant of `query` with the same borrowed lifetime contract.
+    pub fn queryNamed(self: *Stmt, binds: []const NamedValue) !Rows {
+        return Rows.initBorrowedNamed(self, binds);
     }
 
     pub fn bindValues(self: *Stmt, binds: []const core.Value) !void {
-        if (self.closed) return error.StatementClosed;
+        try self.requireAvailable();
         try self.validateBindCount(binds);
         self.freeBindBuffers();
         _ = c.sqlite3_clear_bindings(self.handle);
@@ -1643,7 +1658,7 @@ pub const Stmt = struct {
     }
 
     pub fn bindNamedValues(self: *Stmt, binds: []const NamedValue) !void {
-        if (self.closed) return error.StatementClosed;
+        try self.requireAvailable();
         try self.validateNamedBindCount(binds);
         self.freeBindBuffers();
         _ = c.sqlite3_clear_bindings(self.handle);
@@ -1652,6 +1667,11 @@ pub const Stmt = struct {
         for (binds) |bind| {
             try self.bindValue(try self.namedBindIndex(bind.name), bind.value);
         }
+    }
+
+    fn requireAvailable(self: *const Stmt) !void {
+        if (self.closed or self.close_requested) return error.StatementClosed;
+        if (self.rows_open) return error.ConnectionBusy;
     }
 
     fn validateBindCount(self: Stmt, binds: []const core.Value) !void {
@@ -1758,6 +1778,9 @@ fn execScriptSql(allocator: std.mem.Allocator, db: *c.sqlite3, sql: []const u8) 
 
 pub const Rows = struct {
     stmt: Stmt,
+    /// Non-null only for explicit prepared-statement queries. The caller must
+    /// keep the Stmt storage alive until Rows.deinit.
+    borrowed_stmt: ?*Stmt = null,
     columns: []const []const u8,
     values: []core.Value,
     done: bool = false,
@@ -1766,16 +1789,24 @@ pub const Rows = struct {
     diagnostics: ?*DiagnosticState = null,
     diagnostic_sql: ?[]u8 = null,
 
-    pub fn init(stmt: Stmt, binds: []const core.Value) !Rows {
-        return initOwned(stmt, binds, true);
+    fn initBorrowed(stmt: *Stmt, binds: []const core.Value) !Rows {
+        try stmt.bindValues(binds);
+        stmt.rows_open = true;
+        errdefer {
+            stmt.rows_open = false;
+            stmt.resetForReuse();
+        }
+        return initBorrowedBound(stmt);
     }
 
-    pub fn initNamed(stmt: Stmt, binds: []const NamedValue) !Rows {
-        return initOwnedNamed(stmt, binds, true);
-    }
-
-    pub fn initOwned(stmt: Stmt, binds: []const core.Value, owns_stmt: bool) !Rows {
-        return initOwnedWithDiagnostics(stmt, binds, owns_stmt, null, "");
+    fn initBorrowedNamed(stmt: *Stmt, binds: []const NamedValue) !Rows {
+        try stmt.bindNamedValues(binds);
+        stmt.rows_open = true;
+        errdefer {
+            stmt.rows_open = false;
+            stmt.resetForReuse();
+        }
+        return initBorrowedBound(stmt);
     }
 
     fn initOwnedWithDiagnostics(
@@ -1790,10 +1821,6 @@ pub const Rows = struct {
 
         try owned_stmt.bindValues(binds);
         return initBound(owned_stmt, owns_stmt, diagnostics, sql);
-    }
-
-    pub fn initOwnedNamed(stmt: Stmt, binds: []const NamedValue, owns_stmt: bool) !Rows {
-        return initOwnedNamedWithDiagnostics(stmt, binds, owns_stmt, null, "");
     }
 
     fn initOwnedNamedWithDiagnostics(
@@ -1823,6 +1850,35 @@ pub const Rows = struct {
         if (diagnostics) |state| state.retain();
         errdefer if (diagnostics) |state| state.release();
 
+        const storage = try allocRowStorage(&stmt);
+
+        return .{
+            .stmt = stmt,
+            .columns = storage.columns,
+            .values = storage.values,
+            .owns_stmt = owns_stmt,
+            .diagnostics = diagnostics,
+            .diagnostic_sql = diagnostic_sql,
+        };
+    }
+
+    fn initBorrowedBound(stmt: *Stmt) !Rows {
+        const storage = try allocRowStorage(stmt);
+        return .{
+            .stmt = undefined,
+            .borrowed_stmt = stmt,
+            .columns = storage.columns,
+            .values = storage.values,
+            .owns_stmt = false,
+        };
+    }
+
+    const RowStorage = struct {
+        columns: []const []const u8,
+        values: []core.Value,
+    };
+
+    fn allocRowStorage(stmt: *Stmt) !RowStorage {
         const column_count = try sqliteColumnCount(stmt.handle);
         const columns = try stmt.allocator.alloc([]const u8, column_count);
         errdefer stmt.allocator.free(columns);
@@ -1833,26 +1889,24 @@ pub const Rows = struct {
             const name = c.sqlite3_column_name(stmt.handle, try sqliteIndex(index)) orelse return error.DriverError;
             column.* = std.mem.span(name);
         }
-
-        return .{
-            .stmt = stmt,
-            .columns = columns,
-            .values = values,
-            .owns_stmt = owns_stmt,
-            .diagnostics = diagnostics,
-            .diagnostic_sql = diagnostic_sql,
-        };
+        return .{ .columns = columns, .values = values };
     }
 
     pub fn deinit(self: *Rows) void {
-        self.stmt.allocator.free(self.values);
-        self.stmt.allocator.free(self.columns);
-        if (self.owns_stmt) {
-            self.stmt.close();
+        const stmt = self.stmtPtr();
+        const allocator = stmt.allocator;
+        allocator.free(self.values);
+        allocator.free(self.columns);
+        if (self.borrowed_stmt != null) {
+            stmt.resetForReuse();
+            stmt.rows_open = false;
+            if (stmt.close_requested) stmt.finishClose();
+        } else if (self.owns_stmt) {
+            stmt.close();
         } else {
-            self.stmt.resetForReuse();
+            stmt.resetForReuse();
         }
-        if (self.diagnostic_sql) |sql| self.stmt.allocator.free(sql);
+        if (self.diagnostic_sql) |sql| allocator.free(sql);
         if (self.diagnostics) |diagnostics| diagnostics.release();
         self.diagnostic_sql = null;
         self.diagnostics = null;
@@ -1862,7 +1916,8 @@ pub const Rows = struct {
     pub fn next(self: *Rows) !?core.Row {
         if (self.done) return null;
 
-        const rc = c.sqlite3_step(self.stmt.handle);
+        const stmt = self.stmtPtr();
+        const rc = c.sqlite3_step(stmt.handle);
         switch (rc) {
             c.SQLITE_ROW => {
                 for (self.values, 0..) |*value, index| {
@@ -1887,19 +1942,24 @@ pub const Rows = struct {
 
     fn captureDeferredError(self: *Rows, err: anyerror) void {
         const diagnostics = self.diagnostics orelse return;
-        const db = c.sqlite3_db_handle(self.stmt.handle) orelse return;
+        const db = c.sqlite3_db_handle(self.stmtPtr().handle) orelse return;
         diagnostics.capture(db, err, self.diagnostic_sql orelse "");
     }
 
     fn decodeColumn(self: *Rows, index: c_int) !core.Value {
-        return switch (c.sqlite3_column_type(self.stmt.handle, index)) {
+        const handle = self.stmtPtr().handle;
+        return switch (c.sqlite3_column_type(handle, index)) {
             c.SQLITE_NULL => .{ .null = {} },
-            c.SQLITE_INTEGER => .{ .integer = c.sqlite3_column_int64(self.stmt.handle, index) },
-            c.SQLITE_FLOAT => .{ .real = c.sqlite3_column_double(self.stmt.handle, index) },
-            c.SQLITE_TEXT => .{ .text = try columnText(self.stmt.handle, index) },
-            c.SQLITE_BLOB => .{ .blob = try columnBlob(self.stmt.handle, index) },
+            c.SQLITE_INTEGER => .{ .integer = c.sqlite3_column_int64(handle, index) },
+            c.SQLITE_FLOAT => .{ .real = c.sqlite3_column_double(handle, index) },
+            c.SQLITE_TEXT => .{ .text = try columnText(handle, index) },
+            c.SQLITE_BLOB => .{ .blob = try columnBlob(handle, index) },
             else => error.InvalidColumnType,
         };
+    }
+
+    fn stmtPtr(self: *Rows) *Stmt {
+        return self.borrowed_stmt orelse &self.stmt;
     }
 };
 
@@ -2610,7 +2670,7 @@ test "SQLite query row maps to scalar struct" {
     try std.testing.expectEqual(@as(?[]const u8, null), item.missing);
 }
 
-test "SQLite query can be prepared statement owned by rows" {
+test "SQLite prepared query borrows and reuses statement" {
     var db = try Database.open(std.testing.allocator, .{});
     defer db.deinit();
 
@@ -2621,15 +2681,82 @@ test "SQLite query can be prepared statement owned by rows" {
     _ = try conn.exec("insert into nums (n) values (1)", &.{});
     _ = try conn.exec("insert into nums (n) values (2)", &.{});
 
-    const stmt = try conn.prepare("select n from nums order by n");
+    var stmt = try conn.prepare("select n from nums order by n");
+    defer stmt.close();
     var rows = try stmt.query(&.{});
-    defer rows.deinit();
+    try std.testing.expect(stmt.rows_open);
+    try std.testing.expectError(error.ConnectionBusy, stmt.query(&.{}));
+    try std.testing.expectError(error.ConnectionBusy, stmt.exec(&.{}));
 
     const first = (try rows.next()).?;
     try std.testing.expectEqual(@as(i64, 1), try (try first.value("n")).asInt());
     const second = (try rows.next()).?;
     try std.testing.expectEqual(@as(i64, 2), try (try second.value("n")).asInt());
     try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
+    rows.deinit();
+    try std.testing.expect(!stmt.rows_open);
+
+    var reused = try stmt.query(&.{});
+    defer reused.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try (try (try reused.next()).?.getName("n")).asInt());
+}
+
+test "SQLite prepared named query reuses statement" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    var stmt = try conn.prepare("select :value as value");
+    defer stmt.close();
+
+    var first = try stmt.queryNamed(&.{.{ .name = "value", .value = .{ .integer = 1 } }});
+    try std.testing.expectEqual(@as(i64, 1), try (try (try first.next()).?.getName("value")).asInt());
+    first.deinit();
+
+    var second = try stmt.queryNamed(&.{.{ .name = "value", .value = .{ .integer = 2 } }});
+    defer second.deinit();
+    try std.testing.expectEqual(@as(i64, 2), try (try (try second.next()).?.getName("value")).asInt());
+}
+
+test "SQLite prepared query defers close until rows teardown" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    var stmt = try conn.prepare("select 7 as value");
+    var rows = try stmt.query(&.{});
+    stmt.close();
+    try std.testing.expect(stmt.close_requested);
+    try std.testing.expect(!stmt.closed);
+    try std.testing.expectError(error.StatementClosed, stmt.query(&.{}));
+
+    try std.testing.expectEqual(@as(i64, 7), try (try (try rows.next()).?.getName("value")).asInt());
+    rows.deinit();
+    try std.testing.expect(stmt.closed);
+    try std.testing.expect(!stmt.close_requested);
+    stmt.close();
+}
+
+test "SQLite prepared query allocation failure clears busy state" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var db = try Database.open(failing.allocator(), .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+    var stmt = try conn.prepare("select 9 as value");
+    defer stmt.close();
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, stmt.query(&.{}));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(!stmt.rows_open);
+
+    failing.fail_index = std.math.maxInt(usize);
+    var rows = try stmt.query(&.{});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 9), try (try (try rows.next()).?.getName("value")).asInt());
 }
 
 test "SQLite borrowed row can be copied into owned row" {
