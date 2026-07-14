@@ -721,6 +721,9 @@ or automatically retry an uncertain migration.
 If the post-rollback marker write itself fails, that persistence error takes
 precedence over the original SQL error: zsql never reports the original failure
 as durably guarded when it could not record the guard.
+SQLite acquires `BEGIN IMMEDIATE` before reading or validating migration history,
+so a waiter cannot apply from a stale pre-lock snapshot. PostgreSQL performs the
+same revalidation after acquiring its session advisory lock.
 
 `Migrator(D).repairDirty(version, expected_checksum)` is the guarded repair
 primitive. It locks migration history, requires an existing dirty row and exact

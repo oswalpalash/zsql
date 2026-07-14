@@ -1349,7 +1349,14 @@ pub fn validateMigrationStatus(conn: *Conn, migrations: []const core.migrate.Mig
     var status = try migrationStatus(conn.allocator, conn);
     defer status.deinit();
 
-    for (status.records) |record| {
+    return validateMigrationRecords(status.records, migrations);
+}
+
+fn validateMigrationRecords(
+    records: []const MigrationRecord,
+    migrations: []const core.migrate.MigrationFile,
+) !void {
+    for (records) |record| {
         if (record.dirty) return error.MigrationDirty;
 
         const migration = findMigration(migrations, record.version) orelse continue;
@@ -1361,13 +1368,9 @@ pub fn validateMigrationStatus(conn: *Conn, migrations: []const core.migrate.Mig
 
 pub fn applyMigrations(conn: *Conn, migrations: []const core.migrate.MigrationFile) !ApplyResult {
     try ensureMigrationTable(conn);
-    try validateMigrationStatus(conn, migrations);
-
-    var status = try migrationStatus(conn.allocator, conn);
-    defer status.deinit();
 
     var active_migration: ?core.migrate.MigrationFile = null;
-    return applyMigrationsTransaction(conn, migrations, status.records, &active_migration) catch |apply_err| {
+    return applyMigrationsTransaction(conn, migrations, &active_migration) catch |apply_err| {
         if (active_migration) |migration| {
             return core.migrate.dirtyFailure(
                 conn,
@@ -1383,15 +1386,20 @@ pub fn applyMigrations(conn: *Conn, migrations: []const core.migrate.MigrationFi
 fn applyMigrationsTransaction(
     conn: *Conn,
     migrations: []const core.migrate.MigrationFile,
-    records: []const MigrationRecord,
     active_migration: *?core.migrate.MigrationFile,
 ) !ApplyResult {
     var tx = try conn.beginImmediate();
     errdefer tx.rollbackIfOpen();
 
+    // Read and validate history only after BEGIN IMMEDIATE holds the write
+    // reservation, so a waiter cannot act on a pre-lock snapshot.
+    var status = try migrationStatus(conn.allocator, conn);
+    defer status.deinit();
+    try validateMigrationRecords(status.records, migrations);
+
     var applied: usize = 0;
     for (migrations) |migration| {
-        if (findMigrationRecord(records, migration.id.version) != null) continue;
+        if (findMigrationRecord(status.records, migration.id.version) != null) continue;
         active_migration.* = migration;
         if (std.mem.trim(u8, migration.sql, " \t\r\n").len == 0) return error.InvalidSql;
 
@@ -3979,6 +3987,45 @@ test "SQLite migration apply runs pending migrations and records clean status" {
     try std.testing.expect(!status.records[0].dirty);
     try std.testing.expectEqual(@as(u64, 2), status.records[1].version);
     try std.testing.expect(!status.records[1].dirty);
+}
+
+test "SQLite migration apply validates history under begin immediate" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    const State = struct {
+        conn: *Conn,
+        saw_history_read: bool = false,
+        read_outside_transaction: bool = false,
+
+        fn beforeQuery(ctx: ?*anyopaque, start: core.QueryStart) void {
+            if (std.mem.indexOf(u8, start.sql, "from zsql_migrations") == null) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.saw_history_read = true;
+            if (!self.conn.transaction_open) self.read_outside_transaction = true;
+        }
+    };
+    var state: State = .{ .conn = &conn };
+    conn.setHooks(.{ .ctx = &state, .before_query = State.beforeQuery });
+    defer conn.setHooks(.{});
+
+    const sql = "create table locked_history (id integer primary key);";
+    const migrations = [_]core.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "locked_history",
+            .filename = "V0001__locked_history.sql",
+        },
+        .sql = sql,
+        .checksum = core.migrate.checksumSql(sql),
+    }};
+    try std.testing.expectEqual(@as(usize, 1), (try applyMigrations(&conn, &migrations)).applied);
+    try std.testing.expect(state.saw_history_read);
+    try std.testing.expect(!state.read_outside_transaction);
+    try std.testing.expect(!conn.transaction_open);
 }
 
 test "SQLite migration apply executes multi-statement scripts" {
