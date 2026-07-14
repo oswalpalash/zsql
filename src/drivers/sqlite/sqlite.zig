@@ -1677,21 +1677,20 @@ pub const Stmt = struct {
 
         if (isBindMarker(name[0])) return self.lookupNamedBindIndex(name);
 
-        var prefixed_buffer: [256]u8 = undefined;
-        if (name.len + 1 > prefixed_buffer.len) return error.InvalidBindValue;
+        const prefixed = try self.allocator.allocSentinel(u8, name.len + 1, 0);
+        defer self.allocator.free(prefixed);
+        @memcpy(prefixed[1..], name);
         inline for (.{ ':', '@', '$' }) |marker| {
-            prefixed_buffer[0] = marker;
-            @memcpy(prefixed_buffer[1 .. name.len + 1], name);
-            if (self.lookupNamedBindIndex(prefixed_buffer[0 .. name.len + 1])) |index| {
-                return index;
-            } else |_| {}
+            prefixed[0] = marker;
+            const index = c.sqlite3_bind_parameter_index(self.handle, prefixed.ptr);
+            if (index != 0) return index;
         }
 
         return error.InvalidBindValue;
     }
 
     fn lookupNamedBindIndex(self: Stmt, name: []const u8) !c_int {
-        const lookup_z = self.allocator.dupeZ(u8, name) catch return error.InvalidBindValue;
+        const lookup_z = try self.allocator.dupeZ(u8, name);
         defer self.allocator.free(lookup_z);
 
         const index = c.sqlite3_bind_parameter_index(self.handle, lookup_z.ptr);
@@ -2684,6 +2683,43 @@ test "SQLite supports named exec and query binds" {
     try std.testing.expectEqualStrings("ada", try (try row.value("name")).asText());
     try std.testing.expectEqual(@as(i64, 1), try (try row.value("active")).asInt());
     try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
+}
+
+test "SQLite bare named binds support long names with bounded allocation" {
+    var name_storage: [300]u8 = undefined;
+    @memset(&name_storage, 'n');
+    const name: []const u8 = &name_storage;
+    const sql = try std.fmt.allocPrint(std.testing.allocator, "select @{s} as value", .{name});
+    defer std.testing.allocator.free(sql);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var db = try Database.open(failing.allocator(), .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+    var stmt = try conn.prepare(sql);
+    defer stmt.close();
+
+    // Validation and binding each resolve the bare name. Every resolution uses
+    // one buffer while probing all marker forms, so two allocations suffice.
+    failing.fail_index = failing.alloc_index + 2;
+    try stmt.bindNamedValues(&.{.{ .name = name, .value = .{ .integer = 42 } }});
+    try std.testing.expect(!failing.has_induced_failure);
+
+    // Allocation failure remains OutOfMemory instead of being mislabeled as a
+    // caller bind-name error, and the statement can be retried afterwards.
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        stmt.bindNamedValues(&.{.{ .name = name, .value = .{ .integer = 42 } }}),
+    );
+    try std.testing.expect(failing.has_induced_failure);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try stmt.bindNamedValues(&.{.{ .name = name, .value = .{ .integer = 42 } }});
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt.handle));
+    try std.testing.expectEqual(@as(i64, 42), c.sqlite3_column_int64(stmt.handle, 0));
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_reset(stmt.handle));
 }
 
 test "SQLite named binds reject missing unknown and duplicate names" {
