@@ -41,7 +41,7 @@ pub const Client = struct {
     cbind_data_owned: ?[]u8 = null,
     server_first: ?[]u8 = null,
     auth_message: ?[]u8 = null,
-    server_signature_b64: ?[]u8 = null,
+    server_signature: ?[Sha256.digest_length]u8 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -99,7 +99,6 @@ pub const Client = struct {
         if (self.cbind_data_owned) |b| self.allocator.free(b);
         if (self.server_first) |s| self.allocator.free(s);
         if (self.auth_message) |s| self.allocator.free(s);
-        if (self.server_signature_b64) |s| self.allocator.free(s);
         self.* = undefined;
     }
 
@@ -174,12 +173,7 @@ pub const Client = struct {
         HmacSha256.create(&server_key, "Server Key", &salted_password);
         var server_signature: [32]u8 = undefined;
         HmacSha256.create(&server_signature, auth_message, &server_key);
-
-        var sig_b64_buf: [64]u8 = undefined;
-        const sig_b64 = std.base64.standard.Encoder.encode(&sig_b64_buf, &server_signature);
-        const server_signature_b64 = try self.allocator.dupe(u8, sig_b64);
-        if (self.server_signature_b64) |old| self.allocator.free(old);
-        self.server_signature_b64 = server_signature_b64;
+        self.server_signature = server_signature;
 
         var proof_b64_buf: [64]u8 = undefined;
         const proof_b64 = std.base64.standard.Encoder.encode(&proof_b64_buf, &client_proof);
@@ -195,9 +189,13 @@ pub const Client = struct {
     pub fn handleServerFinal(self: *const Client, server_final: []const u8) !void {
         const parsed = try parseServerFinal(server_final);
         if (parsed.server_error != null) return error.AuthFailed;
-        const expected = self.server_signature_b64 orelse return error.AuthFailed;
-        const got = parsed.verifier orelse return error.ProtocolError;
-        if (!std.mem.eql(u8, got, expected)) return error.AuthFailed;
+        const expected = self.server_signature orelse return error.AuthFailed;
+        const verifier_b64 = parsed.verifier orelse return error.ProtocolError;
+        const verifier_len = std.base64.standard.Decoder.calcSizeForSlice(verifier_b64) catch return error.ProtocolError;
+        if (verifier_len != Sha256.digest_length) return error.ProtocolError;
+        var verifier: [Sha256.digest_length]u8 = undefined;
+        std.base64.standard.Decoder.decode(&verifier, verifier_b64) catch return error.ProtocolError;
+        if (!std.crypto.timing_safe.eql([Sha256.digest_length]u8, verifier, expected)) return error.AuthFailed;
     }
 };
 
@@ -562,10 +560,12 @@ test "SCRAM server-final parsing accepts extensions and rejects ambiguity" {
     const client_final = try client.handleServerFirst("r=client-nonce-server,s=c2FsdA==,i=1");
     defer std.testing.allocator.free(client_final);
 
+    var signature_b64_buf: [64]u8 = undefined;
+    const signature_b64 = std.base64.standard.Encoder.encode(&signature_b64_buf, &client.server_signature.?);
     const with_extension = try std.fmt.allocPrint(
         std.testing.allocator,
         "v={s},x=optional",
-        .{client.server_signature_b64.?},
+        .{signature_b64},
     );
     defer std.testing.allocator.free(with_extension);
     try client.handleServerFinal(with_extension);
@@ -576,6 +576,25 @@ test "SCRAM server-final parsing accepts extensions and rejects ambiguity" {
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("x=optional"));
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("e=error,x=one,x=two"));
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("1=invalid"));
+    try std.testing.expectError(error.ProtocolError, client.handleServerFinal("v=***"));
+    try std.testing.expectError(error.ProtocolError, client.handleServerFinal("v=AAAA"));
+    try std.testing.expectError(
+        error.AuthFailed,
+        client.handleServerFinal("v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    );
+}
+
+test "SCRAM rejects malformed and non-canonical server salts" {
+    var client = try Client.init(std.testing.allocator, "user", "pencil", "client-nonce", .none);
+    defer client.deinit();
+    try std.testing.expectError(
+        error.ProtocolError,
+        client.handleServerFirst("r=client-nonce-server,s=***=,i=1"),
+    );
+    try std.testing.expectError(
+        error.ProtocolError,
+        client.handleServerFirst("r=client-nonce-server,s=Zh==,i=1"),
+    );
 }
 
 test "tlsServerEndPointData hashes sha256-signed cert with SHA-256" {
