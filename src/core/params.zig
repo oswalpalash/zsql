@@ -63,7 +63,10 @@ pub fn rewriteNamedPostgres(allocator: std.mem.Allocator, sql: []const u8) !Post
         try out.appendSlice(allocator, number);
     }
     try out.appendSlice(allocator, sql[cursor..]);
-    return .{ .sql = try out.toOwnedSlice(allocator), .names = try names.toOwnedSlice(allocator) };
+    const owned_sql = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_sql);
+    const owned_names = try names.toOwnedSlice(allocator);
+    return .{ .sql = owned_sql, .names = owned_names };
 }
 
 pub const Summary = struct {
@@ -437,4 +440,49 @@ test "rewriteNamedPostgres preserves lexical SQL and reuses names" {
     try std.testing.expectEqualStrings("id", rewrite.names[0]);
     try std.testing.expectEqualStrings("name", rewrite.names[1]);
     try std.testing.expectError(error.InvalidSql, rewriteNamedPostgres(std.testing.allocator, "select :id, ?"));
+}
+
+fn exerciseRewriteNamedPostgresAllocationFailures(allocator: std.mem.Allocator) !void {
+    var rewrite = try rewriteNamedPostgres(
+        allocator,
+        "select :account_id, :account_id, @tenant_id, $region from accounts where owner_id = :owner_id",
+    );
+    defer rewrite.deinit(allocator);
+
+    try std.testing.expectEqualStrings(
+        "select $1, $1, $2, $3 from accounts where owner_id = $4",
+        rewrite.sql,
+    );
+    try std.testing.expectEqual(@as(usize, 4), rewrite.names.len);
+}
+
+test "rewriteNamedPostgres cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseRewriteNamedPostgresAllocationFailures,
+        .{},
+    );
+
+    // ArrayList can normally shrink in place, so force both ownership
+    // transfers down their allocate-and-copy path and fail each allocation in
+    // turn. The final failure occurs after SQL ownership has transferred but
+    // before the names slice can transfer.
+    var baseline = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .resize_fail_index = 0,
+    });
+    try exerciseRewriteNamedPostgresAllocationFailures(baseline.allocator());
+    try std.testing.expect(baseline.alloc_index >= 2);
+
+    for (0..baseline.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        try std.testing.expectError(
+            error.OutOfMemory,
+            exerciseRewriteNamedPostgresAllocationFailures(failing.allocator()),
+        );
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
