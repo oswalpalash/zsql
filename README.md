@@ -303,7 +303,8 @@ bounded rather than constrained by a fixed library buffer, and authentication
 state remains safe to deinitialize or retry after allocation failure. Server
 verifiers are strictly decoded to their 32-byte signature and compared in
 constant time. Owned password bytes and password-derived stack intermediates are
-securely zeroed at their lifetime boundaries.
+securely zeroed at their lifetime boundaries. Nonces and attribute values are
+validated against the SCRAM wire grammar before use.
 
 SCRAM-PLUS is used when the server offers it, TLS is active, and a leaf
 certificate DER is available for channel binding. Because `std.crypto.tls.Client`

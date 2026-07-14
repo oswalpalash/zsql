@@ -53,7 +53,7 @@ pub const Client = struct {
         // SCRAM user names with `=` / `,` need escaping; reject rather than
         // silently mis-auth until full SASLprep lands.
         if (std.mem.indexOfAny(u8, user, "=,") != null) return error.InvalidArguments;
-        if (client_nonce.len < 8) return error.InvalidArguments;
+        if (client_nonce.len < 8 or !isPrintableNonce(client_nonce)) return error.InvalidArguments;
 
         const user_owned = try allocator.dupe(u8, user);
         errdefer allocator.free(user_owned);
@@ -128,6 +128,7 @@ pub const Client = struct {
         self.server_first = try self.allocator.dupe(u8, server_first);
 
         const parsed = try parseServerFirst(server_first);
+        if (!isPrintableNonce(parsed.nonce)) return error.ProtocolError;
         if (!std.mem.startsWith(u8, parsed.nonce, self.client_nonce)) return error.AuthFailed;
         if (parsed.nonce.len <= self.client_nonce.len) return error.AuthFailed;
         if (parsed.iterations == 0 or parsed.iterations > 1_000_000) return error.AuthFailed;
@@ -293,9 +294,11 @@ fn parseServerFinal(msg: []const u8) !ServerFinal {
         const key = part[0];
         if (!std.ascii.isAlphabetic(key) or seen[key]) return error.ProtocolError;
         seen[key] = true;
+        const value = part[2..];
+        if (!isScramValue(value)) return error.ProtocolError;
         switch (key) {
-            'v' => verifier = part[2..],
-            'e' => server_error = part[2..],
+            'v' => verifier = value,
+            'e' => server_error = value,
             else => {},
         }
     }
@@ -317,6 +320,7 @@ fn parseServerFirst(msg: []const u8) !ServerFirst {
         if (!std.ascii.isAlphabetic(key) or seen[key]) return error.ProtocolError;
         seen[key] = true;
         const value = part[2..];
+        if (!isScramValue(value)) return error.ProtocolError;
         switch (key) {
             'r' => nonce = value,
             's' => salt = value,
@@ -331,6 +335,20 @@ fn parseServerFirst(msg: []const u8) !ServerFirst {
         .salt_b64 = salt orelse return error.ProtocolError,
         .iterations = iterations orelse return error.ProtocolError,
     };
+}
+
+fn isScramValue(value: []const u8) bool {
+    return value.len != 0 and
+        std.mem.indexOfScalar(u8, value, 0) == null and
+        std.unicode.utf8ValidateSlice(value);
+}
+
+fn isPrintableNonce(nonce: []const u8) bool {
+    if (nonce.len == 0) return false;
+    for (nonce) |byte| {
+        if (byte < 0x21 or byte > 0x7e or byte == ',') return false;
+    }
+    return true;
 }
 
 test "SCRAM server-first attributes are unambiguous" {
@@ -352,6 +370,17 @@ test "SCRAM server-first attributes are unambiguous" {
     try std.testing.expectEqualStrings("client-server", parsed.nonce);
     try std.testing.expectEqualStrings("c2FsdA==", parsed.salt_b64);
     try std.testing.expectEqual(@as(u32, 4096), parsed.iterations);
+
+    _ = try parseServerFirst("r=client-server,s=c2FsdA==,i=4096,x=\x01");
+    _ = try parseServerFirst("r=client-server,s=c2FsdA==,i=4096,x=\xc3\xa9");
+    try std.testing.expectError(
+        error.ProtocolError,
+        parseServerFirst("r=client-server,s=c2FsdA==,i=4096,x=\x00"),
+    );
+    try std.testing.expectError(
+        error.ProtocolError,
+        parseServerFirst("r=client-server,s=c2FsdA==,i=4096,x=\xc3"),
+    );
 }
 
 /// Scan AuthenticationSASL mechanism list for SCRAM variants.
@@ -530,6 +559,31 @@ test "SCRAM client securely zeroes its owned password" {
     client.deinit();
 }
 
+test "SCRAM validates client and server nonce grammar" {
+    inline for (.{
+        "client nonce",
+        "client,nonce",
+        "client\x1fnonce",
+        "client-\xc3\xa9",
+    }) |nonce| {
+        try std.testing.expectError(
+            error.InvalidArguments,
+            Client.init(std.testing.allocator, "user", "pencil", nonce, .none),
+        );
+    }
+
+    var client = try Client.init(std.testing.allocator, "user", "pencil", "client-nonce", .none);
+    defer client.deinit();
+    try std.testing.expectError(
+        error.ProtocolError,
+        client.handleServerFirst("r=client-nonce server,s=c2FsdA==,i=1"),
+    );
+    try std.testing.expectError(
+        error.ProtocolError,
+        client.handleServerFirst("r=client-nonce\x7fserver,s=c2FsdA==,i=1"),
+    );
+}
+
 test "SCRAM-SHA-256-PLUS uses tls-server-end-point cbind encoding" {
     const cbind_data = [_]u8{0xAB} ** 32;
     var client = try Client.init(
@@ -594,6 +648,9 @@ test "SCRAM server-final parsing accepts extensions and rejects ambiguity" {
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("x=optional"));
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("e=error,x=one,x=two"));
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("1=invalid"));
+    try std.testing.expectError(error.ProtocolError, client.handleServerFinal("e="));
+    try std.testing.expectError(error.ProtocolError, client.handleServerFinal("e=bad\x00value"));
+    try std.testing.expectError(error.AuthFailed, client.handleServerFinal("e=\xc3\xa9"));
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("v=***"));
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("v=AAAA"));
     try std.testing.expectError(
