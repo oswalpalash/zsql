@@ -54,7 +54,13 @@ pub fn build(b: *std.Build) void {
         .name = "zsql",
         .root_module = zsql_mod,
     });
-    b.installArtifact(lib);
+    // Zig 0.16 stores the full cached object path as the static archive member
+    // name. Re-archive the single object under a canonical basename so
+    // installed libraries do not leak cache paths and remain reproducible.
+    const normalize_archive = b.addSystemCommand(&.{ "sh", "scripts/normalize_archive.sh", b.graph.zig_exe });
+    normalize_archive.addFileArg(lib.getEmittedBin());
+    const normalized_lib = normalize_archive.addOutputFileArg(lib.out_filename);
+    b.getInstallStep().dependOn(&b.addInstallLibFile(normalized_lib, lib.out_filename).step);
 
     const tests = b.addTest(.{
         .root_module = zsql_mod,

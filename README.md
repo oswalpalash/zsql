@@ -55,9 +55,9 @@ artifacts do not depend on repository-relative files.
 with the libc-free default configuration and with bundled SQLite enabled.
 `zig build reproducibility-smoke` performs two stripped `ReleaseSafe` native
 installs with separate local caches and prefixes, then requires byte-identical
-CLI outputs and both static-library artifacts to exist. Zig 0.16 static archive
-bytes vary across isolated Linux cache roots, so archive byte identity is not
-claimed. Use `-Dstrip=true` for the same install mode.
+CLI and static-library outputs. zsql canonicalizes the installed archive member
+name because Zig 0.16 otherwise embeds its full cache path. Use `-Dstrip=true`
+for the same install mode.
 `zig build version-sync` makes `build.zig.zon` authoritative for release
 metadata and fails if the library/CLI build option drifts; `install-smoke` also
 compares the installed doctor's reported version to that manifest value.
@@ -76,8 +76,8 @@ zig build release-verify
 This covers formatting, default and SQLite tests, version integrity, checked
 queries, examples, external consumers, clean installation, default/bundled-
 SQLite Windows and static-Linux cross-builds, stripped native CLI
-reproducibility, and the fetched release payload. PostgreSQL protocol tests are
-included in the default suite;
+and static-library reproducibility, and the fetched release payload. PostgreSQL
+protocol tests are included in the default suite;
 live server behavior remains the explicit final service-backed gate:
 
 ```sh
