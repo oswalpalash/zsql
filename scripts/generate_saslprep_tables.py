@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import pathlib
+import struct
 import stringprep
 import sys
 import unicodedata
@@ -46,6 +48,9 @@ def emit_array(lines, declaration, item_type, items, formatter):
 
 def generate() -> str:
     range_tables = {
+        "nfkc_changed": codepoint_ranges(
+            lambda character: UCD.normalize("NFKC", character) != character
+        ),
         "non_ascii_space": codepoint_ranges(stringprep.in_table_c12),
         "mapped_to_nothing": codepoint_ranges(stringprep.in_table_b1),
         "prohibited": codepoint_ranges(
@@ -70,6 +75,7 @@ def generate() -> str:
     decomposition_scalars = []
     combining_classes = []
     compositions = []
+    nfkc_changed = hashlib.sha256()
 
     for codepoint in range(MAX_CODEPOINT):
         character = chr(codepoint)
@@ -84,6 +90,12 @@ def generate() -> str:
             scalars = [ord(item) for item in normalized]
             decomposition_scalars.extend(scalars)
             decomposition_entries.append((codepoint, offset, len(scalars)))
+
+        nfkc = UCD.normalize("NFKC", character)
+        if nfkc != character:
+            encoded = nfkc.encode("utf-8")
+            nfkc_changed.update(struct.pack(">II", codepoint, len(encoded)))
+            nfkc_changed.update(encoded)
 
         canonical = UCD.decomposition(character)
         if canonical and not canonical.startswith("<"):
@@ -101,6 +113,9 @@ def generate() -> str:
         "pub const Decomposition = struct { codepoint: u21, offset: u32, len: u8 };",
         "pub const CombiningClass = struct { codepoint: u21, class: u8 };",
         "pub const Composition = struct { first: u21, second: u21, composed: u21 };",
+        "",
+        "pub const nfkc_changed_sha256 = [32]u8{ " +
+        ", ".join(f"0x{byte:02x}" for byte in nfkc_changed.digest()) + " };",
         "",
     ]
 
