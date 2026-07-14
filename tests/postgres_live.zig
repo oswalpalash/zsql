@@ -1080,16 +1080,25 @@ test "postgres live: asynchronous notifications preserve session reuse" {
     defer sender.deinit();
 
     try listener.listen("zsql_live_events");
-    _ = try sender.exec("notify zsql_live_events, 'ready'");
-    var notification = try listener.nextNotification();
-    defer notification.deinit(allocator);
+    _ = try sender.exec("notify zsql_live_events, 'first'; notify zsql_live_events, 'second'");
+
+    // NotificationResponse is asynchronous and can precede any command's
+    // normal response. A command collector must retain both events FIFO.
+    try listener.ping();
+    try std.testing.expectEqual(@as(usize, 2), listener.pendingNotificationCount());
+    var first = try listener.nextNotification();
+    defer first.deinit(allocator);
+    var second = try listener.nextNotification();
+    defer second.deinit(allocator);
 
     try listener.unlisten("zsql_live_events");
     try listener.ping();
     listener.deinit();
 
-    try std.testing.expectEqualStrings("zsql_live_events", notification.channel);
-    try std.testing.expectEqualStrings("ready", notification.payload);
+    try std.testing.expectEqualStrings("zsql_live_events", first.channel);
+    try std.testing.expectEqualStrings("first", first.payload);
+    try std.testing.expectEqualStrings("zsql_live_events", second.channel);
+    try std.testing.expectEqualStrings("second", second.payload);
 }
 
 test "postgres live: pooled listener clears subscriptions before reuse" {
@@ -1114,17 +1123,17 @@ test "postgres live: pooled listener clears subscriptions before reuse" {
     errdefer listener.deinit();
     try listener.listen("zsql_pool_events");
     _ = try sender.exec("notify zsql_pool_events, 'owned'");
-    var notification = try listener.next();
-    defer notification.deinit(allocator);
+    const dedicated = try listener.lease.conn();
+    try dedicated.ping();
+    try std.testing.expectEqual(@as(usize, 1), dedicated.pendingNotificationCount());
     listener.deinit();
 
-    try std.testing.expectEqualStrings("zsql_pool_events", notification.channel);
-    try std.testing.expectEqualStrings("owned", notification.payload);
     try std.testing.expectEqual(@as(usize, 0), pool.stats().leased);
     try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
 
     var lease = try pool.acquire();
     defer if (lease.open) lease.discard() catch {};
+    try std.testing.expectEqual(@as(usize, 0), (try lease.conn()).pendingNotificationCount());
     var rows = try (try lease.conn()).query(
         "select count(*)::bigint as n from pg_listening_channels()",
     );

@@ -415,6 +415,7 @@ pub const Listener = struct {
             self.closed = true;
             return;
         };
+        connection.clearPendingNotifications();
         self.lease.release() catch self.lease.discard() catch {};
         self.closed = true;
     }

@@ -56,6 +56,9 @@ pub const Conn = struct {
     /// Enabled with `enableStmtCache`; when set, extended queries reuse named
     /// server prepares and skip Parse on cache hits.
     stmt_cache: ?core.StmtCache = null,
+    /// Allocator-owned asynchronous notifications received while another
+    /// command was being collected. `nextNotification` returns these FIFO.
+    pending_notifications: std.ArrayListUnmanaged(Notification) = .empty,
     /// Session-wide namespace shared by explicit and cached server statements.
     /// Never reset while the connection lives: explicit statements may remain
     /// open across cache enable/disable cycles.
@@ -288,6 +291,7 @@ pub const Conn = struct {
     /// Close transport buffers without sending Terminate (pre-startup cleanup).
     fn deinitTransportOnly(self: *Conn) void {
         if (self.closed) return;
+        self.clearPendingNotifications();
         self.stream.close(self.io);
         self.allocator.free(self.server_host);
         self.allocator.free(self.read_buf);
@@ -332,6 +336,7 @@ pub const Conn = struct {
         if (self.closed) return;
         // Best-effort Close of cached prepares before Terminate.
         self.disableStmtCache() catch {};
+        self.clearPendingNotifications();
         self.sendTerminate() catch {};
         self.stream.close(self.io);
         self.allocator.free(self.server_host);
@@ -452,7 +457,11 @@ pub const Conn = struct {
         // the reset fails, the pool closes the session and PostgreSQL releases
         // those resources with it.
         self.clearStmtCacheLocal();
+        self.clearPendingNotifications();
         _ = try self.execUnobserved("discard all");
+        // A notification already in flight can precede DISCARD ALL's command
+        // response. It belongs to the previous borrower as well.
+        self.clearPendingNotifications();
 
         if (statement_timeout_ms) |ms| try self.setStatementTimeoutMs(ms);
         if (stmt_cache_size > 0) self.stmt_cache = try core.StmtCache.init(self.allocator, stmt_cache_size);
@@ -463,6 +472,35 @@ pub const Conn = struct {
             cache.deinit();
             self.stmt_cache = null;
         }
+    }
+
+    /// Number of notifications already received from the server and waiting
+    /// for `nextNotification`. This does not read from the network.
+    pub fn pendingNotificationCount(self: *const Conn) usize {
+        return self.pending_notifications.items.len;
+    }
+
+    /// Drop notifications already received by this connection. Pooled
+    /// listeners use this before their dedicated lease returns to general use.
+    pub fn clearPendingNotifications(self: *Conn) void {
+        for (self.pending_notifications.items) |*notification| {
+            notification.deinit(self.allocator);
+        }
+        self.pending_notifications.deinit(self.allocator);
+        self.pending_notifications = .empty;
+    }
+
+    fn queueNotification(self: *Conn, body: []const u8) !void {
+        appendNotification(self.allocator, &self.pending_notifications, body) catch |err| {
+            // Allocation failure does not damage protocol synchronization.
+            // A malformed backend message makes the connection untrustworthy.
+            if (err != error.OutOfMemory) self.broken = true;
+            return err;
+        };
+    }
+
+    fn queueNotificationBestEffort(self: *Conn, body: []const u8) void {
+        self.queueNotification(body) catch {};
     }
 
     fn closePrepared(self: *Conn, name: []const u8) !void {
@@ -482,6 +520,7 @@ pub const Conn = struct {
             defer self.allocator.free(msg.body);
             switch (msg.tag) {
                 .close_complete, .notice_response, .parameter_status => {},
+                .notification_response => try self.queueNotification(msg.body),
                 .ready_for_query => {
                     synchronized = true;
                     self.tx_status = protocol.parseReadyForQuery(msg.body) catch {
@@ -527,7 +566,8 @@ pub const Conn = struct {
                     rows_affected = types.parseCommandTag(tag).rows_affected;
                 },
                 .empty_query_response => {},
-                .parameter_status, .notice_response, .notification_response => {},
+                .parameter_status, .notice_response => {},
+                .notification_response => try self.queueNotification(msg.body),
                 .ready_for_query => {
                     synchronized = true;
                     self.tx_status = protocol.parseReadyForQuery(msg.body) catch {
@@ -681,6 +721,7 @@ pub const Conn = struct {
                     self.allocator.free(fields);
                 },
                 .no_data, .notice_response, .parameter_status => {},
+                .notification_response => try self.queueNotification(msg.body),
                 .ready_for_query => {
                     synchronized = true;
                     self.tx_status = protocol.parseReadyForQuery(msg.body) catch {
@@ -713,7 +754,8 @@ pub const Conn = struct {
             defer self.allocator.free(msg.body);
             switch (msg.tag) {
                 .parse_complete, .bind_complete, .no_data => {},
-                .parameter_status, .notice_response, .notification_response => {},
+                .parameter_status, .notice_response => {},
+                .notification_response => try self.queueNotification(msg.body),
                 .command_complete => {
                     const tag = try protocol.parseCommandComplete(msg.body);
                     rows_affected = types.parseCommandTag(tag).rows_affected;
@@ -869,6 +911,9 @@ pub const Conn = struct {
     pub fn nextNotification(self: *Conn) !Notification {
         self.clearLastError();
         if (self.closed) return error.ConnectionClosed;
+        if (self.pending_notifications.items.len != 0) {
+            return self.pending_notifications.orderedRemove(0);
+        }
         while (true) {
             const msg = try self.readMessage();
             defer self.allocator.free(msg.body);
@@ -942,7 +987,8 @@ pub const Conn = struct {
                     };
                     return if (started) .{ .rows_affected = rows_affected } else error.ProtocolError;
                 },
-                .parameter_status, .notice_response, .notification_response => {},
+                .parameter_status, .notice_response => {},
+                .notification_response => try self.queueNotification(msg.body),
                 .error_response => return self.failFromErrorResponse(msg.body, false, sql),
                 else => return error.ProtocolError,
             }
@@ -996,7 +1042,8 @@ pub const Conn = struct {
                     if (!started) return error.ProtocolError;
                     return out.finish(self.allocator);
                 },
-                .parameter_status, .notice_response, .notification_response => {},
+                .parameter_status, .notice_response => {},
+                .notification_response => try self.queueNotification(msg.body),
                 .error_response => return self.failFromErrorResponse(msg.body, false, sql),
                 else => return error.ProtocolError,
             }
@@ -1487,7 +1534,8 @@ pub const Conn = struct {
                     return finishSimpleRows(self.allocator, &column_names, &rows, rows_affected);
                 },
                 .error_response => return self.failFromErrorResponse(msg.body, false, sql),
-                .parameter_status, .notice_response, .notification_response => {},
+                .parameter_status, .notice_response => {},
+                .notification_response => try self.queueNotification(msg.body),
                 else => return error.ProtocolError,
             }
         }
@@ -1612,7 +1660,8 @@ pub const Conn = struct {
                     return finishSimpleRows(self.allocator, &column_names, &rows, rows_affected);
                 },
                 .error_response => return self.failFromErrorResponse(msg.body, false, sql),
-                .parameter_status, .notice_response, .notification_response => {},
+                .parameter_status, .notice_response => {},
+                .notification_response => try self.queueNotification(msg.body),
                 else => return error.ProtocolError,
             }
         }
@@ -1811,6 +1860,7 @@ pub const Conn = struct {
                     return;
                 },
                 .error_response, .notice_response => {},
+                .notification_response => self.queueNotificationBestEffort(msg.body),
                 .command_complete,
                 .empty_query_response,
                 .parse_complete,
@@ -2370,6 +2420,16 @@ pub const Notification = struct {
     }
 };
 
+fn appendNotification(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayListUnmanaged(Notification),
+    body: []const u8,
+) !void {
+    var notification = try Notification.parse(allocator, body);
+    errdefer notification.deinit(allocator);
+    try pending.append(allocator, notification);
+}
+
 const CopyOutputBuffer = struct {
     bytes: std.ArrayListUnmanaged(u8) = .empty,
 
@@ -2507,6 +2567,49 @@ test "notification parser cleans every partial allocation" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         parseNotificationForAllocationTest,
+        .{},
+    );
+}
+
+fn queueNotificationsForAllocationTest(allocator: std.mem.Allocator) !void {
+    var pending: std.ArrayListUnmanaged(Notification) = .empty;
+    defer {
+        for (pending.items) |*notification| notification.deinit(allocator);
+        pending.deinit(allocator);
+    }
+    const first = [_]u8{ 0, 0, 0, 7, 'a', 0, '1', 0 };
+    const second = [_]u8{ 0, 0, 0, 8, 'b', 0, '2', 0 };
+    try appendNotification(allocator, &pending, &first);
+    try appendNotification(allocator, &pending, &second);
+}
+
+test "notification queue owns payloads and preserves FIFO" {
+    var pending: std.ArrayListUnmanaged(Notification) = .empty;
+    defer {
+        for (pending.items) |*notification| notification.deinit(std.testing.allocator);
+        pending.deinit(std.testing.allocator);
+    }
+    var first_body = [_]u8{ 0, 0, 0, 7, 'a', 0, '1', 0 };
+    const second_body = [_]u8{ 0, 0, 0, 8, 'b', 0, '2', 0 };
+    try appendNotification(std.testing.allocator, &pending, &first_body);
+    try appendNotification(std.testing.allocator, &pending, &second_body);
+    first_body[4] = 'x';
+    first_body[6] = '9';
+
+    var first = pending.orderedRemove(0);
+    defer first.deinit(std.testing.allocator);
+    var second = pending.orderedRemove(0);
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("a", first.channel);
+    try std.testing.expectEqualStrings("1", first.payload);
+    try std.testing.expectEqualStrings("b", second.channel);
+    try std.testing.expectEqualStrings("2", second.payload);
+}
+
+test "notification queue cleans every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        queueNotificationsForAllocationTest,
         .{},
     );
 }

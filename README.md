@@ -475,9 +475,13 @@ defer notification.deinit(allocator);
 ```
 
 Notifications own their channel and payload buffers and may outlive the
-listener lease. `Listener.deinit` sends `UNLISTEN *` before returning its
-session to the pool; if cleanup fails, that connection is discarded instead of
-leaking subscription state into an unrelated lease.
+listener lease. A connection queues notifications that arrive while it is
+collecting another command, so later `nextNotification` / `Listener.next` calls
+receive them in server order. `pendingNotificationCount` reports only events
+already read from the wire. `Listener.deinit` sends `UNLISTEN *` and discards
+queued events before returning its session to the pool; if cleanup fails, that
+connection is discarded instead of leaking subscription state into an
+unrelated lease.
 
 COPY uses trusted COPY SQL plus explicit bytes; values are encoded by the caller
 for the selected COPY format:
