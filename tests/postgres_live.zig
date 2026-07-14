@@ -105,6 +105,32 @@ test "postgres live: SCRAM authenticates SASLprep-equivalent Unicode passwords" 
     try expectCurrentUser(unicode_config, "zsql_saslprep_live");
 }
 
+test "postgres live: SCRAM uses startup role when its name needs SASL escaping" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa_state.deinit() == .ok);
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+
+    var admin_config = try pg.parseUrl(allocator, url_str);
+    defer admin_config.deinit();
+    var admin = try pg.Conn.open(allocator, std.testing.io, admin_config);
+    defer admin.deinit();
+
+    const drop_role = "drop role if exists \"zsql,sasl=role\"";
+    _ = try admin.exec(drop_role);
+    errdefer _ = admin.exec(drop_role) catch {};
+    _ = try admin.exec(
+        \\create role "zsql,sasl=role" login password 'startup-role-password'
+    );
+    defer _ = admin.exec(drop_role) catch {};
+
+    var role_config = try pg.parseUrl(allocator, url_str);
+    defer role_config.deinit();
+    try replaceCredentials(&role_config, "zsql,sasl=role", "startup-role-password");
+    try expectCurrentUser(role_config, "zsql,sasl=role");
+}
+
 fn collectPostgresMigrationStatus(allocator: std.mem.Allocator, migrator: pg.Migrator) !void {
     var status = try migrator.status(allocator);
     defer status.deinit();

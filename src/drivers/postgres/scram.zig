@@ -582,6 +582,14 @@ test "SCRAM client securely zeroes its owned password" {
     client.deinit();
 }
 
+test "SCRAM permits PostgreSQL's empty ignored username" {
+    var client = try Client.init(std.testing.allocator, "", "secret", "client-nonce", .none);
+    defer client.deinit();
+    const first = try client.clientFirstMessage(std.testing.allocator);
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqualStrings("n,,n=,r=client-nonce", first);
+}
+
 test "SCRAM prepares Unicode passwords and preserves PostgreSQL raw fallback" {
     const vectors = [_]struct { input: []const u8, expected: []const u8 }{
         .{ .input = "I\xc2\xadX", .expected = "IX" },

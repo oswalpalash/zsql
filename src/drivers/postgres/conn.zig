@@ -1677,7 +1677,11 @@ pub const Conn = struct {
                             try self.fillClientNonce(&nonce_buf);
                             scram_client = try scram.Client.init(
                                 self.allocator,
-                                config.user,
+                                // PostgreSQL authenticates the startup-packet
+                                // user and ignores SCRAM's username attribute.
+                                // Match libpq's empty value so role bytes never
+                                // need SASLprep or SASL-name escaping here.
+                                "",
                                 config.password,
                                 &nonce_buf,
                                 channel_binding,
