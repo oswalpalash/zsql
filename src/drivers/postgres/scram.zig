@@ -289,10 +289,13 @@ fn parseServerFinal(msg: []const u8) !ServerFinal {
     var seen = [_]bool{false} ** 256;
 
     var iter = std.mem.splitScalar(u8, msg, ',');
-    while (iter.next()) |part| {
+    var position: usize = 0;
+    while (iter.next()) |part| : (position += 1) {
         if (part.len < 2 or part[1] != '=') return error.ProtocolError;
         const key = part[0];
         if (!std.ascii.isAlphabetic(key) or seen[key]) return error.ProtocolError;
+        if (key == 'm') return error.AuthFailed;
+        if (position == 0 and key != 'v' and key != 'e') return error.ProtocolError;
         seen[key] = true;
         const value = part[2..];
         if (!isScramValue(value)) return error.ProtocolError;
@@ -314,10 +317,13 @@ fn parseServerFirst(msg: []const u8) !ServerFirst {
     var seen = [_]bool{false} ** 256;
 
     var iter = std.mem.splitScalar(u8, msg, ',');
-    while (iter.next()) |part| {
+    var position: usize = 0;
+    while (iter.next()) |part| : (position += 1) {
         if (part.len < 2 or part[1] != '=') return error.ProtocolError;
         const key = part[0];
         if (!std.ascii.isAlphabetic(key) or seen[key]) return error.ProtocolError;
+        if (key == 'm') return error.AuthFailed;
+        if (position < 3 and key != "rsi"[position]) return error.ProtocolError;
         seen[key] = true;
         const value = part[2..];
         if (!isScramValue(value)) return error.ProtocolError;
@@ -325,7 +331,6 @@ fn parseServerFirst(msg: []const u8) !ServerFirst {
             'r' => nonce = value,
             's' => salt = value,
             'i' => iterations = std.fmt.parseUnsigned(u32, value, 10) catch return error.ProtocolError,
-            'm' => return error.ProtocolError, // reserved extension must be rejected
             else => {},
         }
     }
@@ -364,6 +369,18 @@ test "SCRAM server-first attributes are unambiguous" {
     try std.testing.expectError(
         error.ProtocolError,
         parseServerFirst("r=client-server,s=c2FsdA==,i=4096,1=invalid"),
+    );
+    try std.testing.expectError(
+        error.ProtocolError,
+        parseServerFirst("s=c2FsdA==,r=client-server,i=4096"),
+    );
+    try std.testing.expectError(
+        error.ProtocolError,
+        parseServerFirst("x=early,r=client-server,s=c2FsdA==,i=4096"),
+    );
+    try std.testing.expectError(
+        error.AuthFailed,
+        parseServerFirst("m=required,r=client-server,s=c2FsdA==,i=4096"),
     );
 
     const parsed = try parseServerFirst("r=client-server,s=c2FsdA==,i=4096,x=optional");
@@ -646,6 +663,11 @@ test "SCRAM server-final parsing accepts extensions and rejects ambiguity" {
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("v=one,v=two"));
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("v=one,e=other-error"));
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("x=optional"));
+    try std.testing.expectError(
+        error.ProtocolError,
+        client.handleServerFinal("x=early,v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    );
+    try std.testing.expectError(error.AuthFailed, client.handleServerFinal("m=required,e=other-error"));
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("e=error,x=one,x=two"));
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("1=invalid"));
     try std.testing.expectError(error.ProtocolError, client.handleServerFinal("e="));
