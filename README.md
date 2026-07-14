@@ -407,6 +407,9 @@ preventing permanent `prepared statement does not exist` or `0A000` loops.
 SQLite (`-Denable-sqlite=true`) has the same `enableStmtCache` API, caching `sqlite3_stmt` handles.
 Schema-changing SQLite statements and scripts clear cached handles while keeping
 the configured cache enabled, preventing stale result-column metadata after DDL.
+Cache-borrowed copies release their temporary text/blob bytes and list capacity
+after every operation; explicit prepared statements retain only their own
+reusable scratch.
 
 Schema inspection (for offline checks):
 

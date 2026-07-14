@@ -1598,7 +1598,6 @@ pub const Stmt = struct {
         self.freeBindBuffers();
         _ = c.sqlite3_clear_bindings(self.handle);
         _ = c.sqlite3_reset(self.handle);
-        self.owned_bind_buffers.clearRetainingCapacity();
     }
 
     pub fn exec(self: *Stmt, binds: []const core.Value) !core.ExecResult {
@@ -1752,7 +1751,15 @@ pub const Stmt = struct {
         for (self.owned_bind_buffers.items) |buffer| {
             self.allocator.free(buffer);
         }
-        self.owned_bind_buffers.clearRetainingCapacity();
+        if (self.finalize_on_close) {
+            // Explicit statements retain scratch across calls.
+            self.owned_bind_buffers.clearRetainingCapacity();
+        } else {
+            // Cache borrows are value copies. They must release list capacity
+            // before the copy is discarded; the cache entry owns only handle.
+            self.owned_bind_buffers.deinit(self.allocator);
+            self.owned_bind_buffers = .empty;
+        }
     }
 };
 
@@ -2326,6 +2333,25 @@ test "SQLite prepared statement cache reuses handles" {
 
     conn.disableStmtCache();
     try std.testing.expectEqual(@as(usize, 0), conn.stmtCacheLen());
+}
+
+test "SQLite statement cache releases borrowed bind-list capacity" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    try conn.enableStmtCache(2);
+    _ = try conn.exec("create table cache_text (value text)", &.{});
+    _ = try conn.exec("insert into cache_text (value) values (?)", &.{.{ .text = "first" }});
+    _ = try conn.exec("insert into cache_text (value) values (?)", &.{.{ .text = "second" }});
+
+    var rows = try conn.query(
+        "select value from cache_text where value = ?",
+        &.{.{ .text = "second" }},
+    );
+    defer rows.deinit();
+    try std.testing.expectEqualStrings("second", try (try (try rows.next()).?.getName("value")).asText());
 }
 
 test "SQLite statement cache refreshes result metadata after schema change" {
