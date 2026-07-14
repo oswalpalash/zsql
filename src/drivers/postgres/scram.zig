@@ -193,9 +193,10 @@ pub const Client = struct {
 
     /// Validate server-final-message `v=...`.
     pub fn handleServerFinal(self: *const Client, server_final: []const u8) !void {
-        if (!std.mem.startsWith(u8, server_final, "v=")) return error.AuthFailed;
+        const parsed = try parseServerFinal(server_final);
+        if (parsed.server_error != null) return error.AuthFailed;
         const expected = self.server_signature_b64 orelse return error.AuthFailed;
-        const got = server_final[2..];
+        const got = parsed.verifier orelse return error.ProtocolError;
         if (!std.mem.eql(u8, got, expected)) return error.AuthFailed;
     }
 };
@@ -266,6 +267,33 @@ const ServerFirst = struct {
     salt_b64: []const u8,
     iterations: u32,
 };
+
+const ServerFinal = struct {
+    verifier: ?[]const u8,
+    server_error: ?[]const u8,
+};
+
+fn parseServerFinal(msg: []const u8) !ServerFinal {
+    var verifier: ?[]const u8 = null;
+    var server_error: ?[]const u8 = null;
+    var seen = [_]bool{false} ** 256;
+
+    var iter = std.mem.splitScalar(u8, msg, ',');
+    while (iter.next()) |part| {
+        if (part.len < 2 or part[1] != '=') return error.ProtocolError;
+        const key = part[0];
+        if (!std.ascii.isAlphabetic(key) or seen[key]) return error.ProtocolError;
+        seen[key] = true;
+        switch (key) {
+            'v' => verifier = part[2..],
+            'e' => server_error = part[2..],
+            else => {},
+        }
+    }
+
+    if ((verifier == null) == (server_error == null)) return error.ProtocolError;
+    return .{ .verifier = verifier, .server_error = server_error };
+}
 
 fn parseServerFirst(msg: []const u8) !ServerFirst {
     var nonce: ?[]const u8 = null;
@@ -526,6 +554,28 @@ test "SCRAM-SHA-256-PLUS uses tls-server-end-point cbind encoding" {
     try std.testing.expectEqualStrings(expected_b64, c_attr);
 
     try std.testing.expect(std.mem.indexOf(u8, client_final, ",p=") != null);
+}
+
+test "SCRAM server-final parsing accepts extensions and rejects ambiguity" {
+    var client = try Client.init(std.testing.allocator, "user", "pencil", "client-nonce", .none);
+    defer client.deinit();
+    const client_final = try client.handleServerFirst("r=client-nonce-server,s=c2FsdA==,i=1");
+    defer std.testing.allocator.free(client_final);
+
+    const with_extension = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "v={s},x=optional",
+        .{client.server_signature_b64.?},
+    );
+    defer std.testing.allocator.free(with_extension);
+    try client.handleServerFinal(with_extension);
+
+    try std.testing.expectError(error.AuthFailed, client.handleServerFinal("e=invalid-proof"));
+    try std.testing.expectError(error.ProtocolError, client.handleServerFinal("v=one,v=two"));
+    try std.testing.expectError(error.ProtocolError, client.handleServerFinal("v=one,e=other-error"));
+    try std.testing.expectError(error.ProtocolError, client.handleServerFinal("x=optional"));
+    try std.testing.expectError(error.ProtocolError, client.handleServerFinal("e=error,x=one,x=two"));
+    try std.testing.expectError(error.ProtocolError, client.handleServerFinal("1=invalid"));
 }
 
 test "tlsServerEndPointData hashes sha256-signed cert with SHA-256" {
