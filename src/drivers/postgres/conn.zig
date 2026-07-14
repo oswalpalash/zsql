@@ -2546,17 +2546,25 @@ pub const SimpleRow = struct {
     }
 
     /// Map into a Zig struct by column name, then ordinal fallback.
-    /// Supports up to 64 columns (stack-backed temporary view).
+    /// This decodes directly from the owned wire values without allocating or
+    /// imposing an arbitrary result-column limit.
     pub fn to(self: SimpleRow, comptime T: type) !T {
-        const max_cols = 64;
-        if (self.values.len > max_cols) return error.Unsupported;
+        const info = @typeInfo(T);
+        if (info != .@"struct") @compileError("SimpleRow.to expects a struct type");
+        if (self.column_names.len != self.values.len) return error.InvalidColumn;
 
-        var name_buf: [max_cols][]const u8 = undefined;
-        var value_buf: [max_cols]core.Value = undefined;
-        for (self.column_names, 0..) |n, i| name_buf[i] = n;
-        for (self.values, 0..) |owned, i| value_buf[i] = owned.borrowed();
-        const row = try core.Row.init(name_buf[0..self.column_names.len], value_buf[0..self.values.len]);
-        return row.to(T);
+        var result: T = undefined;
+        inline for (info.@"struct".fields, 0..) |field, ordinal| {
+            var index = ordinal;
+            for (self.column_names, 0..) |column_name, candidate| {
+                if (std.mem.eql(u8, column_name, field.name)) {
+                    index = candidate;
+                    break;
+                }
+            }
+            @field(result, field.name) = try core.decode(field.type, try self.valueAt(index));
+        }
+        return result;
     }
 
     /// Copy into an allocator-owned `core.OwnedRow`.
@@ -2800,6 +2808,29 @@ test "SimpleRow get/as/to map like core.Row" {
     var owned = try row.getOwned(std.testing.allocator);
     defer owned.deinit();
     try std.testing.expectEqual(@as(i64, 7), try owned.as(i64, 0));
+}
+
+test "SimpleRow to has no result-column width cap" {
+    var names: [65][]u8 = undefined;
+    var values: [65]core.OwnedValue = undefined;
+    for (&names, &values) |*name, *value| {
+        name.* = @constCast("unused");
+        value.* = .{ .null = {} };
+    }
+    names[64] = @constCast("tail");
+    values[64] = .{ .integer = 65 };
+
+    const row = SimpleRow{
+        .column_names = &names,
+        .values = &values,
+    };
+    const decoded = try row.to(struct { tail: i64 });
+    try std.testing.expectEqual(@as(i64, 65), decoded.tail);
+
+    try std.testing.expectError(error.InvalidColumn, (SimpleRow{
+        .column_names = names[0..64],
+        .values = &values,
+    }).to(struct {}));
 }
 
 test "captureSqlError stores OwnedDbError for lastError()" {

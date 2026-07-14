@@ -519,6 +519,8 @@ boundary. Every owned copy records or receives its allocator and must be
 released explicitly.
 
 Postgres `SimpleRow` exposes the same `get` / `getName` / `as` / `asName` / `to` / `getOwned` surface.
+Its struct mapping decodes directly from owned wire values without allocation
+or an arbitrary result-column width cap.
 PostgreSQL `bytea` is allocator-owned by `SimpleRows` and decoded to the original
 bytes for both server `hex` and `escape` output modes; wire hex characters are
 never exposed as blob contents.
