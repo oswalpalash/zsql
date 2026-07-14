@@ -17,6 +17,7 @@ test "$provenance_version" = "$expected_version"
 test "$provenance_sqlite" = "disabled"
 grep -q '^[[:space:]]*\.optimize = "Debug",[[:space:]]*$' "$provenance"
 grep -q '^[[:space:]]*\.strip = false,[[:space:]]*$' "$provenance"
+grep -q '^[[:space:]]*\.source_revision = null,[[:space:]]*$' "$provenance"
 doctor_output=$("$prefix/bin/zsql" doctor)
 actual_version=$(printf '%s\n' "$doctor_output" | sed -n 's/^  version: //p')
 if [ "$actual_version" != "$expected_version" ]; then

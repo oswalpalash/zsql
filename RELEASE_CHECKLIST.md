@@ -12,6 +12,9 @@ push a tag until every required item is complete.
 - [ ] Move shipped entries out of `Unreleased` in the public release notes or
   prepare the GitHub release notes from the local changelog.
 - [ ] Confirm `README.md` installation and minimum Zig version are current.
+- [ ] For installed release artifacts, pass
+  `-Dsource-revision=$(git rev-parse HEAD)` and confirm `share/zsql/build.zon`
+  records the exact tagged commit.
 
 The license item is intentionally unresolved. Legal terms are an owner choice;
 automation must not select them.

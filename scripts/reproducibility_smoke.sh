@@ -4,6 +4,7 @@ set -eu
 zig_exe=${1:?usage: reproducibility_smoke.sh /path/to/zig}
 root=$(mktemp -d "${TMPDIR:-/tmp}/zsql-reproducibility-smoke.XXXXXX")
 trap 'rm -rf "$root"' EXIT HUP INT TERM
+source_revision=0123456789abcdef0123456789abcdef01234567
 
 build_release() {
     prefix=$1
@@ -11,6 +12,7 @@ build_release() {
     "$zig_exe" build \
         -Doptimize=ReleaseSafe \
         -Dstrip=true \
+        -Dsource-revision="$source_revision" \
         -p "$prefix" \
         --cache-dir "$cache"
 }
@@ -34,3 +36,5 @@ test -f "$root/out-b/share/zsql/build.zon"
 cmp "$root/out-a/bin/zsql" "$root/out-b/bin/zsql"
 cmp "$root/out-a/lib/libzsql.a" "$root/out-b/lib/libzsql.a"
 cmp "$root/out-a/share/zsql/build.zon" "$root/out-b/share/zsql/build.zon"
+grep -q "^[[:space:]]*\\.source_revision = \"$source_revision\",[[:space:]]*$" \
+    "$root/out-a/share/zsql/build.zon"

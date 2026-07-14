@@ -19,6 +19,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug information from installed artifacts") orelse false;
+    const source_revision = b.option([]const u8, "source-revision", "Record a 40- or 64-digit lowercase hexadecimal source revision");
+    if (source_revision) |revision| {
+        if (!isValidSourceRevision(revision)) {
+            @panic("-Dsource-revision must be 40 or 64 lowercase hexadecimal digits");
+        }
+    }
     // Default builds (enable-sqlite=false) must remain free of libc so the
     // CLI and library install cleanly without system SQLite. Do not call
     // std.c.* from code paths compiled into the default package.
@@ -41,6 +47,10 @@ pub fn build(b: *std.Build) void {
         "system"
     else
         "bundled";
+    const source_revision_zon = if (source_revision) |revision|
+        b.fmt("\"{s}\"", .{revision})
+    else
+        "null";
     const provenance_files = b.addWriteFiles();
     const provenance_file = provenance_files.add("build.zon", b.fmt(
         \\.{{
@@ -52,6 +62,7 @@ pub fn build(b: *std.Build) void {
         \\    .build = .{{
         \\        .zig_version = "{s}",
         \\        .target = "{s}",
+        \\        .source_revision = {s},
         \\        .optimize = "{s}",
         \\        .strip = {},
         \\        .sqlite = "{s}",
@@ -62,6 +73,7 @@ pub fn build(b: *std.Build) void {
         package_version,
         builtin.zig_version_string,
         target_triple,
+        source_revision_zon,
         @tagName(optimize),
         strip,
         sqlite_mode,
@@ -113,6 +125,11 @@ pub fn build(b: *std.Build) void {
     const version_sync_step = b.step("version-sync", "Verify package and generated CLI versions match");
     version_sync_step.dependOn(&version_sync_test.step);
     test_step.dependOn(&version_sync_test.step);
+
+    const provenance_validation = b.addSystemCommand(&.{ "sh", "scripts/test_provenance.sh", b.graph.zig_exe });
+    const provenance_validation_step = b.step("provenance-validation", "Validate accepted and rejected source revision metadata");
+    provenance_validation_step.dependOn(&provenance_validation.step);
+    test_step.dependOn(&provenance_validation.step);
 
     // Convenience aliases used in docs / local workflows.
     const test_core_step = b.step("test-core", "Alias for zig build test (driver-agnostic + postgres unit tests)");
@@ -304,6 +321,14 @@ pub fn build(b: *std.Build) void {
     release_verify.step.dependOn(&release_verify_test.step);
     const release_verify_step = b.step("release-verify", "Run every deterministic pre-tag release gate");
     release_verify_step.dependOn(&release_verify.step);
+}
+
+fn isValidSourceRevision(revision: []const u8) bool {
+    if (revision.len != 40 and revision.len != 64) return false;
+    for (revision) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
 }
 
 fn buildSqliteAmalgamation(

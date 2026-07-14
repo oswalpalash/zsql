@@ -9,7 +9,7 @@ coverage; PostgreSQL rows marked live also run against PostgreSQL 16 in CI.
 | Capability | Status | Public evidence | Test or example evidence |
 | --- | --- | --- | --- |
 | Package consumption | Complete | Zig package module `zsql`; propagated core/bundled/system SQLite dependency options; documented `zig fetch --save=zsql` setup | separate-package public-name compile contract plus core and leak-checked SQLite executables via `consumer-smoke` / `consumer-smoke-system` in CI |
-| Installed distribution | Complete | installed static library, `zsql` CLI, and machine-readable `share/zsql/build.zon`; no repository-relative runtime resources | clean-prefix `install-smoke` validates provenance and runs installed `zsql doctor` in CI |
+| Installed distribution | Complete | installed static library, `zsql` CLI, and machine-readable `share/zsql/build.zon`; optional validated `-Dsource-revision`; no repository-relative runtime resources | clean-prefix `install-smoke` validates null/default provenance; reproducibility gate validates explicit revision; configure-only validation rejects wrong-length, uppercase, and non-hex revisions; installed `zsql doctor` runs in CI |
 | Target portability | Complete for release gate | core library and CLI cross-build for `x86_64-windows` and static `aarch64-linux-musl`, both libc-free by default and with bundled SQLite | isolated-prefix four-cell `portability-smoke` is part of `release-verify` in CI |
 | Native artifact reproducibility | Complete for stripped `ReleaseSafe` gate | public `-Dstrip=true` install mode removes debug paths; installed archives canonicalize Zig 0.16's cache-derived member name | `reproducibility-smoke` compares CLI, static-library, and provenance bytes across separate local caches and prefixes |
 | Version integrity | Complete | `build.zig.zon` release version projected into `zsql.version` and CLI doctor | `version-sync` source gate plus installed-doctor manifest comparison |
@@ -51,6 +51,7 @@ remain as compatibility aliases.
 | All service-free examples | `zig build examples -Denable-sqlite=true` |
 | Cross-target distribution | `zig build portability-smoke` |
 | Stripped native reproducibility | `zig build reproducibility-smoke` |
+| Provenance validation | `zig build provenance-validation` |
 
 ## Deliberate boundaries
 

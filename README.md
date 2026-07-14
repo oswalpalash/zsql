@@ -51,7 +51,11 @@ façade and driver lifecycle declarations before exercising runtime behavior.
 temporary prefix and runs the installed `zsql doctor`, ensuring distribution
 artifacts do not depend on repository-relative files. Every install also writes
 `share/zsql/build.zon` with its package version, Zig version, target,
-optimization, strip policy, and SQLite linkage mode.
+optimization, strip policy, SQLite linkage mode, and optional source revision.
+Release builders can pass a validated 40- or 64-digit lowercase hexadecimal
+revision with `-Dsource-revision=<revision>`; ordinary builds record `null` and
+never require Git metadata. `zig build provenance-validation` checks accepted
+and rejected revision forms without compiling artifacts.
 `zig build portability-smoke` cross-builds the installed library and CLI for
 `x86_64-windows` and static `aarch64-linux-musl` in isolated prefixes, both
 with the libc-free default configuration and with bundled SQLite enabled.
