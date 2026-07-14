@@ -484,6 +484,8 @@ Unsafe raw append is named `rawUnsafe` on purpose.
 `bind` owns copied text/blob payloads and is failure-atomic: allocation failure
 leaves SQL, bind order, ownership, and the next PostgreSQL placeholder unchanged,
 so callers may handle OOM and retry the same builder safely.
+Identifier methods have the same retry contract: invalid later path segments or
+allocation failure never leave a partial quoted identifier in the SQL buffer.
 
 ### Query hooks
 

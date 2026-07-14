@@ -50,11 +50,15 @@ pub const QueryBuilder = struct {
     }
 
     pub fn ident(self: *QueryBuilder, name: []const u8) !void {
+        const sql_len = self.sql.items.len;
+        errdefer self.sql.shrinkRetainingCapacity(sql_len);
         try quoteIdent(&self.sql, self.allocator, name);
     }
 
     /// Quote a dotted path such as `schema.table.column`.
     pub fn identPath(self: *QueryBuilder, path: []const u8) !void {
+        const sql_len = self.sql.items.len;
+        errdefer self.sql.shrinkRetainingCapacity(sql_len);
         var first = true;
         var iter = std.mem.splitScalar(u8, path, '.');
         while (iter.next()) |part| {
@@ -68,6 +72,8 @@ pub const QueryBuilder = struct {
     /// Quote each path segment separately: `identSegments(&.{ "public", "users" })`
     /// → `"public"."users"`. Prefer this when segments are already split.
     pub fn identSegments(self: *QueryBuilder, segments: []const []const u8) !void {
+        const sql_len = self.sql.items.len;
+        errdefer self.sql.shrinkRetainingCapacity(sql_len);
         if (segments.len == 0) return error.InvalidArguments;
         for (segments, 0..) |part, i| {
             if (part.len == 0) return error.InvalidArguments;
@@ -406,4 +412,74 @@ test "QueryBuilder.bind is failure-atomic and retryable" {
             );
         }
     }
+}
+
+const IdentifierOperation = enum { single, path, segments };
+
+const long_identifier = "a\"bcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const quoted_long_identifier = "\"a\"\"bcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\"";
+
+fn appendTestIdentifier(qb: *QueryBuilder, operation: IdentifierOperation) !void {
+    switch (operation) {
+        .single => try qb.ident(long_identifier),
+        .path => try qb.identPath("public." ++ long_identifier),
+        .segments => try qb.identSegments(&.{ "public", long_identifier }),
+    }
+}
+
+fn expectedTestIdentifier(operation: IdentifierOperation) []const u8 {
+    return switch (operation) {
+        .single => "x" ++ quoted_long_identifier,
+        .path, .segments => "x\"public\"." ++ quoted_long_identifier,
+    };
+}
+
+test "QueryBuilder identifier writes are failure-atomic and retryable" {
+    inline for (.{ IdentifierOperation.single, .path, .segments }) |operation| {
+        var saw_allocation_failure = false;
+        for (0..16) |fail_index| {
+            var qb = QueryBuilder.init(std.testing.allocator, .postgres);
+            try qb.sql.ensureTotalCapacityPrecise(std.testing.allocator, 1);
+            qb.sql.appendAssumeCapacity('x');
+
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+                .fail_index = fail_index,
+            });
+            qb.allocator = failing.allocator();
+            defer {
+                qb.allocator = std.testing.allocator;
+                qb.deinit();
+            }
+
+            if (appendTestIdentifier(&qb, operation)) |_| {
+                try std.testing.expect(!failing.has_induced_failure);
+            } else |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expect(failing.has_induced_failure);
+                saw_allocation_failure = true;
+                try std.testing.expectEqualStrings("x", qb.sqlSlice());
+
+                failing.fail_index = std.math.maxInt(usize);
+                try appendTestIdentifier(&qb, operation);
+            }
+            try std.testing.expectEqualStrings(expectedTestIdentifier(operation), qb.sqlSlice());
+        }
+        try std.testing.expect(saw_allocation_failure);
+    }
+}
+
+test "QueryBuilder invalid identifier paths leave SQL unchanged" {
+    var qb = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer qb.deinit();
+    try qb.appendTrustedSql("select ");
+
+    try std.testing.expectError(error.InvalidArguments, qb.identPath("valid."));
+    try std.testing.expectEqualStrings("select ", qb.sqlSlice());
+    try std.testing.expectError(error.InvalidArguments, qb.identPath("valid.bad\x00name"));
+    try std.testing.expectEqualStrings("select ", qb.sqlSlice());
+    try std.testing.expectError(error.InvalidArguments, qb.identSegments(&.{ "valid", "" }));
+    try std.testing.expectEqualStrings("select ", qb.sqlSlice());
+
+    try qb.identSegments(&.{ "valid", "name" });
+    try std.testing.expectEqualStrings("select \"valid\".\"name\"", qb.sqlSlice());
 }
