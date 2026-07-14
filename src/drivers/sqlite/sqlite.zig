@@ -1658,13 +1658,14 @@ pub const Stmt = struct {
 
     pub fn bindNamedValues(self: *Stmt, binds: []const NamedValue) !void {
         try self.requireAvailable();
-        try self.validateNamedBindCount(binds);
+        const indices = try self.resolveNamedBindIndices(binds);
+        defer self.allocator.free(indices);
         self.freeBindBuffers();
         _ = c.sqlite3_clear_bindings(self.handle);
         _ = c.sqlite3_reset(self.handle);
 
-        for (binds) |bind| {
-            try self.bindValue(try self.namedBindIndex(bind.name), bind.value);
+        for (binds, indices) |bind, index| {
+            try self.bindValue(index, bind.value);
         }
     }
 
@@ -1679,16 +1680,19 @@ pub const Stmt = struct {
         }
     }
 
-    fn validateNamedBindCount(self: Stmt, binds: []const NamedValue) !void {
+    fn resolveNamedBindIndices(self: Stmt, binds: []const NamedValue) ![]c_int {
         const count = try sqliteParameterCount(self.handle);
         if (binds.len != count) return error.BindCountMismatch;
 
+        const indices = try self.allocator.alloc(c_int, binds.len);
+        errdefer self.allocator.free(indices);
         for (binds, 0..) |bind, index| {
-            _ = try self.namedBindIndex(bind.name);
+            indices[index] = try self.namedBindIndex(bind.name);
             for (binds[0..index]) |previous| {
                 if (sameBindName(bind.name, previous.name)) return error.InvalidBindValue;
             }
         }
+        return indices;
     }
 
     fn namedBindIndex(self: Stmt, name: []const u8) !c_int {
@@ -2853,8 +2857,8 @@ test "SQLite bare named binds support long names with bounded allocation" {
     var stmt = try conn.prepare(sql);
     defer stmt.close();
 
-    // Validation and binding each resolve the bare name. Every resolution uses
-    // one buffer while probing all marker forms, so two allocations suffice.
+    // One index slice plus one marker-probe buffer suffice; binding reuses the
+    // resolved index instead of looking the name up a second time.
     failing.fail_index = failing.alloc_index + 2;
     try stmt.bindNamedValues(&.{.{ .name = name, .value = .{ .integer = 42 } }});
     try std.testing.expect(!failing.has_induced_failure);
@@ -2872,6 +2876,42 @@ test "SQLite bare named binds support long names with bounded allocation" {
     try stmt.bindNamedValues(&.{.{ .name = name, .value = .{ .integer = 42 } }});
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt.handle));
     try std.testing.expectEqual(@as(i64, 42), c.sqlite3_column_int64(stmt.handle, 0));
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_reset(stmt.handle));
+}
+
+test "SQLite named binds resolve once before statement mutation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var db = try Database.open(failing.allocator(), .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+    var stmt = try conn.prepare("select @first, :second, $third");
+    defer stmt.close();
+
+    const valid = [_]NamedValue{
+        .{ .name = "first", .value = .{ .integer = 1 } },
+        .{ .name = "second", .value = .{ .integer = 2 } },
+        .{ .name = "third", .value = .{ .integer = 3 } },
+    };
+    // One index slice and one marker-probe buffer per name. The former second
+    // lookup pass required six allocations for these three bare names.
+    failing.fail_index = failing.alloc_index + 4;
+    try stmt.bindNamedValues(&valid);
+    try std.testing.expect(!failing.has_induced_failure);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectError(error.InvalidBindValue, stmt.bindNamedValues(&.{
+        valid[0],
+        .{ .name = "missing", .value = .{ .integer = 99 } },
+        valid[2],
+    }));
+
+    // Failed validation occurs before clear/reset/bind, so the previous values
+    // remain intact and executable.
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt.handle));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt.handle, 0));
+    try std.testing.expectEqual(@as(i64, 2), c.sqlite3_column_int64(stmt.handle, 1));
+    try std.testing.expectEqual(@as(i64, 3), c.sqlite3_column_int64(stmt.handle, 2));
     try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_reset(stmt.handle));
 }
 

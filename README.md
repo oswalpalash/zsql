@@ -196,9 +196,10 @@ var db = try zsql.drivers.sqlite.Database.open(allocator, .{
 SQLite extended result codes map unique/primary-key, foreign-key, not-null, and
 check failures to the corresponding public `zsql.Error` categories.
 Bare SQLite named binds may match `:`, `@`, or `$` parameters of any length
-SQLite accepts. Marker probing uses one temporary allocation per resolution,
-and allocation failure remains `error.OutOfMemory` rather than a bind-name
-error.
+SQLite accepts. Each name is resolved once into a prevalidated index slice
+before SQLite bindings are cleared or changed. Marker probing uses one
+temporary allocation per name, and allocation failure remains
+`error.OutOfMemory` rather than a bind-name error.
 
 SQLite `Stmt.query` / `queryNamed` borrow and temporarily mark the prepared
 statement busy. Keep the `Stmt` at a stable address until `Rows.deinit`; rows
