@@ -271,11 +271,14 @@ fn parseServerFirst(msg: []const u8) !ServerFirst {
     var nonce: ?[]const u8 = null;
     var salt: ?[]const u8 = null;
     var iterations: ?u32 = null;
+    var seen = [_]bool{false} ** 256;
 
     var iter = std.mem.splitScalar(u8, msg, ',');
     while (iter.next()) |part| {
         if (part.len < 2 or part[1] != '=') return error.ProtocolError;
         const key = part[0];
+        if (!std.ascii.isAlphabetic(key) or seen[key]) return error.ProtocolError;
+        seen[key] = true;
         const value = part[2..];
         switch (key) {
             'r' => nonce = value,
@@ -291,6 +294,27 @@ fn parseServerFirst(msg: []const u8) !ServerFirst {
         .salt_b64 = salt orelse return error.ProtocolError,
         .iterations = iterations orelse return error.ProtocolError,
     };
+}
+
+test "SCRAM server-first attributes are unambiguous" {
+    const duplicate_messages = [_][]const u8{
+        "r=client-server,r=other,s=c2FsdA==,i=4096",
+        "r=client-server,s=c2FsdA==,s=b3RoZXI=,i=4096",
+        "r=client-server,s=c2FsdA==,i=4096,i=8192",
+        "r=client-server,s=c2FsdA==,i=4096,x=one,x=two",
+    };
+    for (duplicate_messages) |msg| {
+        try std.testing.expectError(error.ProtocolError, parseServerFirst(msg));
+    }
+    try std.testing.expectError(
+        error.ProtocolError,
+        parseServerFirst("r=client-server,s=c2FsdA==,i=4096,1=invalid"),
+    );
+
+    const parsed = try parseServerFirst("r=client-server,s=c2FsdA==,i=4096,x=optional");
+    try std.testing.expectEqualStrings("client-server", parsed.nonce);
+    try std.testing.expectEqualStrings("c2FsdA==", parsed.salt_b64);
+    try std.testing.expectEqual(@as(u32, 4096), parsed.iterations);
 }
 
 /// Scan AuthenticationSASL mechanism list for SCRAM variants.
