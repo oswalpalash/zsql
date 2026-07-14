@@ -14,7 +14,7 @@ push a tag until every required item is complete.
 - [ ] Confirm `README.md` installation and minimum Zig version are current.
 - [ ] For installed release artifacts, pass
   `-Dsource-revision=$(git rev-parse HEAD)` and confirm `share/zsql/build.zon`
-  and `zsql doctor` record the exact tagged commit.
+  and both `zsql doctor` formats record the exact tagged commit.
 
 The license item is intentionally unresolved. Legal terms are an owner choice;
 automation must not select them.

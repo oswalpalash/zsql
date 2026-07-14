@@ -41,3 +41,5 @@ grep -q "^[[:space:]]*\\.source_revision = \"$source_revision\",[[:space:]]*$" \
 doctor_output=$("$root/out-a/bin/zsql" doctor)
 actual_revision=$(printf '%s\n' "$doctor_output" | sed -n 's/^  source revision: //p')
 test "$actual_revision" = "$source_revision"
+"$root/out-a/bin/zsql" doctor --zon > "$root/doctor.zon"
+cmp "$root/out-a/share/zsql/build.zon" "$root/doctor.zon"

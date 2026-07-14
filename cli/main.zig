@@ -21,7 +21,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (std.mem.eql(u8, command, "doctor")) {
-        try cmdDoctor(io);
+        const mode = parseDoctorMode(args.next(), args.next()) catch {
+            try writeOut(io, .stderr, "usage: zsql doctor [--zon]\n");
+            return error.InvalidArguments;
+        };
+        switch (mode) {
+            .human => try cmdDoctor(io),
+            .zon => try writeOut(io, .stdout, cli_options.build_provenance),
+        }
         return;
     }
     if (std.mem.eql(u8, command, "migrate")) {
@@ -60,6 +67,19 @@ pub fn main(init: std.process.Init) !void {
 }
 
 const Stream = enum { stdout, stderr };
+
+const DoctorMode = enum { human, zon };
+
+fn parseDoctorMode(first: ?[]const u8, second: ?[]const u8) !DoctorMode {
+    if (first == null and second == null) return .human;
+    if (first != null and
+        std.mem.eql(u8, first.?, "--zon") and
+        second == null)
+    {
+        return .zon;
+    }
+    return error.InvalidArguments;
+}
 
 fn writeOut(io: std.Io, stream: Stream, bytes: []const u8) !void {
     const file = switch (stream) {
@@ -140,7 +160,7 @@ fn printHelp(io: std.Io) !void {
         \\zsql — explicit SQL toolkit for Zig
         \\
         \\Usage:
-        \\  zsql doctor
+        \\  zsql doctor [--zon]
         \\  zsql migrate new <name>
         \\  zsql migrate status --database <path> [--dir migrations]
         \\  zsql migrate up --database <path> [--dir migrations]
@@ -223,6 +243,13 @@ fn cmdDoctor(io: std.Io) !void {
     try writeOut(io, .stdout, "  query builder: yes\n");
     try writeOut(io, .stdout, "  offline check helpers: yes\n");
     try writeOut(io, .stdout, "ok\n");
+}
+
+test "doctor mode parsing is strict" {
+    try std.testing.expectEqual(DoctorMode.human, try parseDoctorMode(null, null));
+    try std.testing.expectEqual(DoctorMode.zon, try parseDoctorMode("--zon", null));
+    try std.testing.expectError(error.InvalidArguments, parseDoctorMode("extra", null));
+    try std.testing.expectError(error.InvalidArguments, parseDoctorMode("--zon", "extra"));
 }
 
 fn cmdMigrateNew(init: std.process.Init, name: []const u8) !void {

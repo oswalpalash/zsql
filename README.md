@@ -58,6 +58,9 @@ never require Git metadata. `zig build provenance-validation` checks accepted
 and rejected revision forms without compiling artifacts. The CLI reports the
 recorded value—or `unrecorded`—through `zsql doctor`; this is a CLI-private build
 option and does not add a public library symbol.
+`zsql doctor --zon` emits the exact embedded `build.zon` bytes for automation;
+the install and reproducibility gates compare the output byte-for-byte with the
+installed file. Unknown or extra doctor arguments are rejected.
 `zig build portability-smoke` cross-builds the installed library and CLI for
 `x86_64-windows` and static `aarch64-linux-musl` in isolated prefixes, both
 with the libc-free default configuration and with bundled SQLite enabled.

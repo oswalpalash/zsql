@@ -18,6 +18,12 @@ test "$provenance_sqlite" = "disabled"
 grep -q '^[[:space:]]*\.optimize = "Debug",[[:space:]]*$' "$provenance"
 grep -q '^[[:space:]]*\.strip = false,[[:space:]]*$' "$provenance"
 grep -q '^[[:space:]]*\.source_revision = null,[[:space:]]*$' "$provenance"
+"$prefix/bin/zsql" doctor --zon > "$prefix/doctor.zon"
+cmp "$provenance" "$prefix/doctor.zon"
+if "$prefix/bin/zsql" doctor --zon extra >/dev/null 2>&1; then
+    echo "doctor accepted extra machine-readable arguments" >&2
+    exit 1
+fi
 doctor_output=$("$prefix/bin/zsql" doctor)
 actual_version=$(printf '%s\n' "$doctor_output" | sed -n 's/^  version: //p')
 actual_revision=$(printf '%s\n' "$doctor_output" | sed -n 's/^  source revision: //p')

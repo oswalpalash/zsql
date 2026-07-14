@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
     else
         "null";
     const provenance_files = b.addWriteFiles();
-    const provenance_file = provenance_files.add("build.zon", b.fmt(
+    const provenance_contents = b.fmt(
         \\.{{
         \\    .format_version = 1,
         \\    .package = .{{
@@ -77,7 +77,8 @@ pub fn build(b: *std.Build) void {
         @tagName(optimize),
         strip,
         sqlite_mode,
-    }));
+    });
+    const provenance_file = provenance_files.add("build.zon", provenance_contents);
     b.getInstallStep().dependOn(&b.addInstallFile(provenance_file, "share/zsql/build.zon").step);
 
     // Build the amalgamation static library once when requested. Lazy so
@@ -144,6 +145,7 @@ pub fn build(b: *std.Build) void {
     });
     const cli_options = b.addOptions();
     cli_options.addOption([]const u8, "source_revision", source_revision orelse "unrecorded");
+    cli_options.addOption([]const u8, "build_provenance", provenance_contents);
     cli_mod.addOptions("zsql_cli_options", cli_options);
     cli_mod.addImport("zsql", zsql_mod);
     if (enable_sqlite) {
