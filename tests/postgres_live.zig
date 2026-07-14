@@ -796,6 +796,63 @@ test "postgres live: migrator rejects incomplete and out of order plans" {
     try conn.ping();
 }
 
+test "postgres live: migration unlock failure is surfaced and releases session" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa_state.deinit() == .ok);
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var locked_conn = try pg.Conn.open(failing.allocator(), std.testing.io, config);
+    defer locked_conn.deinit();
+    _ = try locked_conn.exec("drop table if exists zsql_migrations");
+    const locked_migrator = pg.Migrator.init(&locked_conn);
+
+    const FailAfterCommit = struct {
+        allocator: *std.testing.FailingAllocator,
+        armed: bool = false,
+
+        fn after(raw: ?*anyopaque, end: zsql.QueryEnd) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.armed or !std.mem.eql(u8, end.sql, "commit")) return;
+            self.armed = true;
+            self.allocator.fail_index = self.allocator.alloc_index;
+        }
+    };
+    var fail_after_commit = FailAfterCommit{ .allocator = &failing };
+    locked_conn.setHooks(.{
+        .ctx = &fail_after_commit,
+        .after_query = FailAfterCommit.after,
+    });
+
+    // The empty apply commits successfully while holding the advisory lock.
+    // Fail before the unlock packet can be built: apply must surface cleanup
+    // failure and close the session rather than report false success.
+    try std.testing.expectError(error.OutOfMemory, locked_migrator.apply(&.{}));
+    try std.testing.expect(fail_after_commit.armed);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(!locked_conn.isReusable());
+
+    // A separate session can immediately acquire the same global lock only if
+    // closing the failed session released it server-side.
+    var verifier = try pg.Conn.open(allocator, std.testing.io, config);
+    defer verifier.deinit();
+    defer _ = verifier.exec("drop table if exists zsql_migrations") catch {};
+    var acquired = try verifier.queryOneParams(
+        "select pg_try_advisory_lock($1::int, $2::int) as acquired",
+        &.{
+            .{ .integer = pg.migrate.advisory_lock_class },
+            .{ .integer = pg.migrate.advisory_lock_id },
+        },
+    );
+    defer acquired.deinit();
+    try std.testing.expect(try (try acquired.getName("acquired")).asBool());
+    try pg.Migrator.init(&verifier).unlock();
+}
+
 test "postgres live: inspected schema survives connection teardown" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer std.debug.assert(gpa_state.deinit() == .ok);

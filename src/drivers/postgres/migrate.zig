@@ -66,6 +66,11 @@ pub const Migrator = struct {
     /// Acquire the session advisory lock used to serialize migration applies.
     /// Uses `queryParams` because `pg_advisory_lock` is invoked via SELECT.
     pub fn lock(self: Migrator) !void {
+        // Once the query reaches PostgreSQL, a client-side allocation or
+        // protocol failure can make lock ownership uncertain. Closing the
+        // session is the only unconditional way to release a possibly-held
+        // session advisory lock.
+        errdefer self.conn.deinit();
         var rows = try self.conn.queryParams(
             "select pg_advisory_lock($1::int, $2::int)",
             &.{
@@ -75,20 +80,25 @@ pub const Migrator = struct {
         );
         defer rows.deinit();
         // Function returns void; drain the single empty-ish result row if any.
-        _ = rows.next();
+        _ = rows.next() orelse return error.ProtocolError;
+        if (rows.next() != null) return error.ProtocolError;
     }
 
-    /// Release the session advisory lock. Safe to call if the lock is held.
-    pub fn unlock(self: Migrator) void {
-        var rows = self.conn.queryParams(
-            "select pg_advisory_unlock($1::int, $2::int)",
+    /// Release and verify the session advisory lock. Any failure closes the
+    /// connection so uncertain ownership cannot strand the global lock.
+    pub fn unlock(self: Migrator) !void {
+        errdefer self.conn.deinit();
+        var rows = try self.conn.queryParams(
+            "select pg_advisory_unlock($1::int, $2::int) as unlocked",
             &.{
                 .{ .integer = advisory_lock_class },
                 .{ .integer = advisory_lock_id },
             },
-        ) catch return;
+        );
         defer rows.deinit();
-        _ = rows.next();
+        const row = rows.next() orelse return error.ProtocolError;
+        if (!try (try row.value("unlocked")).asBool()) return error.ProtocolError;
+        if (rows.next() != null) return error.ProtocolError;
     }
 
     pub fn status(self: Migrator, allocator: std.mem.Allocator) !MigrationStatus {
@@ -150,7 +160,8 @@ pub const Migrator = struct {
     pub fn apply(self: Migrator, migrations: []const core.migrate.MigrationFile) !ApplyResult {
         try self.ensureTable();
         try self.lock();
-        defer self.unlock();
+        var lock_held = true;
+        defer if (lock_held) self.unlock() catch {};
 
         // Re-validate under the lock so concurrent migrators see each other's work.
         try self.validate(migrations);
@@ -159,7 +170,7 @@ pub const Migrator = struct {
         defer st.deinit();
 
         var active_migration: ?core.migrate.MigrationFile = null;
-        return self.applyTransaction(migrations, st.records, &active_migration) catch |apply_err| {
+        const result = self.applyTransaction(migrations, st.records, &active_migration) catch |apply_err| {
             if (active_migration) |migration| {
                 return core.migrate.dirtyFailure(
                     self,
@@ -170,6 +181,12 @@ pub const Migrator = struct {
             }
             return apply_err;
         };
+        self.unlock() catch |err| {
+            lock_held = false;
+            return err;
+        };
+        lock_held = false;
+        return result;
     }
 
     fn applyTransaction(
@@ -242,7 +259,8 @@ pub const Migrator = struct {
     pub fn repairDirty(self: Migrator, version: u64, expected_checksum: core.migrate.Checksum) !void {
         try self.ensureTable();
         try self.lock();
-        defer self.unlock();
+        var lock_held = true;
+        defer if (lock_held) self.unlock() catch {};
 
         try self.conn.begin();
         errdefer self.conn.rollbackIfOpen();
@@ -268,6 +286,11 @@ pub const Migrator = struct {
         );
         if (result.rows_affected != 1) return error.MigrationVersionConflict;
         try self.conn.commit();
+        self.unlock() catch |err| {
+            lock_held = false;
+            return err;
+        };
+        lock_held = false;
     }
 
     /// Alias for `apply` matching the public API target (`Migrator.up`).

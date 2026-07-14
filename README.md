@@ -731,7 +731,11 @@ precedence over the original SQL error: zsql never reports the original failure
 as durably guarded when it could not record the guard.
 SQLite acquires `BEGIN IMMEDIATE` before reading or validating migration history,
 so a waiter cannot apply from a stale pre-lock snapshot. PostgreSQL performs the
-same revalidation after acquiring its session advisory lock.
+same revalidation after acquiring its session advisory lock. PostgreSQL verifies
+that advisory unlock actually succeeded. If lock acquisition or release becomes
+uncertain because of allocation, transport, or protocol failure, zsql closes the
+session so the global migration lock cannot remain stranded; a successful
+migration never hides an unlock failure.
 Migration plans must be strictly increasing and complete for the recorded
 history. Duplicate or descending versions, a renamed/missing applied migration,
 or a newly introduced pending version below the highest applied version return
