@@ -737,6 +737,65 @@ test "postgres live: migrator applies pending files" {
     try std.testing.expect(!status.records[0].dirty);
 }
 
+test "postgres live: migrator rejects incomplete and out of order plans" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa_state.deinit() == .ok);
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, std.testing.io, config);
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists zsql_ordered_v1");
+    _ = try conn.exec("drop table if exists zsql_ordered_v2");
+    _ = try conn.exec("drop table if exists zsql_migrations");
+    defer _ = conn.exec("drop table if exists zsql_ordered_v1") catch {};
+    defer _ = conn.exec("drop table if exists zsql_ordered_v2") catch {};
+    defer _ = conn.exec("drop table if exists zsql_migrations") catch {};
+
+    const first_sql = "create table zsql_ordered_v1 (id bigint primary key)";
+    const second_sql = "create table zsql_ordered_v2 (id bigint primary key)";
+    const first: zsql.migrate.MigrationFile = .{
+        .id = .{ .version = 1, .name = "ordered_v1", .filename = "V0001__ordered_v1.sql" },
+        .sql = first_sql,
+        .checksum = zsql.migrate.checksumSql(first_sql),
+    };
+    const second: zsql.migrate.MigrationFile = .{
+        .id = .{ .version = 2, .name = "ordered_v2", .filename = "V0002__ordered_v2.sql" },
+        .sql = second_sql,
+        .checksum = zsql.migrate.checksumSql(second_sql),
+    };
+    const migrator = pg.Migrator.init(&conn);
+
+    try std.testing.expectError(
+        error.MigrationVersionConflict,
+        migrator.apply(&[_]zsql.migrate.MigrationFile{ second, first }),
+    );
+    var absent_both = try conn.queryOneParams(
+        "select (to_regclass('zsql_ordered_v1') is null and to_regclass('zsql_ordered_v2') is null) as absent",
+        &.{},
+    );
+    defer absent_both.deinit();
+    try std.testing.expect(try (try absent_both.getName("absent")).asBool());
+
+    try std.testing.expectEqual(@as(usize, 1), (try migrator.apply(&.{second})).applied);
+    try std.testing.expectError(error.MigrationVersionConflict, migrator.validate(&.{}));
+    try std.testing.expectError(
+        error.MigrationVersionConflict,
+        migrator.apply(&[_]zsql.migrate.MigrationFile{ first, second }),
+    );
+    var absent_first = try conn.queryOneParams(
+        "select to_regclass('zsql_ordered_v1') is null as absent",
+        &.{},
+    );
+    defer absent_first.deinit();
+    try std.testing.expect(try (try absent_first.getName("absent")).asBool());
+    try conn.ping();
+}
+
 test "postgres live: inspected schema survives connection teardown" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer std.debug.assert(gpa_state.deinit() == .ok);

@@ -1387,10 +1387,13 @@ fn validateMigrationRecords(
     records: []const MigrationRecord,
     migrations: []const core.migrate.MigrationFile,
 ) !void {
-    for (records) |record| {
-        if (record.dirty) return error.MigrationDirty;
-
-        const migration = findMigration(migrations, record.version) orelse continue;
+    for (records) |record| if (record.dirty) return error.MigrationDirty;
+    try core.migrate.validatePlan(migrations, records);
+    for (records, 0..) |record, index| {
+        const migration = migrations[index];
+        if (!std.mem.eql(u8, record.name, migration.id.name)) {
+            return error.MigrationVersionConflict;
+        }
         if (!std.mem.eql(u8, &record.checksum, &migration.checksum)) {
             return error.MigrationChecksumMismatch;
         }
@@ -4070,7 +4073,7 @@ test "SQLite migration validation rejects dirty records" {
     try std.testing.expectError(error.MigrationDirty, validateMigrationStatus(&conn, &migrations));
 }
 
-test "SQLite migration validation ignores stored versions absent locally" {
+test "SQLite migration validation rejects stored versions absent locally" {
     var db = try Database.open(std.testing.allocator, .{});
     defer db.deinit();
 
@@ -4090,7 +4093,93 @@ test "SQLite migration validation ignores stored versions absent locally" {
         .{ .integer = 0 },
     });
 
-    try validateMigrationStatus(&conn, &.{});
+    try std.testing.expectError(error.MigrationVersionConflict, validateMigrationStatus(&conn, &.{}));
+}
+
+test "SQLite migration validation rejects renamed applied versions" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    try ensureMigrationTable(&conn);
+    const sql = "create table users (id integer primary key);\n";
+    const checksum = core.migrate.checksumSql(sql);
+    _ = try conn.exec(
+        \\insert into zsql_migrations (version, name, checksum, applied_at, dirty)
+        \\values (?, ?, ?, ?, ?)
+    , &.{
+        .{ .integer = 1 },
+        .{ .text = "original_name" },
+        .{ .text = &checksum },
+        .{ .text = "2026-07-07T10:00:00Z" },
+        .{ .integer = 0 },
+    });
+
+    const migrations = [_]core.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "renamed",
+            .filename = "V0001__renamed.sql",
+        },
+        .sql = sql,
+        .checksum = checksum,
+    }};
+    try std.testing.expectError(
+        error.MigrationVersionConflict,
+        validateMigrationStatus(&conn, &migrations),
+    );
+}
+
+test "SQLite migration apply rejects out of order pending versions before SQL" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    const first_sql = "create table ordered_v1 (id integer primary key);";
+    const second_sql = "create table ordered_v2 (id integer primary key);";
+    const first: core.migrate.MigrationFile = .{
+        .id = .{ .version = 1, .name = "ordered_v1", .filename = "V0001__ordered_v1.sql" },
+        .sql = first_sql,
+        .checksum = core.migrate.checksumSql(first_sql),
+    };
+    const second: core.migrate.MigrationFile = .{
+        .id = .{ .version = 2, .name = "ordered_v2", .filename = "V0002__ordered_v2.sql" },
+        .sql = second_sql,
+        .checksum = core.migrate.checksumSql(second_sql),
+    };
+
+    try std.testing.expectError(
+        error.MigrationVersionConflict,
+        applyMigrations(&conn, &[_]core.migrate.MigrationFile{ second, first }),
+    );
+    var absent_after_unsorted = try conn.query(
+        "select count(*) as n from sqlite_master where type = 'table' and name in ('ordered_v1', 'ordered_v2')",
+        &.{},
+    );
+    defer absent_after_unsorted.deinit();
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        try (try (try absent_after_unsorted.next()).?.value("n")).asInt(),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), (try applyMigrations(&conn, &.{second})).applied);
+    try std.testing.expectError(
+        error.MigrationVersionConflict,
+        applyMigrations(&conn, &[_]core.migrate.MigrationFile{ first, second }),
+    );
+    var absent_v1 = try conn.query(
+        "select count(*) as n from sqlite_master where type = 'table' and name = 'ordered_v1'",
+        &.{},
+    );
+    defer absent_v1.deinit();
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        try (try (try absent_v1.next()).?.value("n")).asInt(),
+    );
 }
 
 test "SQLite migration apply runs pending migrations and records clean status" {

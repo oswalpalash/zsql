@@ -732,6 +732,11 @@ as durably guarded when it could not record the guard.
 SQLite acquires `BEGIN IMMEDIATE` before reading or validating migration history,
 so a waiter cannot apply from a stale pre-lock snapshot. PostgreSQL performs the
 same revalidation after acquiring its session advisory lock.
+Migration plans must be strictly increasing and complete for the recorded
+history. Duplicate or descending versions, a renamed/missing applied migration,
+or a newly introduced pending version below the highest applied version return
+`MigrationVersionConflict` before any migration-file SQL runs. This prevents an
+older schema change from being silently applied after newer production history.
 
 `Migrator(D).repairDirty(version, expected_checksum)` is the guarded repair
 primitive. It locks migration history, requires an existing dirty row and exact

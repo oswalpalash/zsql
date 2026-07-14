@@ -132,6 +132,36 @@ pub fn checksumSql(sql: []const u8) Checksum {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
+/// Validate that a migration plan is a strict, complete continuation of the
+/// applied history. Plans must be sorted by increasing version with no
+/// duplicates, every applied version must remain resolvable, and a pending
+/// migration may not be inserted below the highest applied version.
+///
+/// `records` may be any slice whose elements expose a `version: u64` field.
+pub fn validatePlan(migrations: []const MigrationFile, records: anytype) !void {
+    var previous_migration: ?u64 = null;
+    for (migrations) |migration| {
+        if (previous_migration) |previous| {
+            if (migration.id.version <= previous) return error.MigrationVersionConflict;
+        }
+        previous_migration = migration.id.version;
+    }
+
+    var previous_record: ?u64 = null;
+    for (records, 0..) |record, index| {
+        if (previous_record) |previous| {
+            if (record.version <= previous) return error.MigrationVersionConflict;
+        }
+        // Applied history must be an exact prefix of the supplied plan. This
+        // simultaneously rejects missing applied files and pending versions
+        // inserted below already-applied history in O(plan + history) time.
+        if (index >= migrations.len or migrations[index].id.version != record.version) {
+            return error.MigrationVersionConflict;
+        }
+        previous_record = record.version;
+    }
+}
+
 fn isValidName(name: []const u8) bool {
     for (name) |c| {
         if (std.ascii.isAlphanumeric(c)) continue;
@@ -253,4 +283,38 @@ test "migration directory scanner rejects duplicate versions" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "V1__add_users.sql", .data = "alter table users add column name text;\n" });
 
     try std.testing.expectError(error.MigrationVersionConflict, scanDir(std.testing.allocator, std.testing.io, tmp.dir));
+}
+
+test "migration plan requires ordered unique complete history" {
+    const Record = struct { version: u64 };
+    const files = [_]MigrationFile{
+        .{ .id = .{ .version = 1, .name = "one", .filename = "V0001__one.sql" }, .checksum = undefined },
+        .{ .id = .{ .version = 2, .name = "two", .filename = "V0002__two.sql" }, .checksum = undefined },
+        .{ .id = .{ .version = 3, .name = "three", .filename = "V0003__three.sql" }, .checksum = undefined },
+    };
+
+    try validatePlan(&files, &[_]Record{});
+    try validatePlan(&files, &[_]Record{ .{ .version = 1 }, .{ .version = 2 } });
+    try validatePlan(&files, &[_]Record{ .{ .version = 1 }, .{ .version = 2 }, .{ .version = 3 } });
+
+    const duplicate = [_]MigrationFile{ files[0], files[0] };
+    try std.testing.expectError(error.MigrationVersionConflict, validatePlan(&duplicate, &[_]Record{}));
+    const descending = [_]MigrationFile{ files[1], files[0] };
+    try std.testing.expectError(error.MigrationVersionConflict, validatePlan(&descending, &[_]Record{}));
+    try std.testing.expectError(
+        error.MigrationVersionConflict,
+        validatePlan(&files, &[_]Record{.{ .version = 2 }}),
+    );
+    try std.testing.expectError(
+        error.MigrationVersionConflict,
+        validatePlan(files[1..], &[_]Record{.{ .version = 1 }}),
+    );
+    try std.testing.expectError(
+        error.MigrationVersionConflict,
+        validatePlan(&files, &[_]Record{ .{ .version = 1 }, .{ .version = 3 } }),
+    );
+    try std.testing.expectError(
+        error.MigrationVersionConflict,
+        validatePlan(&files, &[_]Record{ .{ .version = 2 }, .{ .version = 1 } }),
+    );
 }

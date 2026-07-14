@@ -134,9 +134,13 @@ pub const Migrator = struct {
     pub fn validate(self: Migrator, migrations: []const core.migrate.MigrationFile) !void {
         var st = try self.status(self.conn.allocator);
         defer st.deinit();
-        for (st.records) |record| {
-            if (record.dirty) return error.MigrationDirty;
-            const migration = findMigration(migrations, record.version) orelse continue;
+        for (st.records) |record| if (record.dirty) return error.MigrationDirty;
+        try core.migrate.validatePlan(migrations, st.records);
+        for (st.records, 0..) |record, index| {
+            const migration = migrations[index];
+            if (!std.mem.eql(u8, record.name, migration.id.name)) {
+                return error.MigrationVersionConflict;
+            }
             if (!std.mem.eql(u8, &record.checksum, &migration.checksum)) {
                 return error.MigrationChecksumMismatch;
             }
