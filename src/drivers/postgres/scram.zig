@@ -59,7 +59,7 @@ pub const Client = struct {
         errdefer allocator.free(user_owned);
         const password_owned = try allocator.dupe(u8, password);
         errdefer {
-            @memset(password_owned, 0);
+            std.crypto.secureZero(u8, password_owned);
             allocator.free(password_owned);
         }
         const nonce_owned = try allocator.dupe(u8, client_nonce);
@@ -92,7 +92,7 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         self.allocator.free(self.user);
-        @memset(self.password, 0);
+        self.wipePassword();
         self.allocator.free(self.password);
         self.allocator.free(self.client_nonce);
         self.allocator.free(self.client_first_bare);
@@ -100,6 +100,10 @@ pub const Client = struct {
         if (self.server_first) |s| self.allocator.free(s);
         if (self.auth_message) |s| self.allocator.free(s);
         self.* = undefined;
+    }
+
+    fn wipePassword(self: *Client) void {
+        std.crypto.secureZero(u8, self.password);
     }
 
     pub fn mechanism(self: *const Client) Mechanism {
@@ -134,12 +138,15 @@ pub const Client = struct {
         std.base64.standard.Decoder.decode(salt, parsed.salt_b64) catch return error.ProtocolError;
 
         var salted_password: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &salted_password);
         try pbkdf2(&salted_password, self.password, salt, parsed.iterations, HmacSha256);
 
         var client_key: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &client_key);
         HmacSha256.create(&client_key, "Client Key", &salted_password);
 
         var stored_key: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &stored_key);
         Sha256.hash(&client_key, &stored_key, .{});
 
         const cbind_b64 = try encodeCbindInput(self.allocator, self.channel_binding);
@@ -162,16 +169,20 @@ pub const Client = struct {
         self.auth_message = auth_message;
 
         var client_signature: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &client_signature);
         HmacSha256.create(&client_signature, auth_message, &stored_key);
 
         var client_proof: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &client_proof);
         for (&client_proof, client_key, client_signature) |*out, k, s| {
             out.* = k ^ s;
         }
 
         var server_key: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &server_key);
         HmacSha256.create(&server_key, "Server Key", &salted_password);
         var server_signature: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &server_signature);
         HmacSha256.create(&server_signature, auth_message, &server_key);
         self.server_signature = server_signature;
 
@@ -510,6 +521,13 @@ test "SCRAM-SHA-256 client proof matches standard PBKDF2-HMAC-SHA256" {
     );
 
     try client.handleServerFinal("v=lds20Nc9hhmu9VkAe15f2sOlIv44mtVCyJJPiCd1kM8=");
+}
+
+test "SCRAM client securely zeroes its owned password" {
+    var client = try Client.init(std.testing.allocator, "user", "secret", "client-nonce", .none);
+    client.wipePassword();
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** "secret".len), client.password);
+    client.deinit();
 }
 
 test "SCRAM-SHA-256-PLUS uses tls-server-end-point cbind encoding" {
