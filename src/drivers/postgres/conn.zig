@@ -1400,7 +1400,7 @@ pub const Conn = struct {
         errdefer if (!synchronized) self.drainUntilReady();
 
         var columns: []protocol.FieldDescription = &.{};
-        var column_names: std.ArrayListUnmanaged([]u8) = .empty;
+        var column_names: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer {
             for (column_names.items) |name| self.allocator.free(name);
             column_names.deinit(self.allocator);
@@ -1513,7 +1513,7 @@ pub const Conn = struct {
         errdefer if (!synchronized) self.drainUntilReady();
 
         var columns: []protocol.FieldDescription = &.{};
-        var column_names: std.ArrayListUnmanaged([]u8) = .empty;
+        var column_names: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer {
             for (column_names.items) |name| self.allocator.free(name);
             column_names.deinit(self.allocator);
@@ -2485,7 +2485,7 @@ test "orderedNamedBinds orders and validates named values" {
 /// Allocator-owned simple-query result set.
 pub const SimpleRows = struct {
     allocator: std.mem.Allocator,
-    column_names: [][]u8,
+    column_names: [][]const u8,
     rows: []OwnedSimpleRow,
     rows_affected: u64,
     index: usize = 0,
@@ -2510,7 +2510,7 @@ pub const SimpleRows = struct {
 };
 
 pub const SimpleRow = struct {
-    column_names: []const []u8,
+    column_names: []const []const u8,
     values: []const core.OwnedValue,
 
     pub fn value(self: SimpleRow, name: []const u8) !core.Value {
@@ -2574,14 +2574,7 @@ pub const SimpleRow = struct {
 };
 
 fn simpleRowToOwned(allocator: std.mem.Allocator, row: SimpleRow) !core.OwnedRow {
-    var names = try allocator.alloc([]const u8, row.column_names.len);
-    defer allocator.free(names);
-    var values = try allocator.alloc(core.Value, row.values.len);
-    defer allocator.free(values);
-    for (row.column_names, 0..) |n, i| names[i] = n;
-    for (row.values, 0..) |owned_val, i| values[i] = owned_val.borrowed();
-    const view = try core.Row.init(names, values);
-    return core.OwnedRow.init(allocator, view);
+    return core.OwnedRow.initFromOwnedValues(allocator, row.column_names, row.values);
 }
 
 /// Allocator-owned named PostgreSQL prepared statement.
@@ -2774,6 +2767,35 @@ test "prepared invalidation classification is narrow" {
     try std.testing.expect(classifyPreparedInvalidation("23505", "duplicate key") == null);
 }
 
+fn copySimpleRowForAllocationTest(allocator: std.mem.Allocator) !void {
+    const names = [_][]const u8{ "name", "payload" };
+    const values = [_]core.OwnedValue{
+        .{ .text = @constCast("ada") },
+        .{ .blob = @constCast("zig") },
+    };
+    var owned = try (SimpleRow{
+        .column_names = &names,
+        .values = &values,
+    }).getOwned(allocator);
+    defer owned.deinit();
+    try std.testing.expectEqualStrings("ada", try owned.asName([]const u8, "name"));
+    try std.testing.expectEqualStrings("zig", try (try owned.getName("payload")).asBlob());
+}
+
+test "SimpleRow getOwned deep-copies without temporary view allocations" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        copySimpleRowForAllocationTest,
+        .{},
+    );
+
+    // Two final slices, two column names, and two text/blob values: six total
+    // allocations. The former temporary name/value views added two more.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 6 });
+    try copySimpleRowForAllocationTest(failing.allocator());
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
 test "SimpleRow get/as/to map like core.Row" {
     var id_owned = try core.OwnedValue.from(std.testing.allocator, .{ .integer = 7 });
     defer id_owned.deinit(std.testing.allocator);
@@ -2782,7 +2804,7 @@ test "SimpleRow get/as/to map like core.Row" {
     var active_owned = try core.OwnedValue.from(std.testing.allocator, .{ .boolean = true });
     defer active_owned.deinit(std.testing.allocator);
 
-    const names = [_][]u8{ @constCast("id"), @constCast("name"), @constCast("active") };
+    const names = [_][]const u8{ "id", "name", "active" };
     const values = [_]core.OwnedValue{ id_owned, name_owned, active_owned };
     const row = SimpleRow{
         .column_names = &names,
@@ -2811,13 +2833,13 @@ test "SimpleRow get/as/to map like core.Row" {
 }
 
 test "SimpleRow to has no result-column width cap" {
-    var names: [65][]u8 = undefined;
+    var names: [65][]const u8 = undefined;
     var values: [65]core.OwnedValue = undefined;
     for (&names, &values) |*name, *value| {
-        name.* = @constCast("unused");
+        name.* = "unused";
         value.* = .{ .null = {} };
     }
-    names[64] = @constCast("tail");
+    names[64] = "tail";
     values[64] = .{ .integer = 65 };
 
     const row = SimpleRow{

@@ -87,7 +87,30 @@ pub const OwnedRow = struct {
     values: []OwnedValue,
 
     pub fn init(allocator: std.mem.Allocator, row: Row) !OwnedRow {
-        const columns = try allocator.alloc([]u8, row.columns.len);
+        return initFromSlices(Value, allocator, row.columns, row.values, borrowValue);
+    }
+
+    /// Deep-copy immutable column names and allocator-owned source values.
+    /// The source values remain owned by the caller and may be released or
+    /// mutated independently after this returns.
+    pub fn initFromOwnedValues(
+        allocator: std.mem.Allocator,
+        columns: []const []const u8,
+        values: []const OwnedValue,
+    ) !OwnedRow {
+        return initFromSlices(OwnedValue, allocator, columns, values, borrowOwnedValue);
+    }
+
+    fn initFromSlices(
+        comptime SourceValue: type,
+        allocator: std.mem.Allocator,
+        source_columns: []const []const u8,
+        source_values: []const SourceValue,
+        comptime borrow: fn (SourceValue) Value,
+    ) !OwnedRow {
+        if (source_columns.len != source_values.len) return error.InvalidColumn;
+
+        const columns = try allocator.alloc([]u8, source_columns.len);
         var initialized_columns: usize = 0;
         errdefer {
             for (columns[0..initialized_columns]) |column| {
@@ -96,12 +119,12 @@ pub const OwnedRow = struct {
             allocator.free(columns);
         }
 
-        for (row.columns, 0..) |column, index| {
+        for (source_columns, 0..) |column, index| {
             columns[index] = try allocator.dupe(u8, column);
             initialized_columns += 1;
         }
 
-        const values = try allocator.alloc(OwnedValue, row.values.len);
+        const values = try allocator.alloc(OwnedValue, source_values.len);
         var initialized: usize = 0;
         errdefer {
             for (values[0..initialized]) |*item| {
@@ -110,8 +133,8 @@ pub const OwnedRow = struct {
             allocator.free(values);
         }
 
-        for (row.values, 0..) |item, index| {
-            values[index] = try OwnedValue.from(allocator, item);
+        for (source_values, 0..) |item, index| {
+            values[index] = try OwnedValue.from(allocator, borrow(item));
             initialized += 1;
         }
 
@@ -120,6 +143,14 @@ pub const OwnedRow = struct {
             .columns = columns,
             .values = values,
         };
+    }
+
+    fn borrowValue(source: Value) Value {
+        return source;
+    }
+
+    fn borrowOwnedValue(source: OwnedValue) Value {
+        return source.borrowed();
     }
 
     pub fn deinit(self: *OwnedRow) void {
@@ -379,6 +410,30 @@ test "OwnedRow duplicates text and blob values" {
     try std.testing.expectEqual(@as(usize, 2), owned.len());
     try std.testing.expectEqualStrings("ada", try (try owned.value("name")).asText());
     try std.testing.expectEqualStrings("zig", try (try owned.value("payload")).asBlob());
+}
+
+test "OwnedRow deep-copies owned value inputs and validates shape" {
+    var text = [_]u8{ 'a', 'd', 'a' };
+    var blob = [_]u8{ 'z', 'i', 'g' };
+    const values = [_]OwnedValue{
+        .{ .text = &text },
+        .{ .blob = &blob },
+    };
+    var owned = try OwnedRow.initFromOwnedValues(
+        std.testing.allocator,
+        &.{ "name", "payload" },
+        &values,
+    );
+    defer owned.deinit();
+
+    text[0] = 'x';
+    blob[0] = 'y';
+    try std.testing.expectEqualStrings("ada", try (try owned.value("name")).asText());
+    try std.testing.expectEqualStrings("zig", try (try owned.value("payload")).asBlob());
+    try std.testing.expectError(
+        error.InvalidColumn,
+        OwnedRow.initFromOwnedValues(std.testing.allocator, &.{"only"}, &values),
+    );
 }
 
 test "decode supports borrowed SQL domain wrappers" {
