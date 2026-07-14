@@ -42,6 +42,69 @@ fn requireUrl(allocator: std.mem.Allocator) ![]u8 {
     return std.process.Environ.getAlloc(std.testing.environ, allocator, "ZSQL_PG_URL") catch return error.SkipZigTest;
 }
 
+fn replaceCredentials(config: *pg.Config, user: []const u8, password: []const u8) !void {
+    const owned_user = try config.allocator.dupe(u8, user);
+    errdefer config.allocator.free(owned_user);
+    const owned_password = try config.allocator.dupe(u8, password);
+    errdefer {
+        std.crypto.secureZero(u8, owned_password);
+        config.allocator.free(owned_password);
+    }
+
+    config.allocator.free(config.user);
+    std.crypto.secureZero(u8, config.password);
+    config.allocator.free(config.password);
+    config.user = owned_user;
+    config.password = owned_password;
+}
+
+fn expectCurrentUser(config: pg.Config, expected: []const u8) !void {
+    var conn = try pg.Conn.open(config.allocator, std.testing.io, config);
+    defer conn.deinit();
+    var rows = try conn.query("select current_user");
+    defer rows.deinit();
+    const row = rows.next() orelse return error.NoRows;
+    try std.testing.expectEqualStrings(expected, try (try row.value("current_user")).asText());
+}
+
+test "postgres live: SCRAM authenticates SASLprep-equivalent Unicode passwords" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa_state.deinit() == .ok);
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+
+    var admin_config = try pg.parseUrl(allocator, url_str);
+    defer admin_config.deinit();
+    var admin = try pg.Conn.open(allocator, std.testing.io, admin_config);
+    defer admin.deinit();
+
+    const drop_role = "drop role if exists zsql_saslprep_live";
+    _ = try admin.exec(drop_role);
+    errdefer _ = admin.exec(drop_role) catch {};
+    _ = try admin.exec("set password_encryption = 'scram-sha-256'");
+    _ = try admin.exec(
+        \\create role zsql_saslprep_live login password U&'I\00ADX'
+    );
+    defer _ = admin.exec(drop_role) catch {};
+
+    var unicode_config = try pg.parseUrl(allocator, url_str);
+    defer unicode_config.deinit();
+    // U+2168 (ROMAN NUMERAL NINE) normalizes to the same "IX" as the role's
+    // I + U+00AD (SOFT HYPHEN) + X password after PostgreSQL SASLprep.
+    try replaceCredentials(&unicode_config, "zsql_saslprep_live", "\xe2\x85\xa8");
+    try expectCurrentUser(unicode_config, "zsql_saslprep_live");
+
+    // PostgreSQL hashes prohibited UTF-8 passwords as raw bytes. Matching the
+    // same U+0007 bytes proves the client takes that fallback instead of
+    // rejecting the credential or masking it as a normalized value.
+    _ = try admin.exec(
+        \\alter role zsql_saslprep_live password U&'raw\0007password'
+    );
+    try replaceCredentials(&unicode_config, "zsql_saslprep_live", "raw\x07password");
+    try expectCurrentUser(unicode_config, "zsql_saslprep_live");
+}
+
 fn collectPostgresMigrationStatus(allocator: std.mem.Allocator, migrator: pg.Migrator) !void {
     var status = try migrator.status(allocator);
     defer status.deinit();

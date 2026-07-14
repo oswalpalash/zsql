@@ -1,9 +1,6 @@
 const std = @import("std");
 const Certificate = std.crypto.Certificate;
-
-test {
-    _ = @import("saslprep.zig");
-}
+const saslprep = @import("saslprep.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -32,8 +29,8 @@ pub const ChannelBinding = union(enum) {
 
 /// Client-side SCRAM-SHA-256 / SCRAM-SHA-256-PLUS state for PostgreSQL SASL.
 ///
-/// Password bytes are zeroed in `deinit`. Nonces and intermediate messages are
-/// allocator-owned.
+/// The PostgreSQL-prepared or raw-fallback password is owned and zeroed in
+/// `deinit`. Nonces and intermediate messages are allocator-owned.
 pub const Client = struct {
     allocator: std.mem.Allocator,
     user: []u8,
@@ -54,14 +51,19 @@ pub const Client = struct {
         client_nonce: []const u8,
         channel_binding: ChannelBinding,
     ) !Client {
-        // SCRAM user names with `=` / `,` need escaping; reject rather than
-        // silently mis-auth until full SASLprep lands.
+        // SCRAM user names with `=` / `,` need SASL-name escaping; reject
+        // rather than silently constructing a different client-first message.
         if (std.mem.indexOfAny(u8, user, "=,") != null) return error.InvalidArguments;
         if (client_nonce.len < 8 or !isPrintableNonce(client_nonce)) return error.InvalidArguments;
 
         const user_owned = try allocator.dupe(u8, user);
         errdefer allocator.free(user_owned);
-        const password_owned = try allocator.dupe(u8, password);
+        const password_owned = saslprep.prepare(allocator, password) catch |err| switch (err) {
+            // PostgreSQL treats invalid or prohibited UTF-8 passwords as raw
+            // bytes. Allocation failure must never silently change the key.
+            error.InvalidUtf8, error.Prohibited => try allocator.dupe(u8, password),
+            else => return err,
+        };
         errdefer {
             std.crypto.secureZero(u8, password_owned);
             allocator.free(password_owned);
@@ -578,6 +580,48 @@ test "SCRAM client securely zeroes its owned password" {
     client.wipePassword();
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** "secret".len), client.password);
     client.deinit();
+}
+
+test "SCRAM prepares Unicode passwords and preserves PostgreSQL raw fallback" {
+    const vectors = [_]struct { input: []const u8, expected: []const u8 }{
+        .{ .input = "I\xc2\xadX", .expected = "IX" },
+        .{ .input = "\xe2\x85\xa8", .expected = "IX" },
+        .{ .input = "raw\xffpassword", .expected = "raw\xffpassword" },
+        .{ .input = "raw\x07password", .expected = "raw\x07password" },
+        .{ .input = "", .expected = "" },
+    };
+    for (vectors) |vector| {
+        var client = try Client.init(
+            std.testing.allocator,
+            "user",
+            vector.input,
+            "client-nonce",
+            .none,
+        );
+        defer client.deinit();
+        try std.testing.expectEqualSlices(u8, vector.expected, client.password);
+    }
+}
+
+fn initPreparedClientWithFailures(allocator: std.mem.Allocator) !void {
+    const cbind_data = [_]u8{0xab} ** 32;
+    var client = try Client.init(
+        allocator,
+        "user",
+        "S\xc2\xade\xcc\x81cret\xc2\xa0",
+        "client-nonce",
+        .{ .tls_server_end_point = &cbind_data },
+    );
+    defer client.deinit();
+    try std.testing.expectEqualStrings("S\xc3\xa9cret ", client.password);
+}
+
+test "SCRAM prepared password ownership survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        initPreparedClientWithFailures,
+        .{},
+    );
 }
 
 test "SCRAM validates client and server nonce grammar" {
