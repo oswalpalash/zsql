@@ -640,6 +640,9 @@ build a schema graph with `Conn.inspectSchema` and render ZON via
 `zsql.inspect.writeSchemaZon`. Applications load an embedded artifact with
 `parseSchemaZon` and release its allocator-owned graph with
 `freeParsedSchemaZon`.
+SQLite inspection binds catalog names through table-valued PRAGMA queries;
+table and index identifiers are never interpolated into SQL or restricted by a
+fixed query buffer.
 
 For `WITH` queries, projection, scope, and clause discovery is anchored to the
 outer depth-zero statement; nested CTE keywords cannot replace the outer query

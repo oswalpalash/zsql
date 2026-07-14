@@ -1008,10 +1008,12 @@ pub const Conn = struct {
             const owned_name = try allocator.dupe(u8, table_name);
             errdefer allocator.free(owned_name);
 
-            var pragma_sql_buf: [256]u8 = undefined;
-            // table name comes from sqlite_master, not user input.
-            const pragma_sql = try std.fmt.bufPrint(&pragma_sql_buf, "pragma table_info({s})", .{table_name});
-            var col_rows = try self.query(pragma_sql, &.{});
+            // Table-valued PRAGMAs accept bound catalog names. Binding avoids
+            // both identifier interpolation and fixed query-buffer limits.
+            var col_rows = try self.query(
+                "select name, type, \"notnull\", pk from pragma_table_info(?) order by cid",
+                &.{.{ .text = table_name }},
+            );
             defer col_rows.deinit();
 
             var cols: std.ArrayListUnmanaged(core.inspect.Column) = .empty;
@@ -1041,10 +1043,11 @@ pub const Conn = struct {
             const columns = try cols.toOwnedSlice(allocator);
             errdefer core.inspect.freeColumns(allocator, @constCast(columns));
 
-            // Indexes via PRAGMA index_list / index_info (table name from catalog).
-            var idx_sql_buf: [256]u8 = undefined;
-            const idx_list_sql = try std.fmt.bufPrint(&idx_sql_buf, "pragma index_list({s})", .{table_name});
-            var idx_rows = try self.query(idx_list_sql, &.{});
+            // Indexes via bound table-valued PRAGMA functions.
+            var idx_rows = try self.query(
+                "select name, \"unique\" from pragma_index_list(?) order by seq",
+                &.{.{ .text = table_name }},
+            );
             defer idx_rows.deinit();
 
             var indexes: std.ArrayListUnmanaged(core.inspect.Index) = .empty;
@@ -1062,9 +1065,10 @@ pub const Conn = struct {
                 // Skip auto-indexes that mirror PRIMARY KEY / UNIQUE constraints if desired;
                 // keep them for offline completeness.
                 const unique = (try (try idx_row.value("unique")).asInt()) != 0;
-                var info_sql_buf: [288]u8 = undefined;
-                const info_sql = try std.fmt.bufPrint(&info_sql_buf, "pragma index_info({s})", .{iname});
-                var info_rows = try self.query(info_sql, &.{});
+                var info_rows = try self.query(
+                    "select name from pragma_index_info(?) order by seqno",
+                    &.{.{ .text = iname }},
+                );
                 defer info_rows.deinit();
 
                 var col_names: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -2324,6 +2328,66 @@ test "SQLite inspectSchema exports tables and columns" {
         }
     }
     try std.testing.expect(found_email_idx);
+}
+
+test "SQLite inspectSchema binds long adversarial catalog names" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    var table_name_storage: [320]u8 = undefined;
+    @memset(&table_name_storage, 't');
+    table_name_storage[1] = ')';
+    table_name_storage[2] = '"';
+    const table_name: []const u8 = &table_name_storage;
+
+    var index_name_storage: [330]u8 = undefined;
+    @memset(&index_name_storage, 'i');
+    index_name_storage[1] = ')';
+    index_name_storage[2] = '"';
+    const index_name: []const u8 = &index_name_storage;
+    const column_name = "value)\"column";
+
+    var create_table = core.QueryBuilder.init(std.testing.allocator, .sqlite);
+    defer create_table.deinit();
+    try create_table.appendTrustedSql("create table ");
+    try create_table.ident(table_name);
+    try create_table.appendTrustedSql(" (");
+    try create_table.ident(column_name);
+    try create_table.appendTrustedSql(" integer not null)");
+    _ = try conn.exec(create_table.sqlSlice(), create_table.bindsSlice());
+
+    var create_index = core.QueryBuilder.init(std.testing.allocator, .sqlite);
+    defer create_index.deinit();
+    try create_index.appendTrustedSql("create unique index ");
+    try create_index.ident(index_name);
+    try create_index.appendTrustedSql(" on ");
+    try create_index.ident(table_name);
+    try create_index.appendTrustedSql(" (");
+    try create_index.ident(column_name);
+    try create_index.appendTrustedSql(")");
+    _ = try conn.exec(create_index.sqlSlice(), create_index.bindsSlice());
+
+    const schema = try conn.inspectSchema(std.testing.allocator);
+    defer freeInspectedSchema(std.testing.allocator, schema);
+
+    try std.testing.expectEqual(@as(usize, 1), schema.tables.len);
+    const table = schema.tables[0];
+    try std.testing.expectEqualStrings(table_name, table.name);
+    try std.testing.expectEqual(@as(usize, 1), table.columns.len);
+    try std.testing.expectEqualStrings(column_name, table.columns[0].name);
+    try std.testing.expect(!table.columns[0].nullable);
+
+    var found_index = false;
+    for (table.indexes) |index| {
+        if (!std.mem.eql(u8, index.name, index_name)) continue;
+        found_index = true;
+        try std.testing.expect(index.unique);
+        try std.testing.expectEqual(@as(usize, 1), index.columns.len);
+        try std.testing.expectEqualStrings(column_name, index.columns[0]);
+    }
+    try std.testing.expect(found_index);
 }
 
 test "SQLite inspectSchema releases every partial graph on allocation failure" {
