@@ -129,11 +129,10 @@ pub const Client = struct {
         if (parsed.nonce.len <= self.client_nonce.len) return error.AuthFailed;
         if (parsed.iterations == 0 or parsed.iterations > 1_000_000) return error.AuthFailed;
 
-        var salt_buf: [256]u8 = undefined;
         const salt_len = std.base64.standard.Decoder.calcSizeForSlice(parsed.salt_b64) catch return error.ProtocolError;
-        if (salt_len > salt_buf.len) return error.ProtocolError;
-        std.base64.standard.Decoder.decode(salt_buf[0..salt_len], parsed.salt_b64) catch return error.ProtocolError;
-        const salt = salt_buf[0..salt_len];
+        const salt = try self.allocator.alloc(u8, salt_len);
+        defer self.allocator.free(salt);
+        std.base64.standard.Decoder.decode(salt, parsed.salt_b64) catch return error.ProtocolError;
 
         var salted_password: [32]u8 = undefined;
         try pbkdf2(&salted_password, self.password, salt, parsed.iterations, HmacSha256);
@@ -178,8 +177,9 @@ pub const Client = struct {
 
         var sig_b64_buf: [64]u8 = undefined;
         const sig_b64 = std.base64.standard.Encoder.encode(&sig_b64_buf, &server_signature);
+        const server_signature_b64 = try self.allocator.dupe(u8, sig_b64);
         if (self.server_signature_b64) |old| self.allocator.free(old);
-        self.server_signature_b64 = try self.allocator.dupe(u8, sig_b64);
+        self.server_signature_b64 = server_signature_b64;
 
         var proof_b64_buf: [64]u8 = undefined;
         const proof_b64 = std.base64.standard.Encoder.encode(&proof_b64_buf, &client_proof);
@@ -523,6 +523,33 @@ test "SCRAM rejects server nonce that does not extend client nonce" {
     try std.testing.expectError(
         error.AuthFailed,
         client.handleServerFirst("r=othernonce,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"),
+    );
+}
+
+fn exerciseLongSaltRetry(allocator: std.mem.Allocator) !void {
+    const salt_b64 = [_]u8{'A'} ** 400; // 300 decoded bytes: larger than the former fixed buffer.
+    var server_first_buf: [512]u8 = undefined;
+    const server_first = try std.fmt.bufPrint(
+        &server_first_buf,
+        "r=client-nonce-server,s={s},i=1",
+        .{&salt_b64},
+    );
+
+    var client = try Client.init(allocator, "user", "pencil", "client-nonce", .none);
+    defer client.deinit();
+
+    const first = try client.handleServerFirst(server_first);
+    allocator.free(first);
+    const second = try client.handleServerFirst(server_first);
+    defer allocator.free(second);
+    try std.testing.expect(std.mem.startsWith(u8, second, "c=biws,r=client-nonce-server,p="));
+}
+
+test "SCRAM accepts allocator-bounded salts and retries safely after OOM" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseLongSaltRetry,
+        .{},
     );
 }
 
