@@ -392,6 +392,9 @@ conn.execParams(...) catch |err| {
 ```
 
 After `ErrorResponse`, the driver drains to `ReadyForQuery` so the connection stays usable.
+If that recovery loses the transport, the connection rejects further work but
+still retains its allocator ownership until `deinit`; teardown remains required
+and releases buffers, diagnostics, cached statements, and queued notifications.
 PostgreSQL `lastError()` is borrowed until the next SQL operation or `deinit`;
 starting a later operation clears stale metadata, including when it succeeds.
 For SQL operations it also owns the exact statement template sent to PostgreSQL

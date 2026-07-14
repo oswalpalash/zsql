@@ -43,6 +43,10 @@ pub const Conn = struct {
     /// System CA bundle when verify-ca / verify-full is used.
     ca_bundle: ?std.crypto.Certificate.Bundle = null,
     ca_bundle_lock: Io.RwLock = .init,
+    /// True once allocator and transport ownership has been released. `closed`
+    /// only means the connection is no longer usable and may be set earlier by
+    /// protocol recovery after an I/O failure.
+    deinitialized: bool = false,
     closed: bool = false,
     /// Backend process id from BackendKeyData, if received.
     backend_pid: ?i32 = null,
@@ -290,7 +294,7 @@ pub const Conn = struct {
 
     /// Close transport buffers without sending Terminate (pre-startup cleanup).
     fn deinitTransportOnly(self: *Conn) void {
-        if (self.closed) return;
+        if (self.deinitialized) return;
         self.clearPendingNotifications();
         self.stream.close(self.io);
         self.allocator.free(self.server_host);
@@ -307,6 +311,7 @@ pub const Conn = struct {
         self.peer_cert_der = null;
         self.clearLastError();
         self.closed = true;
+        self.deinitialized = true;
     }
 
     /// Send SSLRequest and read the single-byte server reply (always plain TCP).
@@ -333,11 +338,11 @@ pub const Conn = struct {
     }
 
     pub fn deinit(self: *Conn) void {
-        if (self.closed) return;
+        if (self.deinitialized) return;
         // Best-effort Close of cached prepares before Terminate.
         self.disableStmtCache() catch {};
         self.clearPendingNotifications();
-        self.sendTerminate() catch {};
+        if (!self.closed) self.sendTerminate() catch {};
         self.stream.close(self.io);
         self.allocator.free(self.server_host);
         self.allocator.free(self.read_buf);
@@ -353,6 +358,7 @@ pub const Conn = struct {
         self.peer_cert_der = null;
         self.clearLastError();
         self.closed = true;
+        self.deinitialized = true;
     }
 
     /// Create an allocator-owned handle that can cancel a query concurrently
@@ -2428,6 +2434,86 @@ fn appendNotification(
     var notification = try Notification.parse(allocator, body);
     errdefer notification.deinit(allocator);
     try pending.append(allocator, notification);
+}
+
+const TestConnPair = struct {
+    conn: Conn,
+    peer: net.Stream,
+};
+
+fn makeTestConnPair(allocator: std.mem.Allocator) !TestConnPair {
+    const io = std.testing.io;
+    var address: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+
+    const client = try server.socket.address.connect(io, .{
+        .mode = .stream,
+        .protocol = .tcp,
+    });
+    errdefer client.close(io);
+    const peer = try server.accept(io);
+    errdefer peer.close(io);
+
+    const server_host = try allocator.dupe(u8, "127.0.0.1");
+    errdefer allocator.free(server_host);
+    const read_buf = try allocator.alloc(u8, 128);
+    errdefer allocator.free(read_buf);
+    const write_buf = try allocator.alloc(u8, 128);
+    errdefer allocator.free(write_buf);
+
+    return .{
+        .conn = .{
+            .allocator = allocator,
+            .io = io,
+            .server_host = server_host,
+            .server_port = server.socket.address.getPort(),
+            .stream = client,
+            .read_buf = read_buf,
+            .write_buf = write_buf,
+            .reader = client.reader(io, read_buf),
+            .writer = client.writer(io, write_buf),
+        },
+        .peer = peer,
+    };
+}
+
+test "connection teardown releases ownership after transport closure" {
+    var pair = try makeTestConnPair(std.testing.allocator);
+    var peer_open = true;
+    defer if (peer_open) pair.peer.close(std.testing.io);
+    defer pair.conn.deinit();
+
+    pair.conn.stmt_cache = try core.StmtCache.init(std.testing.allocator, 2);
+    _ = try pair.conn.stmt_cache.?.put("select 1", "zsql_ps_0");
+    const notification_body = [_]u8{ 0, 0, 0, 7, 'e', 'v', 'e', 'n', 't', 's', 0, 'o', 'k', 0 };
+    try pair.conn.queueNotification(&notification_body);
+    pair.conn.last_error = try core.OwnedDbError.fromPostgresFields(
+        std.testing.allocator,
+        .{ .code = "08006", .message = "connection failure" },
+        error.ConnectionClosed,
+        "select 1",
+    );
+    pair.conn.peer_cert_der = try std.testing.allocator.dupe(u8, "peer cert");
+
+    // Losing the peer while a command recovery drain is active marks the
+    // connection closed before its allocator ownership has been released.
+    pair.peer.close(std.testing.io);
+    peer_open = false;
+    pair.conn.drainUntilReady();
+    try std.testing.expect(pair.conn.closed);
+    try std.testing.expect(!pair.conn.deinitialized);
+
+    // Deinit must still free everything and remain idempotent.
+    pair.conn.deinit();
+    pair.conn.deinit();
+
+    try std.testing.expect(pair.conn.closed);
+    try std.testing.expect(pair.conn.deinitialized);
+    try std.testing.expect(pair.conn.stmt_cache == null);
+    try std.testing.expectEqual(@as(usize, 0), pair.conn.pendingNotificationCount());
+    try std.testing.expect(pair.conn.last_error == null);
+    try std.testing.expect(pair.conn.peer_cert_der == null);
 }
 
 const CopyOutputBuffer = struct {
