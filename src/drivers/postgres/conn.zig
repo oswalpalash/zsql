@@ -1063,7 +1063,7 @@ pub const Conn = struct {
             list.deinit(self.allocator);
         }
         while (rows.next()) |row| {
-            try list.append(self.allocator, try simpleRowToOwned(self.allocator, row));
+            try appendOwnedSimpleRow(self.allocator, &list, row);
         }
         return try list.toOwnedSlice(self.allocator);
     }
@@ -2654,6 +2654,16 @@ fn simpleRowToOwned(allocator: std.mem.Allocator, row: SimpleRow) !core.OwnedRow
     return core.OwnedRow.initFromOwnedValues(allocator, row.column_names, row.values);
 }
 
+fn appendOwnedSimpleRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayListUnmanaged(core.OwnedRow),
+    row: SimpleRow,
+) !void {
+    var owned = try simpleRowToOwned(allocator, row);
+    errdefer owned.deinit();
+    try rows.append(allocator, owned);
+}
+
 /// Allocator-owned named PostgreSQL prepared statement.
 ///
 /// `Stmt` borrows its connection. It may move as a value, but the referenced
@@ -2857,6 +2867,33 @@ fn copySimpleRowForAllocationTest(allocator: std.mem.Allocator) !void {
     defer owned.deinit();
     try std.testing.expectEqualStrings("ada", try owned.asName([]const u8, "name"));
     try std.testing.expectEqualStrings("zig", try (try owned.getName("payload")).asBlob());
+}
+
+fn appendOwnedSimpleRowForAllocationTest(allocator: std.mem.Allocator) !void {
+    const names = [_][]const u8{ "id", "name" };
+    const values = [_]core.OwnedValue{
+        .{ .integer = 7 },
+        .{ .text = @constCast("ada") },
+    };
+    var rows: std.ArrayListUnmanaged(core.OwnedRow) = .empty;
+    defer {
+        for (rows.items) |*row| row.deinit();
+        rows.deinit(allocator);
+    }
+    try appendOwnedSimpleRow(allocator, &rows, .{
+        .column_names = &names,
+        .values = &values,
+    });
+    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    try std.testing.expectEqualStrings("ada", try rows.items[0].asName([]const u8, "name"));
+}
+
+test "PostgreSQL queryAll row append cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        appendOwnedSimpleRowForAllocationTest,
+        .{},
+    );
 }
 
 test "SimpleRow getOwned deep-copies without temporary view allocations" {

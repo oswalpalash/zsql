@@ -241,6 +241,8 @@ defer zsql.freeOwnedRows(allocator, all);
 SQLite mirrors this with `Conn.queryOne` / `Conn.queryAll`. Pools expose
 `Pool.queryOne` / `Pool.queryOneParams` and `Pool.queryAll` / `Pool.queryAllParams`
 (lease held only for the fetch; free multi-row results with `zsql.freeOwnedRows`).
+Both drivers release a newly copied row if result-slice growth fails, so
+`queryAll` remains leak-free at every allocation boundary.
 
 Scoped transactions via `withTx` (commit on success, rollback on error):
 

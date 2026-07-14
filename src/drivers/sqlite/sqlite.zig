@@ -893,7 +893,7 @@ pub const Conn = struct {
             list.deinit(self.allocator);
         }
         while (try rows.next()) |row| {
-            try list.append(self.allocator, try core.OwnedRow.init(self.allocator, row));
+            try appendOwnedRow(self.allocator, &list, row);
         }
         return try list.toOwnedSlice(self.allocator);
     }
@@ -1111,6 +1111,16 @@ pub const Conn = struct {
         };
     }
 };
+
+fn appendOwnedRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayListUnmanaged(core.OwnedRow),
+    row: core.Row,
+) !void {
+    var owned = try core.OwnedRow.init(allocator, row);
+    errdefer owned.deinit();
+    try rows.append(allocator, owned);
+}
 
 /// Handle + ownership flag for cached vs one-shot prepares.
 const Prepared = struct {
@@ -2263,6 +2273,27 @@ test "SQLite queryAll collects owned rows" {
     try std.testing.expectEqual(@as(usize, 2), owned.len);
     try std.testing.expectEqual(@as(i64, 1), try (try owned[0].value("id")).asInt());
     try std.testing.expectEqualStrings("b", try (try owned[1].value("name")).asText());
+}
+
+fn appendOwnedRowForAllocationTest(allocator: std.mem.Allocator) !void {
+    const names = [_][]const u8{ "id", "name" };
+    const values = [_]core.Value{ .{ .integer = 7 }, .{ .text = "ada" } };
+    var rows: std.ArrayListUnmanaged(core.OwnedRow) = .empty;
+    defer {
+        for (rows.items) |*row| row.deinit();
+        rows.deinit(allocator);
+    }
+    try appendOwnedRow(allocator, &rows, try core.Row.init(&names, &values));
+    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    try std.testing.expectEqualStrings("ada", try rows.items[0].asName([]const u8, "name"));
+}
+
+test "SQLite queryAll row append cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        appendOwnedRowForAllocationTest,
+        .{},
+    );
 }
 
 test "SQLite withTx commits on success and rolls back on error" {
