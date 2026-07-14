@@ -431,6 +431,40 @@ pub const Conn = struct {
         return 0;
     }
 
+    /// Reset session-visible state before a connection crosses a pool borrower
+    /// boundary. `DISCARD ALL` removes temporary objects, listeners, advisory
+    /// locks, prepared statements, and modified run-time settings. The caller
+    /// supplies pool-owned settings that must be restored after the reset.
+    ///
+    /// This is intentionally unobserved by query hooks: it is driver cleanup,
+    /// not an application statement. Any error leaves reuse to the caller;
+    /// pools close the connection rather than return uncertain state to idle.
+    pub fn resetForPool(
+        self: *Conn,
+        statement_timeout_ms: ?u32,
+        stmt_cache_size: usize,
+    ) !void {
+        if (self.closed) return error.ConnectionClosed;
+        if (!self.isReusable()) return error.ConnectionBusy;
+
+        // DISCARD ALL removes server prepares. Drop the corresponding client
+        // mappings first without issuing one Close round trip per entry. If
+        // the reset fails, the pool closes the session and PostgreSQL releases
+        // those resources with it.
+        self.clearStmtCacheLocal();
+        _ = try self.execUnobserved("discard all");
+
+        if (statement_timeout_ms) |ms| try self.setStatementTimeoutMs(ms);
+        if (stmt_cache_size > 0) self.stmt_cache = try core.StmtCache.init(self.allocator, stmt_cache_size);
+    }
+
+    fn clearStmtCacheLocal(self: *Conn) void {
+        if (self.stmt_cache) |*cache| {
+            cache.deinit();
+            self.stmt_cache = null;
+        }
+    }
+
     fn closePrepared(self: *Conn, name: []const u8) !void {
         const close_msg = try protocol.buildCloseStatementMessage(self.allocator, name);
         defer self.allocator.free(close_msg);

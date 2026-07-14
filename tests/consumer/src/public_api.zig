@@ -53,6 +53,8 @@ pub fn validate() void {
             "SimpleRow",
             "Notification",
             "Pool",
+            "PoolConfig",
+            "SessionReset",
             "Lease",
             "PooledRows",
             "PooledStmt",

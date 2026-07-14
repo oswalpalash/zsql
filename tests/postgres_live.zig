@@ -1233,6 +1233,142 @@ test "postgres live: pool acquire release" {
     try std.testing.expectEqual(@as(usize, 0), stats.leased);
 }
 
+test "postgres live: pool discard-all isolates session state" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa_state.deinit() == .ok);
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    config.statement_timeout_ms = 2345;
+    const HookState = struct {
+        internal_reset_observed: bool = false,
+
+        fn after(raw: ?*anyopaque, end: zsql.QueryEnd) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (std.mem.eql(u8, end.sql, "discard all") or
+                std.mem.eql(u8, end.sql, "set statement_timeout to 2345"))
+            {
+                self.internal_reset_observed = true;
+            }
+        }
+    };
+    var hook_state: HookState = .{};
+    var pool = try pg.Pool.init(allocator, std.testing.io, .{
+        .database = config,
+        .max_open = 1,
+        .max_idle = 1,
+        .stmt_cache_size = 8,
+        .session_reset = .discard_all,
+        .hooks = .{ .ctx = &hook_state, .after_query = HookState.after },
+    });
+    defer pool.deinit();
+
+    const lock_key: i64 = 0x7a73_716c_706f_6f6c; // "zsqlpool"
+    var first = try pool.acquire();
+    defer if (first.open) first.discard() catch {};
+    const first_conn = try first.conn();
+
+    var baseline = try first_conn.queryOneParams(
+        "select pg_backend_pid()::bigint as pid, current_setting('search_path') as search_path",
+        &.{},
+    );
+    defer baseline.deinit();
+    const backend_pid = try (try baseline.getName("pid")).asInt();
+    const baseline_search_path = try (try baseline.getName("search_path")).asText();
+
+    _ = try first_conn.exec("set search_path to pg_catalog");
+    _ = try first_conn.exec("set statement_timeout to 60000");
+    _ = try first_conn.exec("create temporary table zsql_pool_reset_temp (id int)");
+    try first_conn.listen("zsql_pool_reset_channel");
+    {
+        var locked = try first_conn.queryParams(
+            "select pg_advisory_lock($1::bigint)",
+            &.{.{ .integer = lock_key }},
+        );
+        defer locked.deinit();
+        _ = locked.next() orelse return error.NoRows;
+    }
+    try std.testing.expect(first_conn.stmtCacheLen() > 0);
+    try first.release();
+
+    var second = try pool.acquire();
+    defer if (second.open) second.discard() catch {};
+    const second_conn = try second.conn();
+    // The same physical session was reset rather than replaced, and its client
+    // statement cache was rebuilt empty after DISCARD ALL deallocated prepares.
+    try std.testing.expectEqual(@as(usize, 0), second_conn.stmtCacheLen());
+    var reset_state = try second_conn.queryOneParams(
+        "select pg_backend_pid()::bigint as pid, " ++
+            "current_setting('search_path') = $1::text as search_path_restored, " ++
+            "current_setting('statement_timeout') = '2345ms' as timeout_restored, " ++
+            "not exists (select 1 from pg_class where relnamespace = pg_my_temp_schema() " ++
+            "and relname = 'zsql_pool_reset_temp') as temp_dropped, " ++
+            "(select count(*) from pg_listening_channels())::bigint as listeners",
+        &.{.{ .text = baseline_search_path }},
+    );
+    defer reset_state.deinit();
+    try std.testing.expectEqual(backend_pid, try (try reset_state.getName("pid")).asInt());
+    try std.testing.expect(try (try reset_state.getName("search_path_restored")).asBool());
+    try std.testing.expect(try (try reset_state.getName("timeout_restored")).asBool());
+    try std.testing.expect(try (try reset_state.getName("temp_dropped")).asBool());
+    try std.testing.expectEqual(@as(i64, 0), try (try reset_state.getName("listeners")).asInt());
+
+    // A second physical session can take the advisory lock while the reset
+    // session is still leased, proving reset released session-level locks.
+    var observer = try pg.Conn.open(allocator, std.testing.io, config);
+    defer observer.deinit();
+    var acquired = try observer.queryOneParams(
+        "select pg_try_advisory_lock($1::bigint) as acquired",
+        &.{.{ .integer = lock_key }},
+    );
+    defer acquired.deinit();
+    try std.testing.expect(try (try acquired.getName("acquired")).asBool());
+    var unlocked = try observer.queryOneParams(
+        "select pg_advisory_unlock($1::bigint) as unlocked",
+        &.{.{ .integer = lock_key }},
+    );
+    defer unlocked.deinit();
+    try std.testing.expect(try (try unlocked.getName("unlocked")).asBool());
+
+    try std.testing.expect(second_conn.stmtCacheLen() > 0);
+    try second.release();
+    try std.testing.expect(!hook_state.internal_reset_observed);
+}
+
+test "postgres live: failed pool session reset consumes lease" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(gpa_state.deinit() == .ok);
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var pool = try pg.Pool.init(failing.allocator(), std.testing.io, .{
+        .database = config,
+        .max_open = 1,
+        .max_idle = 1,
+        .session_reset = .discard_all,
+    });
+    defer pool.deinit();
+
+    var lease = try pool.acquire();
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, lease.release());
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(!lease.open);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
+
+    failing.fail_index = std.math.maxInt(usize);
+    var replacement = try pool.acquire();
+    try replacement.release();
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+}
+
 test "postgres live: lease release consumes connection when idle growth is OOM" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer std.debug.assert(gpa_state.deinit() == .ok);

@@ -5,6 +5,15 @@ const conn_mod = @import("conn.zig");
 
 const Io = std.Io;
 
+pub const SessionReset = enum {
+    /// Preserve session state across leases. Fastest and required when callers
+    /// deliberately reuse temporary objects or connection-local settings.
+    none,
+    /// Execute PostgreSQL `DISCARD ALL` before an idle connection is reused.
+    /// This isolates borrowers but clears the connection's statement cache.
+    discard_all,
+};
+
 pub const PoolConfig = struct {
     /// Cloned by `Pool.init`, including the optional peer certificate bytes.
     /// The caller retains ownership of this source configuration.
@@ -19,6 +28,10 @@ pub const PoolConfig = struct {
     /// When non-zero, each newly opened connection enables a statement cache
     /// of this size via `Conn.enableStmtCache`. Zero leaves caching off.
     stmt_cache_size: usize = 0,
+    /// Session-state policy at the lease boundary. `discard_all` removes
+    /// temporary objects, changed settings, listeners, advisory locks, and
+    /// prepared statements before the connection returns to idle.
+    session_reset: SessionReset = .none,
     /// Applied to every connection handed out by the pool (new or idle).
     /// Connection-local; no global registry. Bind values are never included.
     hooks: core.Hooks = .{},
@@ -420,6 +433,27 @@ pub const Lease = struct {
     pub fn release(self: *Lease) !void {
         if (!self.open) return error.LeaseClosed;
 
+        // Network cleanup must not run under the pool mutex. Configuration
+        // remains alive because this lease still owns one open slot, even if
+        // pool shutdown races after this snapshot.
+        self.pool.mutex.lockUncancelable(self.pool.io);
+        const reset_session = !self.pool.closed and
+            self.pool.config.session_reset == .discard_all and
+            self.conn_value.isReusable();
+        const statement_timeout_ms = self.pool.config.database.statement_timeout_ms;
+        const stmt_cache_size = self.pool.config.stmt_cache_size;
+        self.pool.mutex.unlock(self.pool.io);
+
+        if (reset_session) {
+            self.conn_value.resetForPool(statement_timeout_ms, stmt_cache_size) catch |err| {
+                // Reset failure makes session state uncertain. Release remains
+                // consuming: close the connection, return its pool slot, and
+                // surface the cleanup error to the caller.
+                self.discard() catch {};
+                return err;
+            };
+        }
+
         self.pool.mutex.lockUncancelable(self.pool.io);
         defer self.pool.mutex.unlock(self.pool.io);
 
@@ -612,9 +646,11 @@ test "postgres pool stats start empty" {
         .max_open = 2,
         .max_idle = 1,
         .stmt_cache_size = 8,
+        .session_reset = .discard_all,
     });
     defer pool.deinit();
     try std.testing.expectEqual(@as(usize, 8), pool.config.stmt_cache_size);
+    try std.testing.expect(pool.config.session_reset == .discard_all);
     try std.testing.expectEqualDeep(PoolStats{
         .open = 0,
         .idle = 0,

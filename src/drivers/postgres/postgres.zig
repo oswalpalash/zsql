@@ -34,6 +34,7 @@ pub const PooledStmt = pool.PooledStmt;
 pub const Listener = pool.Listener;
 pub const PoolConfig = pool.PoolConfig;
 pub const PoolStats = pool.PoolStats;
+pub const SessionReset = pool.SessionReset;
 pub const Migrator = migrate.Migrator;
 pub const MigrationStatus = migrate.MigrationStatus;
 pub const MigrationRecord = migrate.MigrationRecord;

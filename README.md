@@ -280,6 +280,24 @@ put it into failed state, where `begin`/`commit` return
 Pool acquire timeout: `0` = non-blocking, `std.math.maxInt(u64)` = wait forever
 (condition), any other value = deadline-based wait with ≤1 ms polling.
 
+PostgreSQL pools can enforce session isolation at lease boundaries:
+
+```zig
+var pool = try zsql.drivers.postgres.Pool.init(allocator, io, .{
+    .database = config,
+    .session_reset = .discard_all,
+});
+```
+
+The default `.none` preserves connection-local settings, temporary objects, and
+statement-cache entries for callers that deliberately need them. The opt-in
+`.discard_all` policy runs PostgreSQL `DISCARD ALL` before an idle connection is
+reused, removing changed settings, temporary objects, LISTEN registrations,
+session advisory locks, and server prepares. zsql clears and rebuilds its client
+statement cache and reapplies the configured `statement_timeout`. Reset traffic
+does not fire application query hooks. Any reset failure consumes the lease and
+closes the connection rather than exposing uncertain state to another borrower.
+
 Pools retain synchronized connections after recoverable SQL errors and discard
 closed, protocol-broken, or transaction-busy leases. A lease released with an
 open transaction is never returned to another borrower.
