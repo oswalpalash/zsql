@@ -4,6 +4,7 @@ const url = @import("url.zig");
 const conn_mod = @import("conn.zig");
 
 const Io = std.Io;
+const net = std.Io.net;
 
 pub const SessionReset = enum {
     /// Preserve session state across leases. Fastest and required when callers
@@ -605,7 +606,17 @@ pub const PooledStmt = struct {
 
     pub fn close(self: *PooledStmt) !void {
         if (self.closed) return error.StatementClosed;
-        try self.stmt.close();
+
+        self.stmt.close() catch |err| {
+            // A failed Close can leave the statement metadata already released.
+            // Finish best-effort and consume the dedicated lease either way; a
+            // pooled borrower must never be stranded by one failed teardown.
+            self.stmt.deinit();
+            self.lease.release() catch self.lease.discard() catch {};
+            self.finish();
+            return err;
+        };
+
         self.lease.release() catch |err| {
             self.lease.discard() catch {};
             self.finish();
@@ -660,6 +671,68 @@ test "postgres pool stats start empty" {
         .max_idle = 1,
         .acquire_timeout_ns = 0,
     }, pool.stats());
+}
+
+test "postgres pooled statement close failure consumes its lease" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var address: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+
+    const client = try server.socket.address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    // Conn owns the client stream once the lease is assembled below.
+    const peer = try server.accept(io);
+    defer peer.close(io);
+
+    const host = try allocator.dupe(u8, "127.0.0.1");
+    const read_buf = try allocator.alloc(u8, 128);
+    const write_buf = try allocator.alloc(u8, 128);
+    var conn = conn_mod.Conn{
+        .allocator = allocator,
+        .io = io,
+        .server_host = host,
+        .server_port = server.socket.address.getPort(),
+        .stream = client,
+        .read_buf = read_buf,
+        .write_buf = write_buf,
+        .reader = client.reader(io, read_buf),
+        .writer = client.writer(io, write_buf),
+    };
+    // Model transport loss discovered exactly at explicit-statement teardown.
+    conn.closed = true;
+
+    var config = try url.parse(allocator, "postgres://u@127.0.0.1:1/db?sslmode=disable");
+    defer config.deinit();
+    var pool = try Pool.init(allocator, io, .{ .database = config, .max_open = 1 });
+    defer pool.deinit();
+
+    pool.open_count = 1;
+    const lease = try allocator.create(Lease);
+    lease.* = .{ .pool = &pool, .conn_value = conn };
+
+    const statement_name = try allocator.dupe(u8, "zsql_ps_0");
+    const statement_sql = try allocator.dupe(u8, "select 1");
+    const oids = try allocator.alloc(u32, 1);
+    oids[0] = 23;
+    const stmt = conn_mod.Stmt{
+        .conn = &lease.conn_value,
+        .allocator = allocator,
+        .name = statement_name,
+        .sql = statement_sql,
+        .parameter_oids = oids,
+    };
+    var pooled = PooledStmt{
+        .allocator = allocator,
+        .lease = lease,
+        .stmt = stmt,
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().leased);
+    try std.testing.expectError(error.ConnectionClosed, pooled.close());
+    try std.testing.expect(pooled.closed);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().leased);
 }
 
 test "postgres pool owns connection config through deferred shutdown" {

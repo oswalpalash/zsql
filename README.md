@@ -154,8 +154,11 @@ transaction.
 dedicated lease for the statement lifetime. The lease is heap-stable so the
 statement's connection pointer remains valid even when `PooledStmt` moves.
 Closing or deinitializing the statement always happens before releasing or
-discarding its lease; a pool shutdown lets the statement finish, then closes
-the connection instead of returning it to idle. Rows returned by
+discarding its lease. If an explicit Close fails, the pooled wrapper finishes
+best-effort statement cleanup, releases or discards the dedicated lease, and
+reports the original error rather than stranding pool capacity. A pool shutdown
+lets the statement finish, then closes the connection instead of returning it to
+idle. Rows returned by
 `PooledStmt.query` / `queryNamed` own their decoded data and remain valid after
 the statement is closed and the pool is deinitialized.
 
