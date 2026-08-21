@@ -105,6 +105,10 @@ pub extern fn sqlite3_column_text(pStmt: ?*sqlite3_stmt, iCol: c_int) ?[*:0]cons
 pub extern fn sqlite3_column_blob(pStmt: ?*sqlite3_stmt, iCol: c_int) ?*const anyopaque;
 pub extern fn sqlite3_column_bytes(pStmt: ?*sqlite3_stmt, iCol: c_int) c_int;
 
+/// Returns nonzero when the database is in autocommit mode (no explicit
+/// transaction is active). This includes transactions started through raw SQL.
+pub extern fn sqlite3_get_autocommit(db: ?*sqlite3) c_int;
+
 pub extern fn sqlite3_changes(db: ?*sqlite3) c_int;
 pub extern fn sqlite3_changes64(db: ?*sqlite3) i64;
 pub extern fn sqlite3_last_insert_rowid(db: ?*sqlite3) i64;

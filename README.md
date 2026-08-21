@@ -307,7 +307,8 @@ try pg_conn.withTxWithOptions({}, .{
 ```
 
 `Conn.transactionOpen` gives both drivers an explicit view of whether a
-transaction boundary is active. Starting a nested transaction returns
+transaction boundary is active. SQLite derives this from the database engine's
+autocommit state, so even raw SQL `BEGIN` cannot evade pool health checks. Starting a nested transaction returns
 `error.ConnectionBusy`; committing or rolling back while idle returns
 `error.TransactionClosed`. PostgreSQL commands rejected inside a transaction
 put it into failed state, where `begin`/`commit` return

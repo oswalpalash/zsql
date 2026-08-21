@@ -784,14 +784,23 @@ pub const Conn = struct {
         self.closed = true;
     }
 
-    /// True when this connection is safe to return to an idle pool.
+    /// True when this connection is safe to return to an idle pool. This uses
+    /// SQLite's authoritative autocommit state so raw BEGIN/COMMIT statements
+    /// cannot hide an active transaction from pool accounting.
     pub fn isReusable(self: *const Conn) bool {
-        return !self.closed and !self.transaction_open;
+        return !self.closed and !self.transactionOpen();
     }
 
-    /// Explicit view of the wrapper-managed transaction boundary.
+    /// Explicit view of the transaction boundary, including transactions
+    /// started directly with SQL such as `BEGIN`.
     pub fn transactionOpen(self: *const Conn) bool {
-        return !self.closed and self.transaction_open;
+        if (self.closed) return false;
+        return c.sqlite3_get_autocommit(self.handle) == 0;
+    }
+
+    fn syncTransactionStateFromHandle(self: *Conn) void {
+        if (self.closed) return;
+        self.transaction_open = self.transactionOpen();
     }
 
     /// Borrowed SQLite error metadata valid until the next operation or close.
@@ -884,6 +893,7 @@ pub const Conn = struct {
     }
 
     pub fn exec(self: *Conn, sql: []const u8, binds: []const core.Value) !core.ExecResult {
+        defer self.syncTransactionStateFromHandle();
         self.clearLastError();
         const observe = !self.hooks.isEmpty();
         const start_ns: u64 = if (observe) core.hooks.monoNs() else 0;
@@ -936,6 +946,7 @@ pub const Conn = struct {
 
     pub fn execScript(self: *Conn, sql: []const u8) !void {
         if (self.closed) return error.ConnectionClosed;
+        defer self.syncTransactionStateFromHandle();
         self.clearLastError();
         execScriptSql(self.allocator, self.handle, sql) catch |err| {
             self.captureLastError(err, sql);
@@ -1072,7 +1083,7 @@ pub const Conn = struct {
 
     pub fn begin(self: *Conn) !Tx {
         if (self.closed) return error.ConnectionClosed;
-        if (self.transaction_open) return error.ConnectionBusy;
+        if (self.transactionOpen()) return error.ConnectionBusy;
         _ = try self.exec("begin", &.{});
         self.transaction_open = true;
         return .{
@@ -1082,7 +1093,7 @@ pub const Conn = struct {
 
     pub fn beginImmediate(self: *Conn) !Tx {
         if (self.closed) return error.ConnectionClosed;
-        if (self.transaction_open) return error.ConnectionBusy;
+        if (self.transactionOpen()) return error.ConnectionBusy;
         _ = try self.exec("begin immediate", &.{});
         self.transaction_open = true;
         return .{
@@ -3248,6 +3259,33 @@ test "SQLite rejects nested begin and closed transaction reuse" {
 
     var next = try conn.begin();
     try next.commit();
+}
+
+test "SQLite raw SQL transaction state stays visible to pool accounting" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    try std.testing.expect(!conn.transactionOpen());
+    try std.testing.expect(conn.isReusable());
+
+    _ = try conn.exec("begin", &.{});
+    try std.testing.expect(conn.transactionOpen());
+    try std.testing.expect(!conn.isReusable());
+    try std.testing.expectError(error.ConnectionBusy, conn.begin());
+
+    _ = try conn.exec("rollback", &.{});
+    try std.testing.expect(!conn.transactionOpen());
+    try std.testing.expect(conn.isReusable());
+
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
+    defer pool.deinit();
+
+    var lease = try pool.acquire();
+    _ = try (try lease.conn()).exec("begin", &.{});
+    try lease.release();
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
 }
 
 test "SQLite rollbackIfOpen rolls back once" {
