@@ -59,22 +59,28 @@ fn buildBeginSql(
 
     try S.put(buffer, &len, "begin");
     if (options.isolation) |isolation| {
-        const text = switch (isolation) {
+        if (len > "begin".len) try S.put(buffer, &len, ",");
+        try S.put(buffer, &len, switch (isolation) {
             .read_uncommitted => " isolation level read uncommitted",
             .read_committed => " isolation level read committed",
             .repeatable_read => " isolation level repeatable read",
             .serializable => " isolation level serializable",
-        };
-        try S.put(buffer, &len, text);
+        });
     }
     if (options.access_mode) |access| {
+        if (len > "begin".len) try S.put(buffer, &len, ",");
         try S.put(buffer, &len, switch (access) {
-            .read_write => ", read write",
-            .read_only => ", read only",
+            .read_write => " read write",
+            .read_only => " read only",
         });
     }
     if (options.deferrable) |deferrable| {
-        try S.put(buffer, &len, if (deferrable) ", deferrable" else ", not deferrable");
+        if (len > "begin".len) try S.put(buffer, &len, ",");
+        try S.put(
+            buffer,
+            &len,
+            if (deferrable) " deferrable" else " not deferrable",
+        );
     }
     return buffer[0..len];
 }
@@ -3310,6 +3316,10 @@ test "buildBeginSql emits typed characteristics exactly" {
     var buf: [128]u8 = undefined;
 
     try std.testing.expectEqualStrings("begin", try buildBeginSql(&buf, .{}));
+    try std.testing.expectEqualStrings(
+        "begin read only",
+        try buildBeginSql(&buf, .{ .access_mode = .read_only }),
+    );
     try std.testing.expectEqualStrings(
         "begin isolation level serializable, read only, deferrable",
         try buildBeginSql(&buf, .{
