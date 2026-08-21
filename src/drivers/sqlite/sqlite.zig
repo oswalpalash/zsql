@@ -1542,6 +1542,20 @@ pub const Tx = struct {
         } else |_| {}
     }
 
+    /// Run `body(ctx, tx)` inside a savepoint. A successful body releases the
+    /// savepoint; a failed body best-effort rolls back to it while preserving
+    /// the caller's original error.
+    pub fn withSavepoint(
+        self: *Tx,
+        ctx: anytype,
+        comptime body: *const fn (@TypeOf(ctx), *Tx) anyerror!void,
+    ) !void {
+        var scoped_savepoint = try self.savepoint();
+        defer if (scoped_savepoint.open) scoped_savepoint.rollbackIfOpen();
+        try body(ctx, self);
+        try scoped_savepoint.release();
+    }
+
     pub fn exec(self: *Tx, sql: []const u8, binds: []const core.Value) !core.ExecResult {
         if (!self.open) return error.TransactionClosed;
         return self.conn.exec(sql, binds);
@@ -2395,6 +2409,46 @@ test "SQLite withTx commits on success and rolls back on error" {
     defer count_rows.deinit();
     const count_row = (try count_rows.next()).?;
     try std.testing.expectEqual(@as(i64, 1), try (try count_row.value("n")).asInt());
+}
+
+test "SQLite withSavepoint commits kept work and rolls back failed work" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+    var conn = try db.connect();
+    defer conn.close();
+
+    _ = try conn.exec("create table scoped_savepoints (id integer primary key)", &.{});
+    try conn.withTx({}, struct {
+        fn run(_: void, tx: *Tx) !void {
+            _ = try tx.exec("insert into scoped_savepoints (id) values (?)", &.{.{ .integer = 1 }});
+
+            try tx.withSavepoint({}, struct {
+                fn runInner(_: void, inner_tx: *Tx) !void {
+                    _ = try inner_tx.exec(
+                        "insert into scoped_savepoints (id) values (?)",
+                        &.{.{ .integer = 2 }},
+                    );
+                }
+            }.runInner);
+
+            const failed = tx.withSavepoint({}, struct {
+                fn runInner(_: void, inner_tx: *Tx) !void {
+                    _ = try inner_tx.exec(
+                        "insert into scoped_savepoints (id) values (?)",
+                        &.{.{ .integer = 3 }},
+                    );
+                    return error.TestScopedSavepoint;
+                }
+            }.runInner);
+            try std.testing.expectError(error.TestScopedSavepoint, failed);
+        }
+    }.run);
+
+    var rows = try conn.query("select id from scoped_savepoints order by id", &.{});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try ((try rows.next()).?).as(i64, 0));
+    try std.testing.expectEqual(@as(i64, 2), try ((try rows.next()).?).as(i64, 0));
+    try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
 }
 
 test "SQLite queryOne enforces single-row cardinality" {

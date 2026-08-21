@@ -273,6 +273,18 @@ try pg_pool.withTx({}, struct {
 }.run);
 ```
 
+Use `withSavepoint` when a nested unit of work should roll back independently
+while the surrounding transaction stays usable:
+
+```zig
+// SQLite: body receives *Tx. PostgreSQL: body receives *Conn.
+try tx.withSavepoint({}, struct {
+    fn run(_: void, tx: *zsql.drivers.sqlite.Tx) !void {
+        _ = try tx.exec("insert into t (id) values (?)", &.{.{ .integer = 1 }});
+    }
+}.run);
+```
+
 Transaction state is explicit: starting a nested transaction returns
 `error.ConnectionBusy`; committing or rolling back while idle returns
 `error.TransactionClosed`. PostgreSQL commands rejected inside a transaction

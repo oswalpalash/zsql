@@ -1278,6 +1278,20 @@ pub const Conn = struct {
         try self.commit();
     }
 
+    /// Run `body(ctx, conn)` inside a savepoint in the open transaction. A
+    /// successful body releases the savepoint; a failed body best-effort rolls
+    /// back to it while preserving the caller's original error.
+    pub fn withSavepoint(
+        self: *Conn,
+        ctx: anytype,
+        comptime body: *const fn (@TypeOf(ctx), *Conn) anyerror!void,
+    ) !void {
+        var scoped_savepoint = try self.savepoint();
+        defer if (scoped_savepoint.open) scoped_savepoint.rollbackIfOpen();
+        try body(ctx, self);
+        try scoped_savepoint.release();
+    }
+
     /// Inspect base tables via `information_schema` for offline query checks.
     ///
     /// Caller owns the returned schema; free with `freeInspectedSchema`.
