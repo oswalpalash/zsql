@@ -107,9 +107,9 @@ fn requireDriver(comptime D: type) void {
     requireDecls(Statement, .{ "close", "exec", "query" });
     requireDecls(Rows, .{ "next", "deinit" });
     requireDecls(Row, .{ "get", "getName", "getOwned", "to" });
-    requireDecls(Pool, .{ "init", "deinit", "acquire" });
+    requireDecls(Pool, .{ "init", "deinit", "acquire", "withTx", "withSavepoint" });
     requireDecls(Lease, .{ "conn", "release", "discard" });
-    requireDecls(Tx, .{ "commit", "rollback", "rollbackIfOpen" });
+    requireDecls(Tx, .{ "commit", "rollback", "rollbackIfOpen", "withSavepoint" });
     requireDecls(Savepoint, .{ "release", "rollback", "rollbackIfOpen" });
     requireDecls(Migrator, .{ "init", "up", "status" });
 }

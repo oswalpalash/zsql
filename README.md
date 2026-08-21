@@ -119,8 +119,9 @@ chooses and adds one.
 Use a driver’s explicit marker for the generic façade, e.g.
 `zsql.Database(zsql.drivers.sqlite.Driver)` or
 `zsql.Pool(zsql.drivers.postgres.Driver)`. The façade selects concrete driver
-types and compile-time validates their lifecycle capabilities; driver authors
-can call `zsql.validateDriver(MyDriver)` directly. It does not normalize SQL
+types and compile-time validates lifecycle capabilities including transactional
+and scoped-savepoint workflows; driver authors can call
+`zsql.validateDriver(MyDriver)` directly. It does not normalize SQL
 dialects or erase useful ownership differences: SQLite `Database` owns the
 database handle and creates lightweight `Conn` wrappers, while PostgreSQL
 `Database` is the network `Conn` itself, so their `open` signatures remain
