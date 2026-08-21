@@ -168,6 +168,14 @@ pub fn parseIsoTime(text: []const u8) !Time {
     return .{ .ns_since_midnight = parsed.ns_since_midnight };
 }
 
+fn isoCombineDateAndTime(date_text: []const u8, time_text: []const u8) !Timestamp {
+    const days = try isoParseDateParts(date_text);
+    const time = try isoSplitTime(time_text, 6);
+    const day_us = std.math.mul(i64, days.days, 86_400_000_000) catch return error.Overflow;
+    const time_us = std.math.cast(i64, time.ns_since_midnight / 1000) orelse return error.Overflow;
+    return .{ .unix_us = std.math.add(i64, day_us, time_us) catch return error.Overflow };
+}
+
 /// Parse a naive ISO timestamp (`YYYY-MM-DD[T ]HH:MM[:SS[.fraction]]`) as UTC.
 /// At most six fractional digits are accepted because `Timestamp` has
 /// microsecond precision; a date without a time means midnight.
@@ -180,16 +188,8 @@ pub fn parseIsoTimestamp(text: []const u8) !Timestamp {
     }
 
     const parts = try isoSplitTimestamp(text);
-    const days = try isoParseDateParts(parts.date);
-    var time = try isoSplitTime(parts.time, 6);
-
-    if (std.mem.indexOfAny(u8, parts.time, "+-Zz")) |_| {
-        return error.TypeMismatch;
-    }
-    _ = &time;
-    const day_us = std.math.mul(i64, days.days, 86_400_000_000) catch return error.Overflow;
-    const time_us = std.math.cast(i64, time.ns_since_midnight / 1000) orelse return error.Overflow;
-    return .{ .unix_us = std.math.add(i64, day_us, time_us) catch return error.Overflow };
+    if (std.mem.indexOfAny(u8, parts.time, "+-Zz") != null) return error.TypeMismatch;
+    return isoCombineDateAndTime(parts.date, parts.time);
 }
 
 /// Parse an ISO timestamp with a required UTC offset (`Z` or `±HH[:]MM`) and
@@ -215,15 +215,14 @@ pub fn parseIsoTimestampTz(text: []const u8) !Timestamp {
     const found_offset = offset_start orelse return error.TypeMismatch;
     const offset_minutes = try isoOffsetMinutes(text[found_offset..]);
 
-    const naive_text = try std.fmt.allocPrint(std.heap.page_allocator, "{s} {s}", .{
+    var naive = try isoCombineDateAndTime(
         text[0..separator],
         text[separator + 1 .. found_offset],
-    });
-    defer std.heap.page_allocator.free(naive_text);
-    const naive = try parseIsoTimestamp(naive_text);
+    );
 
     const offset_us = std.math.mul(i64, offset_minutes, 60_000_000) catch return error.Overflow;
-    return .{ .unix_us = naive.unix_us - offset_us };
+    naive.unix_us = std.math.sub(i64, naive.unix_us, offset_us) catch return error.Overflow;
+    return naive;
 }
 
 /// JSON is represented as validated-by-the-database text/bytes interpreted by
