@@ -668,7 +668,9 @@ hide timezone and precision policy. For callers that choose that policy,
 `types.parseIsoDate`, `.parseIsoTime`, `.parseIsoTimestamp`, and
 `.parseIsoTimestampTz` provide strict conversion to the explicit temporal
 wrappers; timestamp parsing is UTC/naive and timestamptz parsing requires a wire
-offset and normalizes to UTC.
+offset and normalizes to UTC. Those wrappers can format back into caller buffers
+without allocation (for example, `timestamp.formatIsoUtc(&buffer)`), making the
+result straightforward to pass as SQL text.
 
 ### Offline checks
 

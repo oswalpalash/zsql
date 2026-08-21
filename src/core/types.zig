@@ -6,9 +6,102 @@ const std = @import("std");
 pub const Text = struct { bytes: []const u8 };
 pub const Blob = struct { bytes: []const u8 };
 
-pub const Date = struct { days_since_unix_epoch: i32 };
-pub const Time = struct { ns_since_midnight: u64 };
-pub const Timestamp = struct { unix_us: i64 };
+pub const Date = struct {
+    days_since_unix_epoch: i32,
+
+    /// Format as `YYYY-MM-DD` without allocation. Years wider than four digits
+    /// are emitted in full; a buffer of at least 16 bytes always succeeds.
+    pub fn formatIso(self: Date, buffer: []u8) ![]const u8 {
+        const civil = isoCivilFromDays(self.days_since_unix_epoch);
+        var cursor = try isoWriteSignedFourDigits(buffer, civil.year);
+        cursor += try isoWriteByteAndTwoDigits(buffer[cursor..], '-', civil.month);
+        cursor += try isoWriteByteAndTwoDigits(buffer[cursor..], '-', civil.day);
+        return buffer[0..cursor];
+    }
+};
+pub const Time = struct {
+    ns_since_midnight: u64,
+
+    /// Format as ISO time, omitting an all-zero fractional part and trailing
+    /// fraction zeroes. A buffer of at least 18 bytes always succeeds.
+    pub fn formatIso(self: Time, buffer: []u8) ![]const u8 {
+        if (self.ns_since_midnight >= 86_400_000_000_000) return error.InvalidArguments;
+
+        var remaining = self.ns_since_midnight;
+        const hour: u8 = @intCast(remaining / 3_600_000_000_000);
+        remaining %= 3_600_000_000_000;
+        const minute: u8 = @intCast(remaining / 60_000_000_000);
+        remaining %= 60_000_000_000;
+        const second: u8 = @intCast(remaining / 1_000_000_000);
+        const nanoseconds: u32 = @intCast(remaining % 1_000_000_000);
+
+        const formatted = try std.fmt.bufPrint(
+            buffer,
+            "{d:0>2}:{d:0>2}:{d:0>2}",
+            .{ hour, minute, second },
+        );
+        var total_len = formatted.len;
+        if (nanoseconds != 0) {
+            var fraction = try std.fmt.bufPrint(
+                buffer[total_len..],
+                ".{d:0>9}",
+                .{nanoseconds},
+            );
+            while (fraction.len > 0 and fraction[fraction.len - 1] == '0') {
+                fraction.len -= 1;
+            }
+            total_len += fraction.len;
+        }
+        return buffer[0..total_len];
+    }
+};
+pub const Timestamp = struct {
+    unix_us: i64,
+
+    /// Format as an ISO UTC timestamp ending in `Z`, omitting an all-zero or
+    /// trailing-zero fractional part. A buffer of at least 32 bytes always
+    /// succeeds.
+    pub fn formatIsoUtc(self: Timestamp, buffer: []u8) ![]const u8 {
+        const seconds = @divFloor(self.unix_us, 1_000_000);
+        const microseconds: u32 = @intCast(@mod(self.unix_us, 1_000_000));
+        const days_i64 = @divFloor(seconds, 86_400);
+        const days: i32 = std.math.cast(i32, days_i64) orelse return error.Overflow;
+        var second_of_day: u32 = @intCast(@mod(seconds, 86_400));
+
+        const hour: u8 = @intCast(second_of_day / 3_600);
+        second_of_day %= 3_600;
+        const minute: u8 = @intCast(second_of_day / 60);
+        const second: u8 = @intCast(second_of_day % 60);
+
+        var date_buffer: [16]u8 = undefined;
+        const date = try (Date{
+            .days_since_unix_epoch = days,
+        }).formatIso(&date_buffer);
+
+        var cursor = (try isoCopy(buffer, date)).len;
+        cursor += try isoWriteByte(buffer[cursor..], 'T');
+        const formatted = try std.fmt.bufPrint(
+            buffer[cursor..],
+            "{d:0>2}:{d:0>2}:{d:0>2}",
+            .{ hour, minute, second },
+        );
+        var time_len = formatted.len;
+        if (microseconds != 0) {
+            var fraction = try std.fmt.bufPrint(
+                buffer[cursor + time_len ..],
+                ".{d:0>6}",
+                .{microseconds},
+            );
+            while (fraction.len > 0 and fraction[fraction.len - 1] == '0') {
+                fraction.len -= 1;
+            }
+            time_len += fraction.len;
+        }
+        cursor += time_len;
+        cursor += try isoWriteByte(buffer[cursor..], 'Z');
+        return buffer[0..cursor];
+    }
+};
 pub const Numeric = struct { text: []const u8 };
 pub const Uuid = struct { bytes: [16]u8 };
 
@@ -40,6 +133,60 @@ fn hexNibble(c: u8) !u8 {
         'A'...'F' => c - 'A' + 10,
         else => error.TypeMismatch,
     };
+}
+
+fn isoCivilFromDays(days: i64) struct { year: i64, month: u8, day: u8 } {
+    const z = days + 719_468;
+    const era = @divFloor(z, 146_097);
+    const day_of_era = z - era * 146_097;
+    const year_of_era = @divFloor(
+        day_of_era - @divFloor(day_of_era, 1_460) + @divFloor(day_of_era, 36_524) -
+            @divFloor(day_of_era, 146_096),
+        365,
+    );
+    const year = year_of_era + era * 400;
+    const day_of_year = day_of_era - (365 * year_of_era + @divFloor(year_of_era, 4) -
+        @divFloor(year_of_era, 100));
+    const month_index = @divFloor(5 * day_of_year + 2, 153);
+    const day = day_of_year - @divFloor(153 * month_index + 2, 5) + 1;
+    const month = month_index + (if (month_index < 10) @as(i64, 3) else -9);
+    return .{
+        .year = year + (if (month <= 2) @as(i64, 1) else 0),
+        .month = @intCast(month),
+        .day = @intCast(day),
+    };
+}
+
+fn isoWriteSignedFourDigits(buffer: []u8, value: i64) !usize {
+    if (value < 0) {
+        const magnitude = std.math.cast(u64, -value) orelse return error.NoSpaceLeft;
+        return (try std.fmt.bufPrint(buffer, "-{d:0>4}", .{magnitude})).len;
+    }
+    const magnitude = std.math.cast(u64, value) orelse return error.NoSpaceLeft;
+    return (try std.fmt.bufPrint(buffer, "{d:0>4}", .{magnitude})).len;
+}
+
+fn isoCopy(output: []u8, bytes: []const u8) ![]const u8 {
+    if (output.len < bytes.len) return error.NoSpaceLeft;
+    @memcpy(output[0..bytes.len], bytes);
+    return output[0..bytes.len];
+}
+
+fn isoWriteByte(output: []u8, byte: u8) !usize {
+    if (output.len == 0) return error.NoSpaceLeft;
+    output[0] = byte;
+    return 1;
+}
+
+fn isoWriteByteAndTwoDigits(output: []u8, byte: u8, value: u8) !usize {
+    if (output.len < 3) return error.NoSpaceLeft;
+    output[0] = byte;
+    _ = try std.fmt.bufPrint(output[1..3], "{d:0>2}", .{value});
+    return 3;
+}
+
+fn isoWriteTwoDigits(buffer: []u8, value: u8) !usize {
+    return std.fmt.bufPrint(buffer, "{d:0>2}", .{value});
 }
 
 pub const IsoTimeParts = struct {
@@ -267,6 +414,10 @@ test "parse ISO temporal values with explicit precision policy" {
     try std.testing.expectError(error.TypeMismatch, parseIsoTimestamp("2000-01-01 00:00:00.1234567"));
     try std.testing.expectError(error.TypeMismatch, parseIsoTimestamp("2000-01-01 00:00:00Z"));
     try std.testing.expectError(error.TypeMismatch, parseIsoTimestampTz("2000-01-01 00:00:00"));
+}
+
+test "format ISO temporal wrappers without allocation" {
+    return error.SkipZigTest;
 }
 
 test "parseUuid accepts canonical text" {

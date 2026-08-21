@@ -579,39 +579,32 @@ test "QueryBuilder.bindJoined emits delimited atomic placeholders" {
     }
 }
 
-test "QueryBuilder.bindJoined rolls back the complete prior operation on failure" {
-    var qb = QueryBuilder.init(std.testing.allocator, .postgres);
-    try qb.appendTrustedSql("x");
+fn exerciseQueryBuilderBindJoined(allocator: std.mem.Allocator) !void {
+    var qb = QueryBuilder.init(allocator, .postgres);
     defer qb.deinit();
 
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
-        // Force failure inside the joined batch.
-        .fail_index = 0,
-    });
-    qb.allocator = failing.allocator();
-
-    const initial_sql = try std.testing.allocator.dupe(u8, qb.sqlSlice());
-    defer std.testing.allocator.free(initial_sql);
-
-    var saw_oom = false;
+    try qb.appendTrustedSql("x");
     if (qb.bindJoined(.{ "first", "second" }, ", ")) |_| {
-        return error.TestExpectedError;
+        try std.testing.expectEqualStrings("x$1, $2", qb.sqlSlice());
+        try std.testing.expectEqual(@as(usize, 2), qb.bindsSlice().len);
+        try std.testing.expectEqual(@as(usize, 2), qb.owned.items.len);
+        try std.testing.expectEqual(@as(usize, 3), qb.next_index);
     } else |err| {
         if (err != error.OutOfMemory) return err;
-        saw_oom = true;
+        try std.testing.expectEqualStrings("x", qb.sqlSlice());
+        try std.testing.expectEqual(@as(usize, 0), qb.bindsSlice().len);
+        try std.testing.expectEqual(@as(usize, 0), qb.owned.items.len);
+        try std.testing.expectEqual(@as(usize, 1), qb.next_index);
+        return error.OutOfMemory;
     }
+}
 
-    qb.allocator = std.testing.allocator;
-    try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expect(saw_oom);
-    try std.testing.expectEqualStrings("x", initial_sql);
-    try std.testing.expectEqualStrings("x", qb.sqlSlice());
-    try std.testing.expectEqual(@as(usize, 0), qb.bindsSlice().len);
-    try std.testing.expectEqual(@as(usize, 0), qb.owned.items.len);
-    try std.testing.expectEqual(@as(usize, 1), qb.next_index);
-
-    try qb.bindJoined(.{ "first", "second" }, ", ");
-    try std.testing.expectEqualStrings("x$1, $2", qb.sqlSlice());
+test "QueryBuilder.bindJoined cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseQueryBuilderBindJoined,
+        .{},
+    );
 }
 
 test "QueryBuilder.bindAll restores the complete prior operation on failure" {
