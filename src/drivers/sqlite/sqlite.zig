@@ -197,27 +197,54 @@ pub const Pool = struct {
     ///   for capacity to open a new connection; then `PoolTimeout`.
     pub fn acquireWithTimeout(self: *Pool, timeout_ns: u64) !Lease {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
 
         const deadline: ?std.Io.Clock.Timestamp = if (timeout_ns == 0 or timeout_ns == std.math.maxInt(u64))
             null
         else
-            std.Io.Clock.Timestamp.fromNow(self.io, .{ .raw = .{ .nanoseconds = @intCast(timeout_ns) }, .clock = .awake });
+            std.Io.Clock.Timestamp.fromNow(self.io, .{
+                .raw = .{ .nanoseconds = @intCast(timeout_ns) },
+                .clock = .awake,
+            });
 
         while (true) {
-            if (self.closed) return error.PoolClosed;
+            if (self.closed) {
+                self.mutex.unlock(self.io);
+                return error.PoolClosed;
+            }
 
             if (self.idle.pop()) |idle_db| {
                 var db = idle_db;
-                errdefer {
-                    // Return the handle to idle on connect failure after unlock
-                    // is unsafe here; close it and drop open_count instead.
-                    db.deinit();
+                // The popped handle still owns one accounting slot. Keep local
+                // connect/cache work out of the accounting mutex.
+                self.mutex.unlock(self.io);
+
+                var conn = db.connect() catch |err| {
+                    self.mutex.lockUncancelable(self.io);
                     self.dropOpenSlotLocked();
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+
+                self.configureConn(&conn) catch |err| {
+                    conn.close();
+                    db.deinit();
+                    self.mutex.lockUncancelable(self.io);
+                    self.dropOpenSlotLocked();
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+
+                self.mutex.lockUncancelable(self.io);
+                if (self.closed) {
+                    self.mutex.unlock(self.io);
+                    conn.close();
+                    db.deinit();
+                    self.mutex.lockUncancelable(self.io);
+                    self.dropOpenSlotLocked();
+                    self.mutex.unlock(self.io);
+                    return error.PoolClosed;
                 }
-                var conn = try db.connect();
-                errdefer conn.close();
-                try self.configureConn(&conn);
+                self.mutex.unlock(self.io);
                 return .{
                     .pool = self,
                     .db = db,
@@ -227,17 +254,43 @@ pub const Pool = struct {
 
             if (self.open_count < self.config.max_open) {
                 self.open_count += 1;
+                self.mutex.unlock(self.io);
+
                 var opened = Database.open(self.allocator, self.config.database) catch |err| {
+                    self.mutex.lockUncancelable(self.io);
                     self.dropOpenSlotLocked();
+                    self.mutex.unlock(self.io);
                     return err;
                 };
-                errdefer {
+
+                var conn = opened.connect() catch |err| {
                     opened.deinit();
+                    self.mutex.lockUncancelable(self.io);
                     self.dropOpenSlotLocked();
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+
+                self.configureConn(&conn) catch |err| {
+                    conn.close();
+                    opened.deinit();
+                    self.mutex.lockUncancelable(self.io);
+                    self.dropOpenSlotLocked();
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+
+                self.mutex.lockUncancelable(self.io);
+                if (self.closed) {
+                    self.mutex.unlock(self.io);
+                    conn.close();
+                    opened.deinit();
+                    self.mutex.lockUncancelable(self.io);
+                    self.dropOpenSlotLocked();
+                    self.mutex.unlock(self.io);
+                    return error.PoolClosed;
                 }
-                var conn = try opened.connect();
-                errdefer conn.close();
-                try self.configureConn(&conn);
+                self.mutex.unlock(self.io);
                 return .{
                     .pool = self,
                     .db = opened,
@@ -245,15 +298,19 @@ pub const Pool = struct {
                 };
             }
 
-            // Pool is full: wait or fail.
+            // Pool is full: wait or fail. Wait helpers re-lock before returning.
             if (timeout_ns == 0) {
+                self.mutex.unlock(self.io);
                 return error.PoolExhausted;
             } else if (timeout_ns == std.math.maxInt(u64)) {
-                // Infinite wait: condition wait re-locks the mutex on wake.
                 self.available.waitUncancelable(self.io, &self.mutex);
             } else if (deadline) |dl| {
-                try self.waitForSlotTimed(dl);
+                self.waitForSlotTimed(dl) catch |err| {
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
             } else {
+                self.mutex.unlock(self.io);
                 return error.PoolExhausted;
             }
         }
@@ -3591,6 +3648,57 @@ test "SQLite pool timed acquire unblocks after concurrent release" {
 
     try std.testing.expect(ctx.ok.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), ctx.err_len);
+}
+
+test "SQLite pool keeps stats responsive during connection setup" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 12 });
+    defer pool.deinit();
+
+    const Worker = struct {
+        pool: *Pool,
+        done: std.atomic.Value(bool) = .init(false),
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var index: usize = 0;
+            while (index < 8) : (index += 1) {
+                var lease = self.pool.acquire() catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+                lease.release() catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+            }
+            self.done.store(true, .release);
+        }
+    };
+
+    var workers: [12]Worker = undefined;
+    var threads: [12]std.Thread = undefined;
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{ .pool = &pool };
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    }
+
+    while (true) {
+        _ = pool.stats();
+        var done_count: usize = 0;
+        for (&workers) |*worker| {
+            if (worker.done.load(.acquire)) done_count += 1;
+        }
+        if (done_count == workers.len) break;
+        try std.testing.io.sleep(.{ .nanoseconds = std.time.ns_per_ms }, .awake);
+    }
+
+    for (&threads) |*thread| thread.join();
+    for (&workers) |*worker| {
+        try std.testing.expect(!worker.failed.load(.acquire));
+        try std.testing.expect(worker.done.load(.acquire));
+    }
 }
 
 test "SQLite lease release consumes connection when idle growth is OOM" {
