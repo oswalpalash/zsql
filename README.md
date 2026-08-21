@@ -563,6 +563,9 @@ try qb.bind(@as(i64, 1)); // Zig scalars OK
 
 // Bind a tuple/slice atomically; callers supply any needed separators.
 try qb.bindAll(.{ 2, "ada" });
+
+// Or let the builder insert trusted separators between placeholders.
+try qb.bindJoined(.{ 2, "ada" }, ", ");
 // qb.sqlSlice() + qb.bindsSlice() for driver execParams/queryParams
 
 // Reuse the configured builder for another statement.

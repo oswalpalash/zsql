@@ -148,6 +148,50 @@ pub const QueryBuilder = struct {
         }
     }
 
+    /// Bind every element of a slice, array, or tuple, appending `separator`
+    /// between adjacent placeholders. This is the delimiter-aware form of
+    /// `bindAll`; like that operation, binding is all-or-nothing. The separator
+    /// is trusted caller input and is appended verbatim.
+    pub fn bindJoined(
+        self: *QueryBuilder,
+        values: anytype,
+        separator: []const u8,
+    ) !void {
+        const sql_len = self.sql.items.len;
+        const binds_len = self.binds.items.len;
+        const owned_len = self.owned.items.len;
+        const next_index = self.next_index;
+        errdefer self.rollbackBind(sql_len, binds_len, owned_len, next_index);
+
+        switch (@typeInfo(@TypeOf(values))) {
+            .pointer => |pointer| switch (pointer.size) {
+                .slice => for (values, 0..) |value, index| {
+                    if (index != 0) try self.sql.appendSlice(self.allocator, separator);
+                    try self.bind(value);
+                },
+                .one => for (values, 0..) |value, index| {
+                    if (index != 0) try self.sql.appendSlice(self.allocator, separator);
+                    try self.bind(value);
+                },
+                else => @compileError("QueryBuilder.bindJoined supports slices, arrays, and tuples"),
+            },
+            .array => for (values, 0..) |value, index| {
+                if (index != 0) try self.sql.appendSlice(self.allocator, separator);
+                try self.bind(value);
+            },
+            .@"struct" => |structure| {
+                if (!structure.is_tuple) {
+                    @compileError("QueryBuilder.bindJoined supports slices, arrays, and tuples");
+                }
+                inline for (values, 0..) |value, index| {
+                    if (index != 0) try self.sql.appendSlice(self.allocator, separator);
+                    try self.bind(value);
+                }
+            },
+            else => @compileError("QueryBuilder.bindJoined supports slices, arrays, and tuples"),
+        }
+    }
+
     pub fn sqlSlice(self: *const QueryBuilder) []const u8 {
         return self.sql.items;
     }
@@ -453,6 +497,68 @@ test "QueryBuilder.bindAll binds tuples, arrays, and slices atomically" {
         );
         try std.testing.expectEqual(@as(usize, 2), qb.bindsSlice().len);
     }
+}
+
+test "QueryBuilder.bindJoined emits delimited atomic placeholders" {
+    inline for (.{ QueryBuilder.Dialect.postgres, QueryBuilder.Dialect.sqlite }) |dialect| {
+        var qb = QueryBuilder.init(std.testing.allocator, dialect);
+        defer qb.deinit();
+
+        try qb.appendTrustedSql("values (");
+        try qb.bindJoined(.{ 1, "owned text", Value{ .blob = "\x00\x01" }, null }, ", ");
+        try qb.appendTrustedSql(")");
+        try std.testing.expectEqualStrings(
+            if (dialect == .postgres)
+                "values ($1, $2, $3, $4)"
+            else
+                "values (?, ?, ?, ?)",
+            qb.sqlSlice(),
+        );
+        try std.testing.expectEqual(@as(usize, 4), qb.bindsSlice().len);
+        try std.testing.expectEqualStrings("owned text", qb.bindsSlice()[1].text);
+
+        qb.reset();
+        try qb.appendTrustedSql("values (");
+        try qb.bindJoined(.{}, ", ");
+        try qb.appendTrustedSql(")");
+        try std.testing.expectEqualStrings("values ()", qb.sqlSlice());
+        try std.testing.expectEqual(@as(usize, 0), qb.bindsSlice().len);
+    }
+}
+
+test "QueryBuilder.bindJoined rolls back the complete prior operation on failure" {
+    var qb = QueryBuilder.init(std.testing.allocator, .postgres);
+    try qb.appendTrustedSql("x");
+    defer qb.deinit();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        // Force failure inside the joined batch.
+        .fail_index = 0,
+    });
+    qb.allocator = failing.allocator();
+
+    const initial_sql = try std.testing.allocator.dupe(u8, qb.sqlSlice());
+    defer std.testing.allocator.free(initial_sql);
+
+    var saw_oom = false;
+    if (qb.bindJoined(.{ "first", "second" }, ", ")) |_| {
+        return error.TestExpectedError;
+    } else |err| {
+        if (err != error.OutOfMemory) return err;
+        saw_oom = true;
+    }
+
+    qb.allocator = std.testing.allocator;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(saw_oom);
+    try std.testing.expectEqualStrings("x", initial_sql);
+    try std.testing.expectEqualStrings("x", qb.sqlSlice());
+    try std.testing.expectEqual(@as(usize, 0), qb.bindsSlice().len);
+    try std.testing.expectEqual(@as(usize, 0), qb.owned.items.len);
+    try std.testing.expectEqual(@as(usize, 1), qb.next_index);
+
+    try qb.bindJoined(.{ "first", "second" }, ", ");
+    try std.testing.expectEqualStrings("x$1, $2", qb.sqlSlice());
 }
 
 test "QueryBuilder.bindAll restores the complete prior operation on failure" {
