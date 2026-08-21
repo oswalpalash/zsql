@@ -301,9 +301,10 @@ statement-cache entries for callers that deliberately need them. The opt-in
 `.discard_all` policy runs PostgreSQL `DISCARD ALL` before an idle connection is
 reused, removing changed settings, temporary objects, LISTEN registrations,
 session advisory locks, and server prepares. zsql clears and rebuilds its client
-statement cache, and restores `statement_timeout` in the same hook-free
-simple-query batch. Events received through that batch boundary belong to the
-previous borrower and are discarded rather than delivered later. Any reset failure consumes
+statement cache, and pipelines timeout restoration behind cleanup as two
+hook-free Query messages. Their final ReadyForQuery is one round-trip boundary;
+events received through it belong to the previous borrower and are discarded
+rather than delivered later. Any reset failure consumes
 the lease and closes the connection rather than exposing uncertain state to
 another borrower.
 

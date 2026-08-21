@@ -465,23 +465,26 @@ pub const Conn = struct {
         self.clearStmtCacheLocal();
         self.clearPendingNotifications();
 
-        // Keep restoration in one simple-query batch so its ReadyForQuery is
-        // also the asynchronous-message boundary. Separate round trips could
-        // collect a stale borrower event between cleanup and restoration.
-        var reset_sql_buf: [64]u8 = undefined;
-        const reset_sql = if (statement_timeout_ms) |ms|
-            try std.fmt.bufPrint(
-                &reset_sql_buf,
-                "discard all; set statement_timeout to {d};",
+        // DISCARD ALL cannot share one simple-query string with SET because
+        // PostgreSQL treats that batch as a transaction block. Pipelining the
+        // two Query messages keeps one round trip and one final Ready boundary
+        // without changing their independent backend transaction semantics.
+        var timeout_sql_buf: [64]u8 = undefined;
+        var commands: [2][]const u8 = .{ "discard all", undefined };
+        var command_count: usize = 1;
+        if (statement_timeout_ms) |ms| {
+            commands[1] = try std.fmt.bufPrint(
+                &timeout_sql_buf,
+                "set statement_timeout to {d}",
                 .{ms},
-            )
-        else
-            "discard all;";
-        _ = try self.execUnobserved(reset_sql);
+            );
+            command_count = 2;
+        }
 
-        // An event in flight while the batch completed belongs to the previous
-        // borrower as well. Statement-cache rebuild is local, so this is the
-        // final network boundary before the connection becomes observable.
+        // Events collected through the final Ready belonged to the previous
+        // borrower. Statement-cache rebuild is local, so reset performs no I/O
+        // after this boundary.
+        try self.execSimpleBatchUnobserved(commands[0..command_count]);
         self.clearPendingNotifications();
 
         if (stmt_cache_size > 0) {
@@ -603,6 +606,59 @@ pub const Conn = struct {
                 else => return error.ProtocolError,
             }
         }
+    }
+
+    /// Execute a small batch of trusted simple queries as independent backend
+    /// commands while preserving one client round trip. All requests are
+    /// written before reading, so notifications generated between commands are
+    /// collected before the final ReadyForQuery.
+    fn execSimpleBatchUnobserved(self: *Conn, commands: []const []const u8) !void {
+        if (self.closed) return error.ConnectionClosed;
+        if (commands.len == 0 or commands.len > 2) return error.InvalidArguments;
+
+        var packets: [2][]u8 = undefined;
+        var built: usize = 0;
+        defer for (packets[0..built]) |packet| self.allocator.free(packet);
+        for (commands, 0..) |sql, index| {
+            packets[index] = try protocol.buildQueryMessage(self.allocator, sql);
+            built = index + 1;
+        }
+
+        var pending_error: ?anyerror = null;
+        var failed_sql: []const u8 = "";
+        for (packets[0..built]) |packet| try self.writeAll(packet);
+
+        // A failed early command does not cancel later pipelined commands.
+        // Continue through the final Ready so successful completion leaves the
+        // wire synchronized, then surface the first SQL failure.
+        var completed: usize = 0;
+        while (completed < commands.len) {
+            const msg = try self.readMessage();
+            defer self.allocator.free(msg.body);
+            switch (msg.tag) {
+                .command_complete => _ = try protocol.parseCommandComplete(msg.body),
+                .parameter_status, .notice_response => {},
+                .notification_response => try self.queueNotification(msg.body),
+                .ready_for_query => {
+                    self.tx_status = protocol.parseReadyForQuery(msg.body) catch {
+                        self.broken = true;
+                        return error.ProtocolError;
+                    };
+                    completed += 1;
+                },
+                .error_response => {
+                    if (pending_error == null) {
+                        failed_sql = commands[@min(completed, commands.len - 1)];
+                        const err = self.failFromErrorResponse(msg.body, false, failed_sql);
+                        if (err == error.OutOfMemory) return err;
+                        pending_error = err;
+                    }
+                },
+                else => return error.ProtocolError,
+            }
+        }
+
+        if (pending_error) |err| return err;
     }
 
     /// Execute parameterized SQL via the extended query protocol (Parse/Bind/Execute/Sync).
@@ -2505,33 +2561,52 @@ test "pool reset drains asynchronous events after restoration" {
     var peer_reader = pair.peer.reader(io, &peer_read_buf);
     var peer_writer = pair.peer.writer(io, &peer_writer_buf);
 
-    // Answer the single combined reset batch before invoking the synchronous
-    // reset. The event precedes ReadyForQuery and must disappear with the batch.
-    try peer_writer.interface.writeAll(&.{
-        'A', 0,   0, 0,   12,
-        0,   0,   0, 1,   'c',
-        0,   's', 0, 'Z', 0,
-        0,   0,   5, 'I',
-    });
-    try peer_writer.interface.flush();
+    const Peer = struct {
+        fn run(reader: *net.Stream.Reader, writer: *net.Stream.Writer) !void {
+            var header: [5]u8 = undefined;
+            var scratch: [128]u8 = undefined;
+            const expected_sqls = [_][]const u8{
+                "discard all",
+                "set statement_timeout to 2345",
+            };
+            for (expected_sqls) |expected_sql| {
+                var header_iovecs = [_][]u8{&header};
+                try reader.interface.readVecAll(&header_iovecs);
+
+                const body_len = std.mem.readInt(u32, header[1..5], .big) - 4;
+                try std.testing.expect(body_len > 0 and body_len <= scratch.len);
+                var body_iovecs = [_][]u8{scratch[0..body_len]};
+                try reader.interface.readVecAll(&body_iovecs);
+                try std.testing.expectEqual(
+                    @as(u8, @intFromEnum(protocol.FrontendTag.query)),
+                    header[0],
+                );
+                try std.testing.expectEqualStrings(expected_sql, scratch[0 .. body_len - 1]);
+            }
+
+            // DISCARD completes independently, then timeout restoration follows.
+            // The stale event is collected before the second (and final) Ready.
+            try writer.interface.writeAll(&.{
+                'C', 0,   0,   0,   16,
+                'D', 'I', 'S', 'C', 'A',
+                'R', 'D', ' ', 'A', 'L',
+                'L', 0,   'Z', 0,   0,
+                0,   5,   'I', 'C', 0,
+                0,   0,   8,   'S', 'E',
+                'T', 0,   'A', 0,   0,
+                0,   12,  0,   0,   0,
+                1,   'c', 0,   's', 0,
+                'Z', 0,   0,   0,   5,
+                'I',
+            });
+            try writer.interface.flush();
+        }
+    };
+
+    const peer_thread = try std.Thread.spawn(.{}, Peer.run, .{ &peer_reader, &peer_writer });
+    defer peer_thread.join();
 
     try pair.conn.resetForPool(2345, 0);
-
-    var header: [5]u8 = undefined;
-    var header_iovecs = [_][]u8{&header};
-    try peer_reader.interface.readVecAll(&header_iovecs);
-
-    const body_len = std.mem.readInt(u32, header[1..5], .big) - 4;
-    var scratch: [128]u8 = undefined;
-    try std.testing.expect(body_len > 0 and body_len <= scratch.len);
-    var body_iovecs = [_][]u8{scratch[0..body_len]};
-    try peer_reader.interface.readVecAll(&body_iovecs);
-
-    try std.testing.expectEqual(@as(u8, @intFromEnum(protocol.FrontendTag.query)), header[0]);
-    try std.testing.expectEqualStrings(
-        "discard all; set statement_timeout to 2345;",
-        scratch[0 .. body_len - 1],
-    );
 
     try std.testing.expectEqual(@as(usize, 0), pair.conn.pendingNotificationCount());
     try std.testing.expect(pair.conn.isReusable());
