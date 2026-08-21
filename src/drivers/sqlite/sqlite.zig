@@ -158,16 +158,23 @@ pub const Pool = struct {
 
     pub fn deinit(self: *Pool) void {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.closed) return;
+        if (self.closed) {
+            self.mutex.unlock(self.io);
+            return;
+        }
         self.closed = true;
 
-        const idle_count = self.idle.items.len;
-        for (self.idle.items) |*db| {
-            db.deinit();
-        }
-        self.idle.deinit(self.allocator);
+        // Detach idle database handles while holding the accounting lock, then
+        // perform local teardown without blocking stats or unrelated waiters.
+        var closing = self.idle;
         self.idle = .empty;
+        const idle_count = closing.items.len;
+        self.mutex.unlock(self.io);
+
+        for (closing.items) |*db| db.deinit();
+        closing.deinit(self.allocator);
+
+        self.mutex.lockUncancelable(self.io);
         std.debug.assert(self.open_count >= idle_count);
         self.open_count -= idle_count;
         self.deinitConfigIfUnusedLocked();
@@ -175,6 +182,7 @@ pub const Pool = struct {
         // Existing leases close themselves when returned. Infinite waiters are
         // broadcast; finite waiters observe `closed` within their ≤1ms poll.
         self.available.broadcast(self.io);
+        self.mutex.unlock(self.io);
     }
 
     /// Acquire a lease using `PoolConfig.acquire_timeout_ns`.
@@ -474,40 +482,33 @@ pub const Lease = struct {
         if (!self.open) return error.LeaseClosed;
 
         self.pool.mutex.lockUncancelable(self.pool.io);
-        defer self.pool.mutex.unlock(self.pool.io);
 
-        if (self.pool.closed) {
-            self.conn_value.close();
-            self.db.deinit();
+        if (self.pool.closed or !self.conn_value.isReusable()) {
+            self.deinitLeaseOutsideMutex();
             self.pool.dropOpenSlotLocked();
             self.open = false;
-            return error.PoolClosed;
-        }
-
-        if (!self.conn_value.isReusable()) {
-            self.conn_value.close();
-            self.db.deinit();
-            self.pool.dropOpenSlotLocked();
-            self.open = false;
+            const closed = self.pool.closed;
+            self.pool.mutex.unlock(self.pool.io);
+            if (closed) return error.PoolClosed;
             return;
         }
 
         if (self.pool.idle.items.len < self.pool.effectiveMaxIdle()) {
             self.pool.idle.append(self.pool.allocator, self.db) catch |err| {
-                self.conn_value.close();
-                self.db.deinit();
+                self.deinitLeaseOutsideMutex();
                 self.pool.dropOpenSlotLocked();
                 self.open = false;
+                self.pool.mutex.unlock(self.pool.io);
                 return err;
             };
             self.conn_value.close();
         } else {
-            self.conn_value.close();
-            self.db.deinit();
+            self.deinitLeaseOutsideMutex();
             self.pool.dropOpenSlotLocked();
         }
         self.open = false;
         if (self.pool.idle.items.len > 0) self.pool.notifyAvailable();
+        self.pool.mutex.unlock(self.pool.io);
     }
 
     fn finishAfterError(self: *Lease, err: anyerror) void {
@@ -522,12 +523,19 @@ pub const Lease = struct {
         if (!self.open) return error.LeaseClosed;
 
         self.pool.mutex.lockUncancelable(self.pool.io);
-        defer self.pool.mutex.unlock(self.pool.io);
-
-        self.conn_value.close();
-        self.db.deinit();
+        self.deinitLeaseOutsideMutex();
         self.pool.dropOpenSlotLocked();
         self.open = false;
+        self.pool.mutex.unlock(self.pool.io);
+    }
+
+    /// The caller holds and regains the pool mutex. The lease's open-slot
+    /// reservation keeps owned configuration alive across local cleanup.
+    fn deinitLeaseOutsideMutex(self: *Lease) void {
+        self.pool.mutex.unlock(self.pool.io);
+        self.conn_value.close();
+        self.db.deinit();
+        self.pool.mutex.lockUncancelable(self.pool.io);
     }
 };
 
@@ -3708,6 +3716,42 @@ test "SQLite pool withSavepoint keeps outer transaction and releases lease" {
     defer rows.deinit();
     try std.testing.expectEqual(@as(i64, 1), try ((try rows.next()).?).as(i64, 0));
     try std.testing.expectEqual(@as(?core.Row, null), rows.next());
+}
+
+test "SQLite pool teardown keeps accounting mutex responsive" {
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{
+        .max_open = 32,
+        .max_idle = 32,
+    });
+    defer pool.deinit();
+
+    var leases: [32]Lease = undefined;
+    for (&leases) |*lease| lease.* = try pool.acquire();
+    for (&leases) |*lease| try lease.release();
+    try std.testing.expectEqual(@as(usize, 32), pool.stats().idle);
+
+    const Worker = struct {
+        pool: *Pool,
+        ready: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.ready.store(true, .release);
+            self.pool.deinit();
+            self.done.store(true, .release);
+        }
+    };
+    var worker = Worker{ .pool = &pool };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    defer thread.join();
+
+    while (!worker.done.load(.acquire)) {
+        // Exercise accounting while detached handles are being torn down.
+        _ = pool.stats();
+        try std.testing.io.sleep(.{ .nanoseconds = std.time.ns_per_ms }, .awake);
+    }
+    try std.testing.expect(worker.ready.load(.acquire));
+    try std.testing.expect(pool.closed);
 }
 
 test "SQLite pool releases a rolled-back application error connection" {
