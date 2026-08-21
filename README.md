@@ -301,9 +301,11 @@ statement-cache entries for callers that deliberately need them. The opt-in
 `.discard_all` policy runs PostgreSQL `DISCARD ALL` before an idle connection is
 reused, removing changed settings, temporary objects, LISTEN registrations,
 session advisory locks, and server prepares. zsql clears and rebuilds its client
-statement cache and reapplies the configured `statement_timeout`. Reset traffic
-does not fire application query hooks. Any reset failure consumes the lease and
-closes the connection rather than exposing uncertain state to another borrower.
+statement cache, reapplies the configured `statement_timeout`, and forces one
+final wire boundary so stale asynchronous events cannot leak across borrowers.
+Reset traffic does not fire application query hooks. Any reset failure consumes
+the lease and closes the connection rather than exposing uncertain state to
+another borrower.
 
 Pools retain synchronized connections after recoverable SQL errors and discard
 closed, protocol-broken, or transaction-busy leases. Destructive PostgreSQL
