@@ -663,10 +663,12 @@ leaking any partially collected result storage.
 
 `zsql.types.Text`, `Blob`, `Numeric`, and canonical-text `Uuid` decode through
 the same borrowed row path. PostgreSQL `date`, `time`, `timestamp`, and
-`timestamptz` are intentionally exposed as raw text in this release: parsing
-them implicitly would require timezone and precision policy that zsql does not
-hide. The explicit `Date`, `Time`, and `Timestamp` wrappers are available for
-application-owned conversions.
+`timestamptz` intentionally remain raw text by default: implicit parsing would
+hide timezone and precision policy. For callers that choose that policy,
+`types.parseIsoDate`, `.parseIsoTime`, `.parseIsoTimestamp`, and
+`.parseIsoTimestampTz` provide strict conversion to the explicit temporal
+wrappers; timestamp parsing is UTC/naive and timestamptz parsing requires a wire
+offset and normalizes to UTC.
 
 ### Offline checks
 
