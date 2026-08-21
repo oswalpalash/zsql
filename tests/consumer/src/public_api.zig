@@ -66,7 +66,7 @@ pub fn validate() void {
             "Migrator",
             "Driver",
         });
-        requireDecls(zsql.QueryBuilder, .{ "init", "deinit", "reset", "appendTrustedSql", "rawUnsafe", "ident", "identPath", "identSegments", "bind", "sqlSlice", "bindsSlice" });
+        requireDecls(zsql.QueryBuilder, .{ "init", "deinit", "reset", "appendTrustedSql", "rawUnsafe", "ident", "identPath", "identSegments", "bind", "bindAll", "sqlSlice", "bindsSlice" });
         requireDecls(zsql.drivers.postgres.Notification, .{"deinit"});
         requireDecls(zsql.drivers.postgres.Listener, .{ "listen", "unlisten", "next", "deinit" });
         requireDecls(zsql.drivers.postgres.Conn, .{ "copyIn", "copyOut", "withTxWithOptions" });

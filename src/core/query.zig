@@ -120,6 +120,34 @@ pub const QueryBuilder = struct {
         }
     }
 
+    /// Bind every element of a slice, array, or tuple as an all-or-nothing
+    /// operation. Each element accepts the same values as `bind`; if any later
+    /// element fails, SQL, bind order, ownership, and placeholder indexes are
+    /// restored to their state before this call.
+    pub fn bindAll(self: *QueryBuilder, values: anytype) !void {
+        const sql_len = self.sql.items.len;
+        const binds_len = self.binds.items.len;
+        const owned_len = self.owned.items.len;
+        const next_index = self.next_index;
+        errdefer self.rollbackBind(sql_len, binds_len, owned_len, next_index);
+
+        switch (@typeInfo(@TypeOf(values))) {
+            .pointer => |pointer| switch (pointer.size) {
+                .slice => for (values) |value| try self.bind(value),
+                .one => for (values) |value| try self.bind(value),
+                else => @compileError("QueryBuilder.bindAll supports slices, arrays, and tuples"),
+            },
+            .array => for (values) |value| try self.bind(value),
+            .@"struct" => |structure| {
+                if (!structure.is_tuple) {
+                    @compileError("QueryBuilder.bindAll supports slices, arrays, and tuples");
+                }
+                inline for (values) |value| try self.bind(value);
+            },
+            else => @compileError("QueryBuilder.bindAll supports slices, arrays, and tuples"),
+        }
+    }
+
     pub fn sqlSlice(self: *const QueryBuilder) []const u8 {
         return self.sql.items;
     }
@@ -391,6 +419,73 @@ test "QueryBuilder.reset enables leak-free reuse with fresh placeholders" {
         qb.sqlSlice(),
     );
     try std.testing.expectEqualStrings("second", qb.bindsSlice()[0].text);
+}
+
+test "QueryBuilder.bindAll binds tuples, arrays, and slices atomically" {
+    inline for (.{ QueryBuilder.Dialect.postgres, QueryBuilder.Dialect.sqlite }) |dialect| {
+        var qb = QueryBuilder.init(std.testing.allocator, dialect);
+        defer qb.deinit();
+
+        try qb.appendTrustedSql("values (");
+        try qb.bindAll(.{ 1, "owned text", Value{ .blob = "\x00\x01" }, null });
+        try qb.appendTrustedSql(")");
+        try std.testing.expectEqualStrings(
+            if (dialect == .postgres)
+                "values ($1$2$3$4)"
+            else
+                "values (????)",
+            qb.sqlSlice(),
+        );
+        try std.testing.expectEqual(@as(usize, 4), qb.bindsSlice().len);
+        try std.testing.expectEqualStrings("owned text", qb.bindsSlice()[1].text);
+
+        qb.reset();
+        try qb.appendTrustedSql("values (");
+        const values = [_]Value{ .{ .integer = 7 }, .null };
+        try qb.bindAll(&values);
+        try qb.appendTrustedSql(")");
+        try std.testing.expectEqualStrings(
+            if (dialect == .postgres)
+                "values ($1$2)"
+            else
+                "values (??)",
+            qb.sqlSlice(),
+        );
+        try std.testing.expectEqual(@as(usize, 2), qb.bindsSlice().len);
+    }
+}
+
+test "QueryBuilder.bindAll restores the complete prior operation on failure" {
+    var qb = QueryBuilder.init(std.testing.allocator, .postgres);
+    try qb.appendTrustedSql("x");
+    defer qb.deinit();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    qb.allocator = failing.allocator();
+
+    const initial_sql = try std.testing.allocator.dupe(u8, qb.sqlSlice());
+    defer std.testing.allocator.free(initial_sql);
+
+    var saw_oom = false;
+    if (qb.bindAll(.{ "first", "second" })) |_| {
+        return error.TestExpectedError;
+    } else |err| {
+        if (err != error.OutOfMemory) return err;
+        saw_oom = true;
+    }
+
+    qb.allocator = std.testing.allocator;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(saw_oom);
+    try std.testing.expectEqualStrings("x", qb.sqlSlice());
+    try std.testing.expectEqual(@as(usize, 0), qb.bindsSlice().len);
+    try std.testing.expectEqual(@as(usize, 0), qb.owned.items.len);
+    try std.testing.expectEqual(@as(usize, 1), qb.next_index);
+
+    try qb.bindAll(.{ "first", "second" });
+    try std.testing.expectEqualStrings("x$1$2", qb.sqlSlice());
 }
 
 test "QueryBuilder.bind cleans every allocation failure" {
