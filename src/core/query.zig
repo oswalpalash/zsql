@@ -93,8 +93,26 @@ pub const QueryBuilder = struct {
         }
     }
 
+    /// Quote every name in a slice and join the quoted identifiers with
+    /// `separator`. The separator is trusted caller input and is appended
+    /// verbatim. An invalid or failed later identifier rolls back the entire
+    /// operation.
+    pub fn identJoined(
+        self: *QueryBuilder,
+        names: []const []const u8,
+        separator: []const u8,
+    ) !void {
+        const sql_len = self.sql.items.len;
+        errdefer self.sql.shrinkRetainingCapacity(sql_len);
+
+        for (names, 0..) |name, index| {
+            if (index != 0) try self.sql.appendSlice(self.allocator, separator);
+            try self.ident(name);
+        }
+    }
+
     /// Bind a parameter. Accepts `Value` or common Zig scalars (`bool`, integers,
-    /// floats, `[]const u8` text, optionals, and `null`). Values are never
+    /// floats, `[]const u8`, optionals, and `null`). Values are never
     /// concatenated into the SQL string.
     pub fn bind(self: *QueryBuilder, value: anytype) !void {
         const sql_len = self.sql.items.len;
@@ -463,6 +481,41 @@ test "QueryBuilder.reset enables leak-free reuse with fresh placeholders" {
         qb.sqlSlice(),
     );
     try std.testing.expectEqualStrings("second", qb.bindsSlice()[0].text);
+}
+
+test "QueryBuilder.identJoined quotes a dynamic identifier list" {
+    inline for (.{ QueryBuilder.Dialect.postgres, QueryBuilder.Dialect.sqlite }) |dialect| {
+        var qb = QueryBuilder.init(std.testing.allocator, dialect);
+        defer qb.deinit();
+
+        try qb.appendTrustedSql("select ");
+        try qb.identJoined(&.{ "id", "public users", "weird\"name" }, ", ");
+        try qb.appendTrustedSql(" from t");
+        try std.testing.expectEqualStrings(
+            "select \"id\", \"public users\", \"weird\"\"name\" from t",
+            qb.sqlSlice(),
+        );
+
+        try qb.appendTrustedSql(" where ");
+        const before = qb.sqlSlice().len;
+        try std.testing.expectError(error.InvalidArguments, qb.identJoined(&.{ "ok", "" }, ", "));
+        try std.testing.expectEqual(before, qb.sqlSlice().len);
+    }
+}
+
+fn exerciseIdentJoinedAllocations(allocator: std.mem.Allocator) !void {
+    var qb = QueryBuilder.init(allocator, .postgres);
+    defer qb.deinit();
+    try qb.appendTrustedSql("x");
+    try qb.identJoined(&.{ "first", "second" }, ", ");
+}
+
+test "QueryBuilder.identJoined cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseIdentJoinedAllocations,
+        .{},
+    );
 }
 
 test "QueryBuilder.bindAll binds tuples, arrays, and slices atomically" {

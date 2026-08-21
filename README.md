@@ -558,6 +558,8 @@ try qb.appendTrustedSql("select * from ");
 try qb.ident("users");
 // or: try qb.identPath("public.users");
 // or: try qb.identSegments(&.{ "public", "users" });
+// or: atomically quote a dynamic list with trusted separators:
+try qb.identJoined(&.{ "id", "name" }, ", ");
 try qb.appendTrustedSql(" where id = ");
 try qb.bind(@as(i64, 1)); // Zig scalars OK
 
