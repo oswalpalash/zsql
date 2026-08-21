@@ -1469,6 +1469,9 @@ pub const Conn = struct {
         if (self.closed) return error.ConnectionClosed;
         if (self.tx_status != .in_transaction) return error.TransactionClosed;
 
+        if (self.next_savepoint_id == std.math.maxInt(usize)) {
+            return error.IntegerOverflow;
+        }
         const id = self.next_savepoint_id;
         self.next_savepoint_id += 1;
 
@@ -3216,6 +3219,21 @@ test "savepoint names are deterministic prefixes" {
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "zsql_sp_{d}", .{0});
     try std.testing.expectEqualStrings("zsql_sp_0", name);
+}
+
+test "PostgreSQL savepoint counter exhaustion is explicit" {
+    var pair = try makeTestConnPair(std.testing.allocator);
+    defer pair.conn.deinit();
+    defer pair.peer.close(std.testing.io);
+
+    pair.conn.tx_status = .in_transaction;
+    pair.conn.next_savepoint_id = std.math.maxInt(usize);
+
+    try std.testing.expectError(error.IntegerOverflow, pair.conn.savepoint());
+    try std.testing.expectEqual(
+        @as(usize, std.math.maxInt(usize)),
+        pair.conn.next_savepoint_id,
+    );
 }
 
 test "prepared invalidation classification is narrow" {
