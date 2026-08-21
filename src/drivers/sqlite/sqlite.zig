@@ -697,6 +697,11 @@ pub const Conn = struct {
         return !self.closed and !self.transaction_open;
     }
 
+    /// Explicit view of the wrapper-managed transaction boundary.
+    pub fn transactionOpen(self: *const Conn) bool {
+        return !self.closed and self.transaction_open;
+    }
+
     /// Borrowed SQLite error metadata valid until the next operation or close.
     /// Contains statement text but never bind parameter values.
     pub fn lastError(self: *const Conn) ?core.DbError {
@@ -1533,8 +1538,8 @@ pub const Tx = struct {
         if (!self.open) return;
         if (self.conn.exec("rollback", &.{})) |_| {
             self.conn.transaction_open = false;
+            self.open = false;
         } else |_| {}
-        self.open = false;
     }
 
     pub fn exec(self: *Tx, sql: []const u8, binds: []const core.Value) !core.ExecResult {
@@ -1554,8 +1559,7 @@ pub const Tx = struct {
 
     pub fn savepoint(self: *Tx) !Savepoint {
         if (!self.open) return error.TransactionClosed;
-        const id = self.next_savepoint_id;
-        self.next_savepoint_id += 1;
+        const id = try allocateSavepointId(&self.next_savepoint_id);
 
         var name_buffer: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buffer, "zsql_sp_{d}", .{id});
@@ -1576,6 +1580,13 @@ pub const Tx = struct {
         _ = try self.conn.exec(sql, &.{});
     }
 };
+
+fn allocateSavepointId(counter: *usize) !usize {
+    if (counter.* == std.math.maxInt(usize)) return error.IntegerOverflow;
+    const id = counter.*;
+    counter.* += 1;
+    return id;
+}
 
 pub const Savepoint = struct {
     tx: *Tx,
@@ -3111,6 +3122,39 @@ test "SQLite rollbackIfOpen rolls back once" {
     var rows = try conn.query("select id from tx_auto_rollback", &.{});
     defer rows.deinit();
     try std.testing.expectEqual(@as(?core.Row, null), try rows.next());
+}
+
+test "SQLite rollback failure keeps the transaction retryable" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    var tx = try conn.begin();
+    try std.testing.expect(conn.transactionOpen());
+
+    // Model a transient cleanup failure without closing the underlying handle.
+    conn.closed = true;
+    tx.rollbackIfOpen();
+    try std.testing.expect(tx.open);
+    try std.testing.expect(!conn.transactionOpen());
+    try std.testing.expect(conn.transaction_open);
+
+    conn.closed = false;
+    try tx.rollback();
+    try std.testing.expect(!tx.open);
+    try std.testing.expectEqual(false, conn.transactionOpen());
+}
+
+test "SQLite savepoint identifiers reject exhaustion without wrapping" {
+    var counter: usize = std.math.maxInt(usize);
+    try std.testing.expectError(error.IntegerOverflow, allocateSavepointId(&counter));
+    try std.testing.expectEqual(std.math.maxInt(usize), counter);
+
+    counter = 0;
+    try std.testing.expectEqual(@as(usize, 0), try allocateSavepointId(&counter));
+    try std.testing.expectEqual(@as(usize, 1), counter);
 }
 
 test "SQLite savepoint release keeps inner changes" {

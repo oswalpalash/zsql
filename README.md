@@ -276,6 +276,9 @@ put it into failed state, where `begin`/`commit` return
 `error.TransactionAborted` until `rollback` restores the session.
 `Savepoint.rollback` is also valid in PostgreSQL's failed state and performs
 `ROLLBACK TO` followed by `RELEASE`, restoring the outer transaction for use.
+SQLite's best-effort `rollbackIfOpen` keeps a transaction open for an explicit
+retry if that rollback attempt fails, so pool health checks still see busy state
+rather than mistaking cleanup for completion.
 
 Pool acquire timeout: `0` = non-blocking, `std.math.maxInt(u64)` = wait forever
 (condition), any other value = deadline-based wait with ≤1 ms polling.
