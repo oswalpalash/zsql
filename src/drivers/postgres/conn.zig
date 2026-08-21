@@ -464,19 +464,29 @@ pub const Conn = struct {
         // those resources with it.
         self.clearStmtCacheLocal();
         self.clearPendingNotifications();
-        _ = try self.execUnobserved("discard all");
-        // A notification already in flight can precede DISCARD ALL's command
-        // response. It belongs to the previous borrower as well.
+
+        // Keep restoration in one simple-query batch so its ReadyForQuery is
+        // also the asynchronous-message boundary. Separate round trips could
+        // collect a stale borrower event between cleanup and restoration.
+        var reset_sql_buf: [64]u8 = undefined;
+        const reset_sql = if (statement_timeout_ms) |ms|
+            try std.fmt.bufPrint(
+                &reset_sql_buf,
+                "discard all; set statement_timeout to {d};",
+                .{ms},
+            )
+        else
+            "discard all;";
+        _ = try self.execUnobserved(reset_sql);
+
+        // An event in flight while the batch completed belongs to the previous
+        // borrower as well. Statement-cache rebuild is local, so this is the
+        // final network boundary before the connection becomes observable.
         self.clearPendingNotifications();
 
-        if (statement_timeout_ms) |ms| try self.setStatementTimeoutMs(ms);
-        if (stmt_cache_size > 0) self.stmt_cache = try core.StmtCache.init(self.allocator, stmt_cache_size);
-
-        // Restoration traffic can collect asynchronous messages that belonged
-        // to the previous borrower. Force one final wire boundary, then drop
-        // everything received before the next borrower becomes observable.
-        _ = try self.execUnobserved("");
-        self.clearPendingNotifications();
+        if (stmt_cache_size > 0) {
+            self.stmt_cache = try core.StmtCache.init(self.allocator, stmt_cache_size);
+        }
     }
 
     fn clearStmtCacheLocal(self: *Conn) void {
@@ -2487,8 +2497,7 @@ fn makeTestConnPair(allocator: std.mem.Allocator) !TestConnPair {
 test "pool reset drains asynchronous events after restoration" {
     var pair = try makeTestConnPair(std.testing.allocator);
     defer pair.conn.deinit();
-    const peer_open = true;
-    defer if (peer_open) pair.peer.close(std.testing.io);
+    defer pair.peer.close(std.testing.io);
 
     const io = std.testing.io;
     var peer_read_buf: [256]u8 = undefined;
@@ -2496,53 +2505,34 @@ test "pool reset drains asynchronous events after restoration" {
     var peer_reader = pair.peer.reader(io, &peer_read_buf);
     var peer_writer = pair.peer.writer(io, &peer_writer_buf);
 
-    const Peer = struct {
-        fn run(
-            reader: *net.Stream.Reader,
-            writer: *net.Stream.Writer,
-        ) !void {
-            var header: [5]u8 = undefined;
-            for (0..3) |index| {
-                var header_iovecs = [_][]u8{&header};
-                try reader.interface.readVecAll(&header_iovecs);
-
-                const body_len = std.mem.readInt(u32, header[1..5], .big) - 4;
-                var scratch: [128]u8 = undefined;
-                if (body_len != 0) {
-                    try std.testing.expect(body_len <= scratch.len);
-                    var body_iovecs = [_][]u8{scratch[0..body_len]};
-                    try reader.interface.readVecAll(&body_iovecs);
-                }
-                try std.testing.expectEqual(
-                    @as(u8, @intFromEnum(protocol.FrontendTag.query)),
-                    header[0],
-                );
-
-                // The final exchange is the restoration boundary. A stale
-                // borrower event can arrive immediately before its
-                // ReadyForQuery; reset must discard it rather than deliver it
-                // to the next borrower.
-                if (index == 2) {
-                    try writer.interface.writeAll(&.{
-                        'A', 0,   0, 0, 12,
-                        0,   0,   0, 1, 'c',
-                        0,   's', 0,
-                    });
-                }
-                try writer.interface.writeAll(&.{ 'Z', 0, 0, 0, 5, 'I' });
-                try writer.interface.flush();
-            }
-        }
-    };
-
-    const peer_thread = try std.Thread.spawn(
-        .{},
-        Peer.run,
-        .{ &peer_reader, &peer_writer },
-    );
-    defer peer_thread.join();
+    // Answer the single combined reset batch before invoking the synchronous
+    // reset. The event precedes ReadyForQuery and must disappear with the batch.
+    try peer_writer.interface.writeAll(&.{
+        'A', 0,   0, 0,   12,
+        0,   0,   0, 1,   'c',
+        0,   's', 0, 'Z', 0,
+        0,   0,   5, 'I',
+    });
+    try peer_writer.interface.flush();
 
     try pair.conn.resetForPool(2345, 0);
+
+    var header: [5]u8 = undefined;
+    var header_iovecs = [_][]u8{&header};
+    try peer_reader.interface.readVecAll(&header_iovecs);
+
+    const body_len = std.mem.readInt(u32, header[1..5], .big) - 4;
+    var scratch: [128]u8 = undefined;
+    try std.testing.expect(body_len > 0 and body_len <= scratch.len);
+    var body_iovecs = [_][]u8{scratch[0..body_len]};
+    try peer_reader.interface.readVecAll(&body_iovecs);
+
+    try std.testing.expectEqual(@as(u8, @intFromEnum(protocol.FrontendTag.query)), header[0]);
+    try std.testing.expectEqualStrings(
+        "discard all; set statement_timeout to 2345;",
+        scratch[0 .. body_len - 1],
+    );
+
     try std.testing.expectEqual(@as(usize, 0), pair.conn.pendingNotificationCount());
     try std.testing.expect(pair.conn.isReusable());
 }
