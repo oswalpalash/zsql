@@ -561,6 +561,9 @@ try qb.ident("users");
 try qb.appendTrustedSql(" where id = ");
 try qb.bind(@as(i64, 1)); // Zig scalars OK
 // qb.sqlSlice() + qb.bindsSlice() for driver execParams/queryParams
+
+// Reuse the configured builder for another statement.
+qb.reset();
 ```
 
 Unsafe raw append is named `rawUnsafe` on purpose.

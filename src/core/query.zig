@@ -39,6 +39,17 @@ pub const QueryBuilder = struct {
         self.* = undefined;
     }
 
+    /// Clear SQL, binds, and owned payloads so the builder can build another
+    /// statement. Allocator and dialect remain configured; backing storage may
+    /// be retained to make repeated dynamic queries allocation-friendly.
+    pub fn reset(self: *QueryBuilder) void {
+        self.sql.clearRetainingCapacity();
+        self.binds.clearRetainingCapacity();
+        for (self.owned.items) |buf| self.allocator.free(buf);
+        self.owned.clearRetainingCapacity();
+        self.next_index = 1;
+    }
+
     pub fn appendTrustedSql(self: *QueryBuilder, sql: []const u8) !void {
         try self.sql.appendSlice(self.allocator, sql);
     }
@@ -352,6 +363,34 @@ fn exerciseQueryBuilderBindAllocations(
     try qb.appendTrustedSql(", ");
     try qb.bind(Value{ .blob = "\x00\x01" });
     try qb.appendTrustedSql(")");
+}
+
+test "QueryBuilder.reset enables leak-free reuse with fresh placeholders" {
+    var qb = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer qb.deinit();
+
+    try qb.appendTrustedSql("select \"value\" from \"items\" where \"id\" = ");
+    try qb.bind(@as([]const u8, "first"));
+    const first_sql = try std.testing.allocator.dupe(u8, qb.sqlSlice());
+    defer std.testing.allocator.free(first_sql);
+    try std.testing.expectEqualStrings(
+        "select \"value\" from \"items\" where \"id\" = $1",
+        first_sql,
+    );
+
+    qb.reset();
+    try std.testing.expectEqual(@as(usize, 0), qb.sqlSlice().len);
+    try std.testing.expectEqual(@as(usize, 0), qb.bindsSlice().len);
+    try std.testing.expectEqual(@as(usize, 0), qb.owned.items.len);
+    try std.testing.expectEqual(@as(usize, 1), qb.next_index);
+
+    try qb.appendTrustedSql("select \"name\" from \"users\" where \"id\" = ");
+    try qb.bind(@as([]const u8, "second"));
+    try std.testing.expectEqualStrings(
+        "select \"name\" from \"users\" where \"id\" = $1",
+        qb.sqlSlice(),
+    );
+    try std.testing.expectEqualStrings("second", qb.bindsSlice()[0].text);
 }
 
 test "QueryBuilder.bind cleans every allocation failure" {
