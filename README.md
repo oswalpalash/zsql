@@ -306,7 +306,9 @@ does not fire application query hooks. Any reset failure consumes the lease and
 closes the connection rather than exposing uncertain state to another borrower.
 
 Pools retain synchronized connections after recoverable SQL errors and discard
-closed, protocol-broken, or transaction-busy leases. A lease released with an
+closed, protocol-broken, or transaction-busy leases. Destructive PostgreSQL
+cleanup performs protocol I/O outside the accounting mutex, so one stalled peer
+cannot freeze stats or unrelated lease release. A lease released with an
 open transaction is never returned to another borrower.
 `Pool.init` clones connection configuration needed by future opens: PostgreSQL
 URL fields and optional peer-certificate bytes, or the SQLite database path.

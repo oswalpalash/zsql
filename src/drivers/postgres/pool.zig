@@ -87,18 +87,28 @@ pub const Pool = struct {
 
     pub fn deinit(self: *Pool) void {
         self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.closed) return;
+        if (self.closed) {
+            self.mutex.unlock(self.io);
+            return;
+        }
         self.closed = true;
 
-        const idle_count = self.idle.items.len;
-        for (self.idle.items) |*c| c.deinit();
-        self.idle.deinit(self.allocator);
+        // Detach idle connections while holding the accounting lock, then do
+        // protocol teardown with the mutex released so a stalled peer cannot
+        // block unrelated leases or stats.
+        var closing = self.idle;
         self.idle = .empty;
+        const idle_count = closing.items.len;
+        self.mutex.unlock(self.io);
+
+        for (closing.items) |*c| c.deinit();
+        closing.deinit(self.allocator);
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         std.debug.assert(self.open_count >= idle_count);
         self.open_count -= idle_count;
         self.deinitConfigIfUnusedLocked();
-
         self.available.broadcast(self.io);
     }
 
@@ -460,14 +470,14 @@ pub const Lease = struct {
         defer self.pool.mutex.unlock(self.pool.io);
 
         if (self.pool.closed) {
-            self.conn_value.deinit();
+            self.deinitConnOutsideMutex();
             self.pool.dropOpenSlotLocked();
             self.open = false;
             return error.PoolClosed;
         }
 
         if (!self.conn_value.isReusable()) {
-            self.conn_value.deinit();
+            self.deinitConnOutsideMutex();
             self.pool.dropOpenSlotLocked();
             self.open = false;
             return;
@@ -478,13 +488,13 @@ pub const Lease = struct {
                 // Release always consumes the lease. If idle storage cannot
                 // grow, close allocation-free instead of transferring a
                 // cleanup obligation back to the caller.
-                self.conn_value.deinit();
+                self.deinitConnOutsideMutex();
                 self.pool.dropOpenSlotLocked();
                 self.open = false;
                 return err;
             };
         } else {
-            self.conn_value.deinit();
+            self.deinitConnOutsideMutex();
             self.pool.dropOpenSlotLocked();
         }
         self.open = false;
@@ -503,11 +513,18 @@ pub const Lease = struct {
         if (!self.open) return error.LeaseClosed;
 
         self.pool.mutex.lockUncancelable(self.pool.io);
-        defer self.pool.mutex.unlock(self.pool.io);
-
-        self.conn_value.deinit();
+        self.deinitConnOutsideMutex();
         self.pool.dropOpenSlotLocked();
+        defer self.pool.mutex.unlock(self.pool.io);
         self.open = false;
+    }
+
+    /// The caller holds and regains the pool mutex. The lease's open-slot
+    /// reservation keeps pool configuration alive across the unlocked cleanup.
+    fn deinitConnOutsideMutex(self: *Lease) void {
+        self.pool.mutex.unlock(self.pool.io);
+        self.conn_value.deinit();
+        self.pool.mutex.lockUncancelable(self.pool.io);
     }
 };
 
@@ -799,6 +816,96 @@ test "postgres pooled close OOM discards instead of idling uncertain session" {
     try std.testing.expect(pooled.closed);
     try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
     try std.testing.expectEqual(@as(usize, 0), pool.stats().idle);
+}
+
+test "postgres destructive lease cleanup keeps the pool mutex available" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var address: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+
+    const client = try server.socket.address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    const peer = try server.accept(io);
+    defer peer.close(io);
+
+    const host = try allocator.dupe(u8, "127.0.0.1");
+    const read_buf = try allocator.alloc(u8, 128);
+    const write_buf = try allocator.alloc(u8, 128);
+    var conn = conn_mod.Conn{
+        .allocator = allocator,
+        .io = io,
+        .server_host = host,
+        .server_port = server.socket.address.getPort(),
+        .stream = client,
+        .read_buf = read_buf,
+        .write_buf = write_buf,
+        .reader = client.reader(io, read_buf),
+        .writer = client.writer(io, write_buf),
+    };
+    conn.stmt_cache = try core.StmtCache.init(allocator, 1);
+    _ = try conn.stmt_cache.?.put("select 1", "zsql_ps_0");
+
+    var config = try url.parse(allocator, "postgres://u@127.0.0.1:1/db?sslmode=disable");
+    defer config.deinit();
+    var pool = try Pool.init(allocator, io, .{ .database = config, .max_open = 1 });
+    defer pool.deinit();
+
+    pool.open_count = 1;
+    const lease = try allocator.create(Lease);
+    lease.* = .{ .pool = &pool, .conn_value = conn };
+
+    const Worker = struct {
+        lease: *Lease,
+        ready: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.ready.store(true, .release);
+            self.lease.discard() catch {};
+            self.done.store(true, .release);
+        }
+    };
+    var worker = Worker{ .lease = lease };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    defer thread.join();
+
+    while (!worker.ready.load(.acquire)) {
+        try io.sleep(.{ .nanoseconds = std.time.ns_per_ms }, .awake);
+    }
+
+    // Read the cached Close/Sync exchange but do not answer yet. The worker is
+    // now blocked on ReadyForQuery while it owns no pool lock.
+    var peer_read_buf: [128]u8 = undefined;
+    var peer_reader = peer.reader(io, &peer_read_buf);
+    var request: [20]u8 = undefined;
+    try peer_reader.interface.readSliceAll(&request);
+
+    // This call is the regression: old destructive paths held the mutex across
+    // the network wait above and therefore could not service stats here.
+    const blocked_stats = pool.stats();
+    try std.testing.expectEqual(@as(usize, 1), blocked_stats.open);
+    try std.testing.expectEqual(@as(usize, 1), blocked_stats.leased);
+
+    var peer_write_buf: [64]u8 = undefined;
+    var peer_writer = peer.writer(io, &peer_write_buf);
+    try peer_writer.interface.writeAll(&.{
+        '3', 0, 0, 0, 4,
+        'Z', 0, 0, 0, 5,
+        'I',
+    });
+    try peer_writer.interface.flush();
+
+    while (!worker.done.load(.acquire)) {
+        try io.sleep(.{ .nanoseconds = std.time.ns_per_ms }, .awake);
+    }
+    try std.testing.expect(!lease.open);
+    const final_stats = pool.stats();
+    try std.testing.expectEqual(@as(usize, 0), final_stats.open);
+    try std.testing.expectEqual(@as(usize, 0), final_stats.idle);
+    allocator.destroy(lease);
 }
 
 test "postgres pool owns connection config through deferred shutdown" {
