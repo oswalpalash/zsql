@@ -1726,6 +1726,39 @@ test "postgres live: pool withSavepoint scopes failures and releases lease" {
     try std.testing.expectEqual(@as(?pg.SimpleRow, null), rows.next());
 }
 
+test "postgres live: withTxWithOptions starts a read-only transaction" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var pool = try pg.Pool.init(allocator, io, .{
+        .database = config,
+        .max_open = 1,
+        .max_idle = 1,
+    });
+    defer pool.deinit();
+
+    const Result = struct { read_only: bool };
+    var result: Result = undefined;
+    try pool.withTxWithOptions(&result, .{ .access_mode = .read_only }, struct {
+        fn run(out: *Result, conn: *pg.Conn) !void {
+            var rows = try conn.query(
+                "select current_setting('transaction_read_only') as read_only",
+            );
+            defer rows.deinit();
+            out.read_only = try rows.next().?.as(bool, 0);
+        }
+    }.run);
+
+    try std.testing.expect(result.read_only);
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+}
+
 test "postgres live: pool commits after savepoint recovery" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();

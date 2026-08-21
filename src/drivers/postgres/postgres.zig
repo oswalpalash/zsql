@@ -26,6 +26,9 @@ pub const SimpleRows = conn.SimpleRows;
 pub const SimpleRow = conn.SimpleRow;
 pub const Notification = conn.Notification;
 pub const Savepoint = conn.Savepoint;
+pub const TransactionOptions = conn.TransactionOptions;
+pub const TransactionAccessMode = conn.TransactionAccessMode;
+pub const TransactionIsolationLevel = conn.TransactionIsolationLevel;
 // Conn.queryOneParams is available on Conn for single-row queries.
 pub const Pool = pool.Pool;
 pub const Lease = pool.Lease;

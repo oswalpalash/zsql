@@ -60,13 +60,22 @@ pub fn validate() void {
             "PooledStmt",
             "Listener",
             "Savepoint",
+            "TransactionOptions",
+            "TransactionAccessMode",
+            "TransactionIsolationLevel",
             "Migrator",
             "Driver",
         });
         requireDecls(zsql.drivers.postgres.Notification, .{"deinit"});
         requireDecls(zsql.drivers.postgres.Listener, .{ "listen", "unlisten", "next", "deinit" });
-        requireDecls(zsql.drivers.postgres.Conn, .{ "copyIn", "copyOut" });
-        requireDecls(zsql.drivers.postgres.Pool, .{ "prepare", "prepareNamed", "copyIn", "copyOut" });
+        requireDecls(zsql.drivers.postgres.Conn, .{ "copyIn", "copyOut", "withTxWithOptions" });
+        requireDecls(zsql.drivers.postgres.Pool, .{
+            "prepare",
+            "prepareNamed",
+            "copyIn",
+            "copyOut",
+            "withTxWithOptions",
+        });
         requireDecls(zsql.drivers.postgres.PooledRows, .{ "next", "deinit" });
         requireDecls(zsql.drivers.postgres.PooledStmt, .{ "exec", "query", "execNamed", "queryNamed", "close", "deinit" });
 

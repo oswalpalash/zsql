@@ -14,6 +14,71 @@ const TlsClient = std.crypto.tls.Client;
 const stream_buf_len = TlsClient.min_buffer_len;
 const app_buf_len = 16 * 1024;
 
+/// Explicit transaction access mode accepted by PostgreSQL BEGIN options.
+pub const TransactionAccessMode = enum {
+    read_write,
+    read_only,
+};
+
+/// Explicit isolation level accepted by PostgreSQL BEGIN options.
+pub const TransactionIsolationLevel = enum {
+    read_uncommitted,
+    read_committed,
+    repeatable_read,
+    serializable,
+};
+
+/// Typed PostgreSQL BEGIN transaction characteristics. Unset fields omit the
+/// corresponding clause and use the server/session default.
+pub const TransactionOptions = struct {
+    isolation: ?TransactionIsolationLevel = null,
+    access_mode: ?TransactionAccessMode = null,
+    deferrable: ?bool = null,
+};
+
+fn buildBeginSql(
+    buffer: []u8,
+    options: TransactionOptions,
+) ![]const u8 {
+    // PostgreSQL rejects DEFERRABLE unless the transaction is both SERIALIZABLE
+    // and READ ONLY. Rejecting here gives callers a local, retry-free contract.
+    if (options.deferrable == true and
+        (options.isolation != .serializable or options.access_mode != .read_only))
+    {
+        return error.InvalidArguments;
+    }
+
+    var len: usize = 0;
+    const S = struct {
+        fn put(output: []u8, used: *usize, text: []const u8) !void {
+            if (output.len - used.* < text.len) return error.NoSpaceLeft;
+            @memcpy(output[used.*..][0..text.len], text);
+            used.* += text.len;
+        }
+    };
+
+    try S.put(buffer, &len, "begin");
+    if (options.isolation) |isolation| {
+        const text = switch (isolation) {
+            .read_uncommitted => " isolation level read uncommitted",
+            .read_committed => " isolation level read committed",
+            .repeatable_read => " isolation level repeatable read",
+            .serializable => " isolation level serializable",
+        };
+        try S.put(buffer, &len, text);
+    }
+    if (options.access_mode) |access| {
+        try S.put(buffer, &len, switch (access) {
+            .read_write => ", read write",
+            .read_only => ", read only",
+        });
+    }
+    if (options.deferrable) |deferrable| {
+        try S.put(buffer, &len, if (deferrable) ", deferrable" else ", not deferrable");
+    }
+    return buffer[0..len];
+}
+
 /// Live PostgreSQL connection after a successful startup handshake.
 ///
 /// Ownership:
@@ -1234,13 +1299,23 @@ pub const Conn = struct {
     }
 
     pub fn begin(self: *Conn) !void {
+        return self.beginWithOptions(.{});
+    }
+
+    /// Begin a transaction with typed PostgreSQL characteristics. Invalid
+    /// combinations (notably DEFERRABLE outside a serializable read-only
+    /// transaction) are rejected before any network I/O.
+    pub fn beginWithOptions(self: *Conn, options: TransactionOptions) !void {
         if (self.closed) return error.ConnectionClosed;
         switch (self.tx_status) {
             .idle => {},
             .in_transaction => return error.ConnectionBusy,
             .failed => return error.TransactionAborted,
         }
-        _ = try self.exec("begin");
+
+        var sql_buf: [128]u8 = undefined;
+        const sql = try buildBeginSql(&sql_buf, options);
+        _ = try self.exec(sql);
     }
 
     pub fn commit(self: *Conn) !void {
@@ -1278,7 +1353,18 @@ pub const Conn = struct {
     /// }.run);
     /// ```
     pub fn withTx(self: *Conn, ctx: anytype, comptime body: *const fn (@TypeOf(ctx), *Conn) anyerror!void) !void {
-        try self.begin();
+        return self.withTxWithOptions(ctx, .{}, body);
+    }
+
+    /// Run `body(ctx, conn)` in a transaction started with explicit PostgreSQL
+    /// characteristics. Commit on success; roll back if `body` returns an error.
+    pub fn withTxWithOptions(
+        self: *Conn,
+        ctx: anytype,
+        options: TransactionOptions,
+        comptime body: *const fn (@TypeOf(ctx), *Conn) anyerror!void,
+    ) !void {
+        try self.beginWithOptions(options);
         errdefer self.rollbackIfOpen();
         try body(ctx, self);
         try self.commit();
@@ -3219,6 +3305,61 @@ pub const Savepoint = struct {
         return self.name[0..self.name_len];
     }
 };
+
+test "buildBeginSql emits typed characteristics exactly" {
+    var buf: [128]u8 = undefined;
+
+    try std.testing.expectEqualStrings("begin", try buildBeginSql(&buf, .{}));
+    try std.testing.expectEqualStrings(
+        "begin isolation level serializable, read only, deferrable",
+        try buildBeginSql(&buf, .{
+            .isolation = .serializable,
+            .access_mode = .read_only,
+            .deferrable = true,
+        }),
+    );
+    try std.testing.expectError(error.InvalidArguments, buildBeginSql(&buf, .{
+        .isolation = .repeatable_read,
+        .access_mode = .read_only,
+        .deferrable = true,
+    }));
+}
+
+test "beginWithOptions sends typed transaction characteristics" {
+    var pair = try makeTestConnPair(std.testing.allocator);
+    defer pair.conn.deinit();
+    defer pair.peer.close(std.testing.io);
+
+    const io = std.testing.io;
+    var peer_read_buf: [256]u8 = undefined;
+    var peer_writer_buf: [64]u8 = undefined;
+    var peer_reader = pair.peer.reader(io, &peer_read_buf);
+    var peer_writer = pair.peer.writer(io, &peer_writer_buf);
+
+    try peer_writer.interface.writeAll(&.{ 'Z', 0, 0, 0, 5, 'T' });
+    try peer_writer.interface.flush();
+
+    try pair.conn.beginWithOptions(.{
+        .isolation = .repeatable_read,
+        .access_mode = .read_only,
+    });
+
+    var header: [5]u8 = undefined;
+    var header_iovecs = [_][]u8{&header};
+    try peer_reader.interface.readVecAll(&header_iovecs);
+    const body_len = std.mem.readInt(u32, header[1..5], .big) - 4;
+    var scratch: [128]u8 = undefined;
+    try std.testing.expect(body_len > 0 and body_len <= scratch.len);
+    var body_iovecs = [_][]u8{scratch[0..body_len]};
+    try peer_reader.interface.readVecAll(&body_iovecs);
+
+    try std.testing.expectEqual(@as(u8, @intFromEnum(protocol.FrontendTag.query)), header[0]);
+    try std.testing.expectEqualStrings(
+        "begin isolation level repeatable read, read only",
+        scratch[0 .. body_len - 1],
+    );
+    try std.testing.expect(pair.conn.transactionOpen());
+}
 
 test "PostgreSQL transactionOpen reflects protocol boundaries" {
     var pair = try makeTestConnPair(std.testing.allocator);

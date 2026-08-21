@@ -293,6 +293,19 @@ try pg_pool.withSavepoint({}, struct {
 }.run);
 ```
 
+PostgreSQL transactions can start with typed characteristics:
+
+```zig
+try pg_conn.withTxWithOptions({}, .{
+    .isolation = .repeatable_read,
+    .access_mode = .read_only,
+}, struct {
+    fn run(_: void, c: *zsql.drivers.postgres.Conn) !void {
+        _ = try c.execParams("select * from reports", &.{});
+    }
+}.run);
+```
+
 `Conn.transactionOpen` gives both drivers an explicit view of whether a
 transaction boundary is active. Starting a nested transaction returns
 `error.ConnectionBusy`; committing or rolling back while idle returns
