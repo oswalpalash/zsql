@@ -400,6 +400,12 @@ pub const Conn = struct {
         return !self.closed and !self.broken and self.tx_status == .idle;
     }
 
+    /// Explicit view of the wire-managed transaction boundary. A closed
+    /// connection no longer exposes its prior protocol state as open.
+    pub fn transactionOpen(self: *const Conn) bool {
+        return !self.closed and self.tx_status != .idle;
+    }
+
     /// Replace connection-local query hooks. Pass `.{}` to clear.
     pub fn setHooks(self: *Conn, hooks: core.Hooks) void {
         self.hooks = hooks;
@@ -3213,6 +3219,21 @@ pub const Savepoint = struct {
         return self.name[0..self.name_len];
     }
 };
+
+test "PostgreSQL transactionOpen reflects protocol boundaries" {
+    var pair = try makeTestConnPair(std.testing.allocator);
+    defer pair.conn.deinit();
+    defer pair.peer.close(std.testing.io);
+
+    try std.testing.expect(!pair.conn.transactionOpen());
+    pair.conn.tx_status = .in_transaction;
+    try std.testing.expect(pair.conn.transactionOpen());
+    pair.conn.tx_status = .failed;
+    try std.testing.expect(pair.conn.transactionOpen());
+
+    pair.conn.closed = true;
+    try std.testing.expect(!pair.conn.transactionOpen());
+}
 
 test "savepoint names are deterministic prefixes" {
     // Pure naming check without a live server.

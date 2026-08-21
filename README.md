@@ -293,7 +293,8 @@ try pg_pool.withSavepoint({}, struct {
 }.run);
 ```
 
-Transaction state is explicit: starting a nested transaction returns
+`Conn.transactionOpen` gives both drivers an explicit view of whether a
+transaction boundary is active. Starting a nested transaction returns
 `error.ConnectionBusy`; committing or rolling back while idle returns
 `error.TransactionClosed`. PostgreSQL commands rejected inside a transaction
 put it into failed state, where `begin`/`commit` return
