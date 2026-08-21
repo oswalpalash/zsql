@@ -608,11 +608,11 @@ pub const PooledStmt = struct {
         if (self.closed) return error.StatementClosed;
 
         self.stmt.close() catch |err| {
-            // A failed Close can leave the statement metadata already released.
-            // Finish best-effort and consume the dedicated lease either way; a
-            // pooled borrower must never be stranded by one failed teardown.
+            // A failed Close can leave the statement metadata released while a
+            // server-side resource remains uncertain. Always discard the
+            // connection rather than return that uncertainty to another borrower.
             self.stmt.deinit();
-            self.lease.release() catch self.lease.discard() catch {};
+            self.lease.discard() catch {};
             self.finish();
             return err;
         };
@@ -733,6 +733,72 @@ test "postgres pooled statement close failure consumes its lease" {
     try std.testing.expect(pooled.closed);
     try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
     try std.testing.expectEqual(@as(usize, 0), pool.stats().leased);
+}
+
+test "postgres pooled close OOM discards instead of idling uncertain session" {
+    const io = std.testing.io;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var address: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+
+    const client = try server.socket.address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    const peer = try server.accept(io);
+    defer peer.close(io);
+
+    const host = try allocator.dupe(u8, "127.0.0.1");
+    const read_buf = try allocator.alloc(u8, 128);
+    const write_buf = try allocator.alloc(u8, 128);
+    const conn = conn_mod.Conn{
+        .allocator = allocator,
+        .io = io,
+        .server_host = host,
+        .server_port = server.socket.address.getPort(),
+        .stream = client,
+        .read_buf = read_buf,
+        .write_buf = write_buf,
+        .reader = client.reader(io, read_buf),
+        .writer = client.writer(io, write_buf),
+    };
+
+    var config = try url.parse(allocator, "postgres://u@127.0.0.1:1/db?sslmode=disable");
+    defer config.deinit();
+    var pool = try Pool.init(allocator, io, .{
+        .database = config,
+        .max_open = 1,
+        .max_idle = 1,
+    });
+    defer pool.deinit();
+
+    pool.open_count = 1;
+    const lease = try allocator.create(Lease);
+    lease.* = .{ .pool = &pool, .conn_value = conn };
+
+    const statement_name = try allocator.dupe(u8, "zsql_ps_0");
+    const statement_sql = try allocator.dupe(u8, "select 1");
+    const oids = try allocator.alloc(u32, 1);
+    oids[0] = 23;
+    var pooled = PooledStmt{
+        .allocator = allocator,
+        .lease = lease,
+        .stmt = .{
+            .conn = &lease.conn_value,
+            .allocator = allocator,
+            .name = statement_name,
+            .sql = statement_sql,
+            .parameter_oids = oids,
+        },
+    };
+
+    // Force the first Close-packet construction to fail while the transport is
+    // otherwise healthy. Returning this lease to idle would preserve an
+    // uncertain server statement for the next borrower.
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, pooled.close());
+    try std.testing.expect(pooled.closed);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().open);
+    try std.testing.expectEqual(@as(usize, 0), pool.stats().idle);
 }
 
 test "postgres pool owns connection config through deferred shutdown" {
