@@ -283,6 +283,13 @@ try tx.withSavepoint({}, struct {
         _ = try tx.exec("insert into t (id) values (?)", &.{.{ .integer = 1 }});
     }
 }.run);
+
+// Pools can acquire the lease and begin the surrounding transaction too.
+try pg_pool.withSavepoint({}, struct {
+    fn run(_: void, conn: *zsql.drivers.postgres.Conn) !void {
+        _ = try conn.exec("insert into t (id) values (1)");
+    }
+}.run);
 ```
 
 Transaction state is explicit: starting a nested transaction returns

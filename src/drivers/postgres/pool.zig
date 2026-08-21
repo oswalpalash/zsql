@@ -375,6 +375,33 @@ pub const Pool = struct {
         try lease.release();
     }
 
+    /// Acquire a lease, begin a transaction, and run `body` inside a savepoint.
+    /// Body errors roll back to the savepoint; transaction or release failures
+    /// consume the lease through normal pool health accounting.
+    pub fn withSavepoint(
+        self: *Pool,
+        ctx: anytype,
+        comptime body: *const fn (@TypeOf(ctx), *conn_mod.Conn) anyerror!void,
+    ) !void {
+        const Runner = struct {
+            outer_ctx: @TypeOf(ctx),
+            outer_body: @TypeOf(body),
+
+            fn run(state: @This(), conn: *conn_mod.Conn) !void {
+                return state.outer_body(state.outer_ctx, conn);
+            }
+        };
+
+        var lease = try self.acquire();
+        errdefer if (lease.open) lease.discard() catch {};
+        const runner = Runner{ .outer_ctx = ctx, .outer_body = body };
+        (try lease.conn()).withTx(runner, Runner.run) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
+        try lease.release();
+    }
+
     pub fn stats(self: *Pool) PoolStats {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

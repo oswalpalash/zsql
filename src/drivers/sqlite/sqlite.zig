@@ -413,6 +413,33 @@ pub const Pool = struct {
         try lease.release();
     }
 
+    /// Acquire a lease, begin a transaction, and run `body` inside a savepoint.
+    /// Body errors roll back to the savepoint; transaction or release failures
+    /// consume the lease through normal pool health accounting.
+    pub fn withSavepoint(
+        self: *Pool,
+        ctx: anytype,
+        comptime body: *const fn (@TypeOf(ctx), *Tx) anyerror!void,
+    ) !void {
+        const Runner = struct {
+            outer_ctx: @TypeOf(ctx),
+            outer_body: @TypeOf(body),
+
+            fn run(state: @This(), tx: *Tx) !void {
+                return state.outer_body(state.outer_ctx, tx);
+            }
+        };
+
+        var lease = try self.acquire();
+        errdefer if (lease.open) lease.discard() catch {};
+        const runner = Runner{ .outer_ctx = ctx, .outer_body = body };
+        (try lease.conn()).withTx(runner, Runner.run) catch |err| {
+            lease.finishAfterError(err);
+            return err;
+        };
+        try lease.release();
+    }
+
     pub fn stats(self: *Pool) PoolStats {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3651,6 +3678,36 @@ test "SQLite pool retains healthy connections after recoverable SQL errors" {
     _ = try pool.exec("insert into pool_reuse (id) values (1)", &.{});
     try std.testing.expectError(error.UniqueViolation, pool.exec("insert into pool_reuse (id) values (1)", &.{}));
     try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+}
+
+test "SQLite pool withSavepoint keeps outer transaction and releases lease" {
+    var pool = try Pool.init(std.testing.allocator, std.testing.io, .{ .max_open = 1 });
+    defer pool.deinit();
+
+    _ = try pool.exec("create table pool_scoped_savepoints (id integer primary key)", &.{});
+
+    try pool.withSavepoint({}, struct {
+        fn run(_: void, tx: *Tx) !void {
+            _ = try tx.exec("insert into pool_scoped_savepoints (id) values (?)", &.{.{ .integer = 1 }});
+
+            const failed = tx.withSavepoint({}, struct {
+                fn runInner(_: void, inner_tx: *Tx) !void {
+                    _ = try inner_tx.exec(
+                        "insert into pool_scoped_savepoints (id) values (?)",
+                        &.{.{ .integer = 2 }},
+                    );
+                    return error.TestPoolSavepoint;
+                }
+            }.runInner);
+            try std.testing.expectError(error.TestPoolSavepoint, failed);
+        }
+    }.run);
+
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+    var rows = try pool.query("select id from pool_scoped_savepoints", &.{});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try ((try rows.next()).?).as(i64, 0));
+    try std.testing.expectEqual(@as(?core.Row, null), rows.next());
 }
 
 test "SQLite pool releases a rolled-back application error connection" {

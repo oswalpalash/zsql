@@ -1680,6 +1680,52 @@ test "postgres live: withSavepoint commits kept work and rolls back failed work"
     try conn.commit();
 }
 
+test "postgres live: pool withSavepoint scopes failures and releases lease" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+    const io = std.testing.io;
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var pool = try pg.Pool.init(allocator, io, .{
+        .database = config,
+        .max_open = 1,
+        .max_idle = 1,
+    });
+    defer pool.deinit();
+
+    _ = try pool.exec("create temp table zsql_pool_scoped_savepoints (id integer)");
+
+    try pool.withSavepoint({}, struct {
+        fn run(_: void, conn: *pg.Conn) !void {
+            _ = try conn.exec("insert into zsql_pool_scoped_savepoints values (1)");
+
+            const failed = conn.withSavepoint({}, struct {
+                fn runInner(_: void, inner: *pg.Conn) !void {
+                    _ = try inner.exec(
+                        "insert into zsql_pool_scoped_savepoints values (2)",
+                    );
+                    return error.TestPoolScopedSavepoint;
+                }
+            }.runInner);
+            try std.testing.expectError(error.TestPoolScopedSavepoint, failed);
+        }
+    }.run);
+
+    try std.testing.expectEqual(@as(usize, 1), pool.stats().idle);
+
+    var rows = try pool.queryParams(
+        "select id from zsql_pool_scoped_savepoints order by id",
+        &.{},
+    );
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try rows.next().?.as(i64, 0));
+    try std.testing.expectEqual(@as(?pg.SimpleRow, null), rows.next());
+}
+
 test "postgres live: pool commits after savepoint recovery" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
