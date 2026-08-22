@@ -582,6 +582,8 @@ try qb.appendBuilder(&filters);
 try qb.bindDate(billing_date);
 try qb.bindTime(reminder_time);
 try qb.bindTimestampUtc(updated_at);
+// Offset decompositions retain their wall clock and numeric UTC offset.
+try qb.bindOffsetDateTime(scheduled_for);
 // qb.sqlSlice() + qb.bindsSlice() for driver execParams/queryParams
 
 // Reuse the configured builder for another statement.
@@ -607,9 +609,10 @@ allocation failure never leave a partial quoted identifier in the SQL buffer.
 `bindUuid` accepts `zsql.types.Uuid` or an optional UUID, formats the value in a
 fixed stack buffer, and copies it through the same atomic text-bind ownership
 path.
-`bindDate`, `bindTime`, and `bindTimestampUtc` provide the same contract for
-explicit temporal wrappers. The timestamp method always emits a UTC `Z` string,
-matching the wrapper's explicit policy; optional empty values bind SQL null.
+`bindDate`, `bindTime`, `bindTimeTz`, `bindTimestampUtc`, and
+`bindOffsetDateTime` provide the same contract for explicit temporal wrappers.
+UTC timestamps emit a `Z` string, while offset date/times preserve their wall
+clock and numeric offset; optional empty values bind SQL null.
 Generic `bind`, `bindAll`, and `bindJoined` also accept `Text`, `Blob`,
 `Numeric`, `Uuid`, and temporal wrappers directly, so typed values can participate
 in atomic batches without first rendering text manually.

@@ -355,6 +355,16 @@ pub const QueryBuilder = struct {
         );
     }
 
+    /// Bind an explicit-offset timestamp decomposition while preserving its
+    /// wall clock and numeric UTC offset. Optional empty values bind SQL null.
+    pub fn bindOffsetDateTime(self: *QueryBuilder, value: anytype) !void {
+        return self.bindTemporal(
+            value,
+            types.Timestamp.OffsetDateTime,
+            "Timestamp.OffsetDateTime",
+        );
+    }
+
     fn bindTemporal(
         self: *QueryBuilder,
         value: anytype,
@@ -407,6 +417,12 @@ pub const QueryBuilder = struct {
                 try value.formatIso(&buffer)
             else
                 try value.formatIsoUtc(&buffer);
+            return self.storeValue(.{ .text = formatted });
+        }
+
+        if (T == types.Timestamp.OffsetDateTime) {
+            var buffer: [types.Timestamp.OffsetDateTime.iso_buffer_len]u8 = undefined;
+            const formatted = try value.formatIso(&buffer);
             return self.storeValue(.{ .text = formatted });
         }
 
@@ -705,6 +721,37 @@ test "QueryBuilder.bindTimeTz preserves offsets" {
     try std.testing.expectEqualStrings("04:05:06.007-07:52:58", sqlite.bindsSlice()[0].text);
 }
 
+test "QueryBuilder.bindOffsetDateTime preserves offsets" {
+    const timestamp = try types.parseIsoTimestampInstant("2024-03-10T01:30:00.25Z");
+    const offset = try timestamp.toOffsetDateTime(-2 * 3_600 - 30 * 60);
+
+    var postgres = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer postgres.deinit();
+    try postgres.appendTrustedSql("values (");
+    try postgres.bindOffsetDateTime(offset);
+    try postgres.appendTrustedSql(", ");
+    try postgres.bindOffsetDateTime(null);
+    try postgres.appendTrustedSql(")");
+
+    var sqlite = QueryBuilder.init(std.testing.allocator, .sqlite);
+    defer sqlite.deinit();
+    try sqlite.appendTrustedSql("where logged_at > ");
+    try sqlite.bindOffsetDateTime(@as(?types.Timestamp.OffsetDateTime, offset));
+
+    try std.testing.expectEqualStrings("values ($1, $2)", postgres.sqlSlice());
+    try std.testing.expectEqualStrings(
+        "2024-03-09T23:00:00.25-02:30",
+        postgres.bindsSlice()[0].text,
+    );
+    try std.testing.expect(postgres.bindsSlice()[1].isNull());
+    try std.testing.expectEqual(@as(usize, 1), postgres.owned.items.len);
+    try std.testing.expectEqualStrings("where logged_at > ?", sqlite.sqlSlice());
+    try std.testing.expectEqualStrings(
+        "2024-03-09T23:00:00.25-02:30",
+        sqlite.bindsSlice()[0].text,
+    );
+}
+
 test "QueryBuilder binds typed temporal values without allocation" {
     const date = try types.parseIsoDate("2024-02-29");
     const time = try types.parseIsoTime("04:05:06.007000000");
@@ -766,12 +813,31 @@ test "QueryBuilder rejects an invalid typed time before mutation" {
     try std.testing.expectEqual(@as(usize, 1), qb.next_index);
 }
 
+test "QueryBuilder rejects an invalid offset date/time before mutation" {
+    var qb = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer qb.deinit();
+    try qb.appendTrustedSql("x");
+    const date = try types.parseIsoDate("12000-01-01");
+    const invalid = types.Timestamp.OffsetDateTime{
+        .date = date,
+        .time = .{ .nanos_since_midnight = 86_400_000_000_000, .offset_seconds = 0 },
+    };
+
+    try std.testing.expectEqual(error.InvalidArguments, qb.bindOffsetDateTime(invalid));
+    try std.testing.expectEqualStrings("x", qb.sqlSlice());
+    try std.testing.expectEqual(@as(usize, 0), qb.bindsSlice().len);
+    try std.testing.expectEqual(@as(usize, 0), qb.owned.items.len);
+    try std.testing.expectEqual(@as(usize, 1), qb.next_index);
+}
+
 fn exerciseQueryBuilderTemporalAllocations(allocator: std.mem.Allocator) !void {
     var qb = QueryBuilder.init(allocator, .postgres);
     defer qb.deinit();
     try qb.bindDate(try types.parseIsoDate("2024-02-29"));
     try qb.bindTime(try types.parseIsoTime("04:05:06.007"));
     try qb.bindTimestampUtc(try types.parseIsoTimestamp("1969-12-31 23:59:59.999999"));
+    const timestamp = try types.parseIsoTimestampInstant("2024-03-10T01:30:00.25Z");
+    try qb.bindOffsetDateTime(try timestamp.toOffsetDateTime(-9_000));
 }
 
 test "QueryBuilder temporal bindings clean every allocation failure" {
@@ -1095,6 +1161,10 @@ test "QueryBuilder.bindAll accepts explicit SQL domain wrappers" {
         defer qb.deinit();
 
         const uuid = try types.parseUuid("550E8400-E29B-41D4-A716-4466554400FF");
+        const time_tz = try types.parseIsoTimeTz("04:05:06.007-07:52:58");
+        const offset_timestamp =
+            try types.parseIsoTimestampInstant("2024-03-10T01:30:00.25Z");
+        const offset = try offset_timestamp.toOffsetDateTime(-9_000);
         const values = .{
             types.Text{ .bytes = "explicit text" },
             types.Blob{ .bytes = "\x00\x01" },
@@ -1103,17 +1173,19 @@ test "QueryBuilder.bindAll accepts explicit SQL domain wrappers" {
             try types.parseIsoDate("2024-02-29"),
             try types.parseIsoTime("04:05:06.007000000"),
             try types.parseIsoTimestamp("1969-12-31 23:59:59.999999"),
+            time_tz,
+            offset,
         };
         try qb.appendTrustedSql("values (");
         try qb.bindJoined(values, ", ");
         try qb.appendTrustedSql(")");
 
-        try std.testing.expectEqual(@as(usize, 7), qb.bindsSlice().len);
+        try std.testing.expectEqual(@as(usize, 9), qb.bindsSlice().len);
         try std.testing.expectEqualStrings(
             if (dialect == .postgres)
-                "values ($1, $2, $3, $4, $5, $6, $7)"
+                "values ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
             else
-                "values (?, ?, ?, ?, ?, ?, ?)",
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             qb.sqlSlice(),
         );
         try std.testing.expectEqualStrings("explicit text", qb.bindsSlice()[0].text);
@@ -1129,7 +1201,15 @@ test "QueryBuilder.bindAll accepts explicit SQL domain wrappers" {
             "1969-12-31T23:59:59.999999Z",
             qb.bindsSlice()[6].text,
         );
-        try std.testing.expectEqual(@as(usize, 7), qb.owned.items.len);
+        try std.testing.expectEqualStrings(
+            "04:05:06.007-07:52:58",
+            qb.bindsSlice()[7].text,
+        );
+        try std.testing.expectEqualStrings(
+            "2024-03-09T23:00:00.25-02:30",
+            qb.bindsSlice()[8].text,
+        );
+        try std.testing.expectEqual(@as(usize, 9), qb.owned.items.len);
     }
 }
 
@@ -1137,6 +1217,8 @@ fn exerciseQueryBuilderDomainWrapperAllocations(allocator: std.mem.Allocator) !v
     var qb = QueryBuilder.init(allocator, .postgres);
     defer qb.deinit();
     const uuid = try types.parseUuid("550e8400-e29b-41d4-a716-4466554400ff");
+    const offset = try (try types.parseIsoTimestampInstant("2024-03-10T01:30:00.25Z"))
+        .toOffsetDateTime(-9_000);
     try qb.bindAll(.{
         types.Text{ .bytes = "owned" },
         types.Blob{ .bytes = "\x00" },
@@ -1145,6 +1227,8 @@ fn exerciseQueryBuilderDomainWrapperAllocations(allocator: std.mem.Allocator) !v
         try types.parseIsoDate("2024-02-29"),
         try types.parseIsoTime("04:05:06.007"),
         try types.parseIsoTimestamp("1969-12-31 23:59:59.999999"),
+        try types.parseIsoTimeTz("04:05:06.007-07:52:58"),
+        offset,
     });
 }
 
