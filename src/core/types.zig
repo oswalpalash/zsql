@@ -103,7 +103,31 @@ pub const Timestamp = struct {
     }
 };
 pub const Numeric = struct { text: []const u8 };
-pub const Uuid = struct { bytes: [16]u8 };
+pub const Uuid = struct {
+    bytes: [16]u8,
+
+    /// Format as canonical lowercase hyphenated UUID text without allocation.
+    pub fn formatCanonical(self: Uuid, buffer: []u8) ![]const u8 {
+        if (buffer.len < 36) return error.NoSpaceLeft;
+
+        const digits = "0123456789abcdef";
+        var cursor: usize = 0;
+        for (self.bytes, 0..) |byte, index| {
+            if (index == 4 or index == 6 or index == 8 or index == 10) {
+                buffer[cursor] = '-';
+                cursor += 1;
+            }
+            buffer[cursor] = digits[byte >> 4];
+            buffer[cursor + 1] = digits[byte & 0x0f];
+            cursor += 2;
+        }
+        return buffer[0..cursor];
+    }
+
+    pub fn eql(self: Uuid, other: Uuid) bool {
+        return std.mem.eql(u8, &self.bytes, &other.bytes);
+    }
+};
 
 /// Parse canonical hyphenated UUID text without allocation.
 pub fn parseUuid(text: []const u8) !Uuid {
@@ -551,4 +575,20 @@ test "parseUuid accepts canonical text" {
     const uuid = try parseUuid("550e8400-e29b-41d4-a716-446655440000");
     try @import("std").testing.expectEqual(@as(u8, 0x55), uuid.bytes[0]);
     try @import("std").testing.expectEqual(@as(u8, 0), uuid.bytes[15]);
+}
+
+test "format UUID as canonical lowercase text without allocation" {
+    const mixed = try parseUuid("550E8400-E29B-41D4-A716-4466554400FF");
+    var buffer: [36]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "550e8400-e29b-41d4-a716-4466554400ff",
+        try mixed.formatCanonical(&buffer),
+    );
+
+    var tiny: [35]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, mixed.formatCanonical(&tiny));
+
+    const other = try parseUuid("550e8400-e29b-41d4-a716-4466554400fe");
+    try std.testing.expect(mixed.eql(mixed));
+    try std.testing.expect(!mixed.eql(other));
 }

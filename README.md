@@ -569,6 +569,9 @@ try qb.bindAll(.{ 2, "ada" });
 
 // Or let the builder insert trusted separators between placeholders.
 try qb.bindJoined(.{ 2, "ada" }, ", ");
+// Typed UUIDs are formatted to canonical text and bound through the normal
+// owned-copy path; optional empty values bind SQL null.
+try qb.bindUuid(external_id);
 // qb.sqlSlice() + qb.bindsSlice() for driver execParams/queryParams
 
 // Reuse the configured builder for another statement.
@@ -581,6 +584,9 @@ leaves SQL, bind order, ownership, and the next PostgreSQL placeholder unchanged
 so callers may handle OOM and retry the same builder safely.
 Identifier methods have the same retry contract: invalid later path segments or
 allocation failure never leave a partial quoted identifier in the SQL buffer.
+`bindUuid` accepts `zsql.types.Uuid` or an optional UUID, formats the value in a
+fixed stack buffer, and copies it through the same atomic text-bind ownership
+path.
 
 ### Query hooks
 
@@ -662,7 +668,8 @@ transfers are failure-atomic, so an OOM preserves connection reuse without
 leaking any partially collected result storage.
 
 `zsql.types.Text`, `Blob`, `Numeric`, and canonical-text `Uuid` decode through
-the same borrowed row path. PostgreSQL `date`, `time`, `timestamp`, and
+the same borrowed row path. `Uuid.formatCanonical` emits lowercase hyphenated
+text without allocation. PostgreSQL `date`, `time`, `timestamp`, and
 `timestamptz` intentionally remain raw text by default: implicit parsing would
 hide timezone and precision policy. For callers that choose that policy,
 `types.parseIsoDate`, `.parseIsoTime`, `.parseIsoTimestamp`, and

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Value = @import("value.zig").Value;
+const types = @import("types.zig");
 
 /// Safe dynamic SQL builder for identifiers and bound values.
 ///
@@ -216,6 +217,27 @@ pub const QueryBuilder = struct {
 
     pub fn bindsSlice(self: *const QueryBuilder) []const Value {
         return self.binds.items;
+    }
+
+    /// Bind a typed UUID as canonical lowercase text. The formatted value is
+    /// copied by the normal bind ownership path, so callers may reuse stack
+    /// storage immediately. Optional UUIDs bind SQL null when empty.
+    pub fn bindUuid(self: *QueryBuilder, value: anytype) !void {
+        const T = @TypeOf(value);
+        if (T == @TypeOf(null)) return self.bind(.{ .null = {} });
+
+        const info = @typeInfo(T);
+        if (info == .optional) {
+            if (value) |uuid| return self.bindUuid(uuid);
+            return self.bind(.{ .null = {} });
+        }
+        if (T != types.Uuid) {
+            @compileError("QueryBuilder.bindUuid accepts zsql.types.Uuid or ?zsql.types.Uuid");
+        }
+
+        var buffer: [36]u8 = undefined;
+        const formatted = try value.formatCanonical(&buffer);
+        try self.bind(formatted);
     }
 
     fn rollbackBind(
@@ -440,6 +462,53 @@ test "QueryBuilder.bind coerces Zig scalars and optionals" {
 test "coerceValue rejects integer overflow into i64" {
     // u64 max does not fit i64.
     try std.testing.expectError(error.IntegerOverflow, coerceValue(@as(u64, std.math.maxInt(u64))));
+}
+
+test "QueryBuilder.bindUuid formats typed values canonically" {
+    const uuid = try types.parseUuid("550E8400-E29B-41D4-A716-4466554400FF");
+
+    var postgres = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer postgres.deinit();
+    try postgres.appendTrustedSql("values (");
+    try postgres.bindUuid(uuid);
+    try postgres.appendTrustedSql(", ");
+    try postgres.bindUuid(@as(?types.Uuid, uuid));
+    try postgres.appendTrustedSql(", ");
+    try postgres.bindUuid(null);
+    try postgres.appendTrustedSql(")");
+
+    try std.testing.expectEqualStrings("values ($1, $2, $3)", postgres.sqlSlice());
+    try std.testing.expectEqualStrings(
+        "550e8400-e29b-41d4-a716-4466554400ff",
+        postgres.bindsSlice()[0].text,
+    );
+    try std.testing.expectEqualStrings(
+        "550e8400-e29b-41d4-a716-4466554400ff",
+        postgres.bindsSlice()[1].text,
+    );
+    try std.testing.expect(postgres.bindsSlice()[2].isNull());
+    try std.testing.expectEqual(@as(usize, 2), postgres.owned.items.len);
+
+    var sqlite = QueryBuilder.init(std.testing.allocator, .sqlite);
+    defer sqlite.deinit();
+    try sqlite.bindUuid(null);
+    try std.testing.expectEqualStrings("?", sqlite.sqlSlice());
+    try std.testing.expect(sqlite.bindsSlice()[0].isNull());
+}
+
+fn exerciseQueryBuilderBindUuidAllocations(allocator: std.mem.Allocator) !void {
+    var qb = QueryBuilder.init(allocator, .postgres);
+    defer qb.deinit();
+    const uuid = try types.parseUuid("550e8400-e29b-41d4-a716-4466554400ff");
+    try qb.bindUuid(uuid);
+}
+
+test "QueryBuilder.bindUuid cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseQueryBuilderBindUuidAllocations,
+        .{},
+    );
 }
 
 fn exerciseQueryBuilderBindAllocations(
