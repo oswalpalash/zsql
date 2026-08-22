@@ -9,9 +9,13 @@ pub const Blob = struct { bytes: []const u8 };
 pub const Date = struct {
     days_since_unix_epoch: i32,
 
+    /// Exact buffer length required by `formatIso` for every representable date.
+    pub const iso_buffer_len: usize = 17;
+
     /// Format as `YYYY-MM-DD` without allocation. Years wider than four digits
-    /// are emitted in full; a buffer of at least 16 bytes always succeeds.
+    /// are emitted in full.
     pub fn formatIso(self: Date, buffer: []u8) ![]const u8 {
+        if (buffer.len < iso_buffer_len) return error.NoSpaceLeft;
         const civil = isoCivilFromDays(self.days_since_unix_epoch);
         var cursor = try isoWriteSignedFourDigits(buffer, civil.year);
         cursor += try isoWriteByteAndTwoDigits(buffer[cursor..], '-', civil.month);
@@ -22,9 +26,13 @@ pub const Date = struct {
 pub const Time = struct {
     ns_since_midnight: u64,
 
+    /// Exact buffer length required by `formatIso` for every valid time.
+    pub const iso_buffer_len: usize = 18;
+
     /// Format as ISO time, omitting an all-zero fractional part and trailing
-    /// fraction zeroes. A buffer of at least 18 bytes always succeeds.
+    /// fraction zeroes.
     pub fn formatIso(self: Time, buffer: []u8) ![]const u8 {
+        if (buffer.len < iso_buffer_len) return error.NoSpaceLeft;
         if (self.ns_since_midnight >= 86_400_000_000_000) return error.InvalidArguments;
 
         var remaining = self.ns_since_midnight;
@@ -58,10 +66,14 @@ pub const Time = struct {
 pub const Timestamp = struct {
     unix_us: i64,
 
+    /// Exact buffer length required by `formatIsoUtc` for every representable
+    /// timestamp.
+    pub const iso_buffer_len: usize = 32;
+
     /// Format as an ISO UTC timestamp ending in `Z`, omitting an all-zero or
-    /// trailing-zero fractional part. A buffer of at least 32 bytes always
-    /// succeeds.
+    /// trailing-zero fractional part.
     pub fn formatIsoUtc(self: Timestamp, buffer: []u8) ![]const u8 {
+        if (buffer.len < iso_buffer_len) return error.NoSpaceLeft;
         const seconds = @divFloor(self.unix_us, 1_000_000);
         const microseconds: u32 = @intCast(@mod(self.unix_us, 1_000_000));
         const days_i64 = @divFloor(seconds, 86_400);
@@ -73,7 +85,7 @@ pub const Timestamp = struct {
         const minute: u8 = @intCast(second_of_day / 60);
         const second: u8 = @intCast(second_of_day % 60);
 
-        var date_buffer: [16]u8 = undefined;
+        var date_buffer: [Date.iso_buffer_len]u8 = undefined;
         const date = try (Date{
             .days_since_unix_epoch = days,
         }).formatIso(&date_buffer);
@@ -229,6 +241,17 @@ fn isoParseDigits(text: []const u8) !u32 {
     return value;
 }
 
+fn isoParseYearDigits(text: []const u8) !i64 {
+    if (text.len == 0 or text.len > 10) return error.TypeMismatch;
+    var value: i64 = 0;
+    for (text) |char| {
+        if (char < '0' or char > '9') return error.TypeMismatch;
+        const next = std.math.mul(i64, value, 10) catch return error.TypeMismatch;
+        value = next + (char - '0');
+    }
+    return value;
+}
+
 fn isoDaysFromCivilYear(year: i64, month: u8, day: u8) !i64 {
     if (month < 1 or month > 12 or day < 1 or day > 31) return error.TypeMismatch;
 
@@ -260,7 +283,7 @@ const IsoParsedDate = struct {
 };
 
 fn isoParseSignedYear(text: []const u8) !i64 {
-    if (text.len == 0 or text.len > 9) return error.TypeMismatch;
+    if (text.len == 0 or text.len > 10) return error.TypeMismatch;
 
     var sign: i64 = 1;
     var digits = text;
@@ -277,7 +300,7 @@ fn isoParseSignedYear(text: []const u8) !i64 {
     // Four-digit years may omit a sign. Expanded years require a sign when
     // negative and may optionally use one when positive.
     if (digits.len < 4) return error.TypeMismatch;
-    const magnitude: i64 = @intCast(try isoParseDigits(digits));
+    const magnitude: i64 = try isoParseYearDigits(digits);
     const year = sign * magnitude;
     if (year == 0) return error.TypeMismatch;
     return year;
@@ -405,9 +428,12 @@ pub fn parseIsoTime(text: []const u8) !Time {
 
 fn isoCombineDateAndTime(days: i64, time_text: []const u8) !Timestamp {
     const time = try isoSplitTime(time_text, 6);
-    const day_us = std.math.mul(i64, days, 86_400_000_000) catch return error.Overflow;
-    const time_us = std.math.cast(i64, time.ns_since_midnight / 1000) orelse return error.Overflow;
-    return .{ .unix_us = std.math.add(i64, day_us, time_us) catch return error.Overflow };
+    // Widen while combining so a negative date plus a positive time can cross
+    // an i64-second boundary without an intermediate overflow.
+    const day_us = @as(i128, days) * 86_400_000_000;
+    const time_us = @as(i128, time.ns_since_midnight / 1_000);
+    const total_us = day_us + time_us;
+    return .{ .unix_us = std.math.cast(i64, total_us) orelse return error.Overflow };
 }
 
 /// Parse a naive ISO timestamp (`YYYY-MM-DD[T ]HH:MM[:SS[.fraction]]`) as UTC.
@@ -587,6 +613,50 @@ test "format ISO temporal wrappers without allocation" {
 
     var tiny: [3]u8 = undefined;
     try std.testing.expectError(error.NoSpaceLeft, date.formatIso(&tiny));
+}
+
+test "ISO formatter buffer lengths cover temporal extrema" {
+    try std.testing.expectEqual(@as(usize, 17), Date.iso_buffer_len);
+    try std.testing.expectEqual(@as(usize, 18), Time.iso_buffer_len);
+    try std.testing.expectEqual(@as(usize, 32), Timestamp.iso_buffer_len);
+
+    const minimum_date = Date{ .days_since_unix_epoch = std.math.minInt(i32) };
+    const maximum_date = Date{ .days_since_unix_epoch = std.math.maxInt(i32) };
+    var short_date: [Date.iso_buffer_len - 1]u8 = undefined;
+    var date_buffer: [Date.iso_buffer_len]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, minimum_date.formatIso(&short_date));
+    try std.testing.expectEqual(
+        minimum_date,
+        try parseIsoDate(try minimum_date.formatIso(&date_buffer)),
+    );
+    try std.testing.expectEqual(
+        maximum_date,
+        try parseIsoDate(try maximum_date.formatIso(&date_buffer)),
+    );
+
+    const maximum_time = Time{ .ns_since_midnight = 86_400_000_000_000 - 1 };
+    var short_time: [Time.iso_buffer_len - 1]u8 = undefined;
+    var time_buffer: [Time.iso_buffer_len]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, maximum_time.formatIso(&short_time));
+    try std.testing.expectEqual(
+        maximum_time,
+        try parseIsoTime(try maximum_time.formatIso(&time_buffer)),
+    );
+
+    const minimum_timestamp = Timestamp{ .unix_us = std.math.minInt(i64) };
+    const maximum_timestamp = Timestamp{ .unix_us = std.math.maxInt(i64) };
+    var short_timestamp: [Timestamp.iso_buffer_len - 1]u8 = undefined;
+    var timestamp_buffer: [Timestamp.iso_buffer_len]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, minimum_timestamp.formatIsoUtc(&short_timestamp));
+    const formatted_minimum = try minimum_timestamp.formatIsoUtc(&timestamp_buffer);
+    try std.testing.expectEqual(
+        minimum_timestamp,
+        try parseIsoTimestampInstant(formatted_minimum),
+    );
+    try std.testing.expectEqual(
+        maximum_timestamp,
+        try parseIsoTimestampInstant(try maximum_timestamp.formatIsoUtc(&timestamp_buffer)),
+    );
 }
 
 test "parseUuid accepts canonical text" {

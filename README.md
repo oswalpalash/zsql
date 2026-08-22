@@ -692,8 +692,9 @@ years across the supported `Date` range. Naive timestamps are interpreted as UTC
 `Z` and explicit offsets normalize to UTC. The standalone
 `parseIsoTimestamp`, `.parseIsoTimestampTz`, and `.parseIsoTimestampInstant`
 functions expose that choice directly. Wrappers can format back into caller
-buffers without allocation (for example, `timestamp.formatIsoUtc(&buffer)`),
-making the result straightforward to pass as SQL text.
+buffers without allocation (for example, `timestamp.formatIsoUtc(&buffer)`).
+Each wrapper exposes its exact `iso_buffer_len`, so callers can size stack
+storage without overestimating expanded-year output.
 
 ### Offline checks
 

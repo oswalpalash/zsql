@@ -241,13 +241,13 @@ pub const QueryBuilder = struct {
     /// null. Formatting uses a fixed stack buffer before the normal owned-copy
     /// bind path.
     pub fn bindDate(self: *QueryBuilder, value: anytype) !void {
-        return self.bindTemporal(value, types.Date, "bindDate", types.Date.formatIso);
+        return self.bindTemporal(value, types.Date, "Date");
     }
 
     /// Bind a typed time as ISO text with nanosecond precision when present.
     /// Optional empty values bind SQL null.
     pub fn bindTime(self: *QueryBuilder, value: anytype) !void {
-        return self.bindTemporal(value, types.Time, "bindTime", types.Time.formatIso);
+        return self.bindTemporal(value, types.Time, "Time");
     }
 
     /// Bind a typed UTC timestamp as ISO text ending in `Z`. Optional empty
@@ -256,8 +256,7 @@ pub const QueryBuilder = struct {
         return self.bindTemporal(
             value,
             types.Timestamp,
-            "bindTimestampUtc",
-            types.Timestamp.formatIsoUtc,
+            "Timestamp",
         );
     }
 
@@ -265,20 +264,19 @@ pub const QueryBuilder = struct {
         self: *QueryBuilder,
         value: anytype,
         comptime expected: type,
-        comptime api_name: []const u8,
-        comptime format: fn (expected, []u8) anyerror![]const u8,
+        comptime type_name: []const u8,
     ) !void {
         const T = @TypeOf(value);
         if (T == @TypeOf(null)) return self.bind(.{ .null = {} });
 
         const info = @typeInfo(T);
         if (info == .optional) {
-            if (value) |temporal| return self.bindTemporal(temporal, expected, api_name, format);
+            if (value) |temporal| return self.bindTemporal(temporal, expected, type_name);
             return self.bind(.{ .null = {} });
         }
         if (T != expected) {
-            @compileError("QueryBuilder." ++ api_name ++ " accepts zsql.types." ++
-                @typeName(expected) ++ " or its optional");
+            @compileError("QueryBuilder accepts zsql.types." ++ type_name ++
+                " or its optional");
         }
 
         return self.bind(value);
@@ -305,7 +303,7 @@ pub const QueryBuilder = struct {
         }
 
         if (T == types.Date or T == types.Time or T == types.Timestamp) {
-            var buffer: [48]u8 = undefined;
+            var buffer: [types.Timestamp.iso_buffer_len]u8 = undefined;
             const formatted = if (T == types.Date)
                 try value.formatIso(&buffer)
             else if (T == types.Time)
