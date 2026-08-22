@@ -996,6 +996,24 @@ test "decompose timestamps into explicit offset date and time" {
     try std.testing.expectEqual(timestamp, try ahead.utcTimestamp());
 }
 
+test "offset decomposition round-trips deterministic instants" {
+    var prng = std.Random.DefaultPrng.init(0x7350_7c1e);
+    const random = prng.random();
+
+    for (0..2_000) |_| {
+        const unix_us = random.int(i64);
+        const offset_seconds: i32 = @intCast(random.intRangeAtMost(i32, -86_400, 86_400));
+        const timestamp = Timestamp{ .unix_us = unix_us };
+        const offset = try timestamp.toOffsetDateTime(offset_seconds);
+
+        try std.testing.expectEqual(offset_seconds, offset.time.offset_seconds);
+        try std.testing.expect(offset.date.days_since_unix_epoch >= std.math.minInt(i32));
+        try std.testing.expect(offset.date.days_since_unix_epoch <= std.math.maxInt(i32));
+        try std.testing.expect(offset.time.nanos_since_midnight < 86_400_000_000_000);
+        try std.testing.expectEqual(timestamp, try offset.utcTimestamp());
+    }
+}
+
 test "parseUuid accepts canonical text" {
     const uuid = try parseUuid("550e8400-e29b-41d4-a716-446655440000");
     try @import("std").testing.expectEqual(@as(u8, 0x55), uuid.bytes[0]);
