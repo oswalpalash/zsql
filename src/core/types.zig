@@ -20,6 +20,19 @@ pub const Date = struct {
         return .{ .unix_us = unix_us };
     }
 
+    /// Combine a calendar date with an offset-aware time without normalizing
+    /// away the timezone policy or truncating nanosecond precision.
+    pub fn toOffsetDateTime(self: Date, time: TimeTz) !Timestamp.OffsetDateTime {
+        if (time.nanos_since_midnight >= 86_400_000_000_000 or
+            time.offset_seconds < -86_400 or
+            time.offset_seconds > 86_400)
+        {
+            return error.InvalidArguments;
+        }
+
+        return .{ .date = self, .time = time };
+    }
+
     /// Exact buffer length required by `formatIso` for every representable date.
     pub const iso_buffer_len: usize = 17;
 
@@ -1057,6 +1070,49 @@ test "combine timezone-aware time with calendar date in UTC" {
 
     const invalid_time = TimeTz{ .nanos_since_midnight = 86_400_000_000_000, .offset_seconds = 0 };
     try std.testing.expectError(error.InvalidArguments, invalid_time.utcTimestamp(epoch_date));
+}
+
+test "combine date and timezone-aware time without precision loss" {
+    var buffer: [OffsetDateTime.iso_buffer_len]u8 = undefined;
+    const date = try parseIsoDate("2024-02-29");
+    const time = try parseIsoTimeTz("01:30:00.123456789-02:30");
+    const combined = try date.toOffsetDateTime(time);
+
+    try std.testing.expectEqual(date, combined.date);
+    try std.testing.expectEqual(time, combined.time);
+    try std.testing.expectEqualStrings(
+        "2024-02-29T01:30:00.123456789-02:30",
+        try combined.formatIso(&buffer),
+    );
+    try std.testing.expectEqual(
+        try parseIsoTimestampInstant("2024-02-29T04:00:00.123456Z"),
+        try combined.utcTimestamp(),
+    );
+
+    for ([_]i32{ -86_400, 0, 86_400 }) |offset_seconds| {
+        const extreme_date = Date{
+            .days_since_unix_epoch = std.math.maxInt(i32),
+        };
+        const extreme_time = TimeTz{
+            .nanos_since_midnight = 86_399_999_999_999,
+            .offset_seconds = offset_seconds,
+        };
+        const extreme = try extreme_date.toOffsetDateTime(extreme_time);
+        try std.testing.expectEqual(extreme_date, extreme.date);
+        try std.testing.expectEqual(extreme_time, extreme.time);
+    }
+
+    const invalid_nanos = TimeTz{
+        .nanos_since_midnight = 86_400_000_000_000,
+        .offset_seconds = 0,
+    };
+    try std.testing.expectError(error.InvalidArguments, date.toOffsetDateTime(invalid_nanos));
+
+    const invalid_offset = TimeTz{
+        .nanos_since_midnight = 0,
+        .offset_seconds = 86_401,
+    };
+    try std.testing.expectError(error.InvalidArguments, date.toOffsetDateTime(invalid_offset));
 }
 
 test "convert timezone-aware times while retaining nanoseconds" {

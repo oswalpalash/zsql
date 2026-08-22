@@ -730,6 +730,8 @@ nanosecond precision, wrapping the wall clock across midnight when needed.
 nanosecond-precision UTC `Time`; `Date.toUtcDateTime` performs the checked
 inverse. For explicit timezone rendering, `Timestamp.toOffsetDateTime(offset)`
 returns the shifted calendar date plus an offset-preserving `TimeTz`.
+`Date.toOffsetDateTime(timeTz)` checks and combines the original wall clock,
+offset, and nanoseconds without normalization.
 `OffsetDateTime.formatIso` renders that local date, time, and numeric offset as
 one string in `types.OffsetDateTime.iso_buffer_len` bytes. Exact day-long
 (`+/-24:00`) offsets are accepted consistently and wider offsets remain invalid.
