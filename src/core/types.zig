@@ -455,6 +455,20 @@ pub fn parseIsoTimestampTz(text: []const u8) !Timestamp {
     return naive;
 }
 
+/// Parse an ISO timestamp as a UTC instant: a naive value is interpreted as
+/// UTC, while `Z` or an explicit offset is normalized to UTC.
+pub fn parseIsoTimestampInstant(text: []const u8) !Timestamp {
+    if (std.mem.indexOfScalar(u8, text, ' ') == null and
+        std.mem.indexOfAny(u8, text, "Tt") == null)
+    {
+        return parseIsoTimestamp(text);
+    }
+    const parts = try isoSplitTimestamp(text);
+    if (std.mem.indexOfAny(u8, parts.time, "+-Zz") != null)
+        return parseIsoTimestampTz(text);
+    return parseIsoTimestamp(text);
+}
+
 /// JSON is represented as validated-by-the-database text/bytes interpreted by
 /// the caller's chosen Zig type; zsql never performs hidden runtime reflection.
 pub fn Json(comptime T: type) type {
@@ -490,6 +504,9 @@ test "parse ISO temporal values with explicit precision policy" {
 
     const negative_short_offset = try parseIsoTimestampTz("1970-01-01 00:00:00-0100");
     try std.testing.expectEqual(@as(i64, 3_600_000_000), negative_short_offset.unix_us);
+    try std.testing.expectEqual(@as(i64, 0), (try parseIsoTimestampInstant("1970-01-01 01:00:00+01:00")).unix_us);
+    try std.testing.expectEqual(@as(i64, 0), (try parseIsoTimestampInstant("1970-01-01T00:00:00Z")).unix_us);
+    try std.testing.expectEqual(@as(i64, 0), (try parseIsoTimestampInstant("1970-01-01")).unix_us);
 
     try std.testing.expectError(error.TypeMismatch, parseIsoDate("2001-02-29"));
     try std.testing.expectError(error.TypeMismatch, parseIsoDate("2000-02-29x"));
@@ -497,6 +514,7 @@ test "parse ISO temporal values with explicit precision policy" {
     try std.testing.expectError(error.TypeMismatch, parseIsoTimestamp("2000-01-01 00:00:00.1234567"));
     try std.testing.expectError(error.TypeMismatch, parseIsoTimestamp("2000-01-01 00:00:00Z"));
     try std.testing.expectError(error.TypeMismatch, parseIsoTimestampTz("2000-01-01 00:00:00"));
+    try std.testing.expectError(error.TypeMismatch, parseIsoTimestampInstant("not-a-time"));
 
     // Expanded and signed years round-trip across the full wrapper range.
     var buffer: [40]u8 = undefined;

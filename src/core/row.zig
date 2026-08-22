@@ -282,6 +282,18 @@ fn convertValue(comptime T: type, value: Value) !T {
         .text => |v| try types.parseUuid(v),
         else => error.InvalidColumnType,
     };
+    if (T == types.Date) return switch (value) {
+        .text => |v| try types.parseIsoDate(v),
+        else => error.InvalidColumnType,
+    };
+    if (T == types.Time) return switch (value) {
+        .text => |v| try types.parseIsoTime(v),
+        else => error.InvalidColumnType,
+    };
+    if (T == types.Timestamp) return switch (value) {
+        .text => |v| try types.parseIsoTimestampInstant(v),
+        else => error.InvalidColumnType,
+    };
 
     return switch (info) {
         .bool => convertBool(value),
@@ -442,6 +454,55 @@ test "decode supports borrowed SQL domain wrappers" {
     try std.testing.expectEqualStrings("12.30", (try decode(types.Numeric, .{ .text = "12.30" })).text);
     try std.testing.expectEqual(@as(u8, 0x55), (try decode(types.Uuid, .{ .text = "550e8400-e29b-41d4-a716-446655440000" })).bytes[0]);
     try std.testing.expectError(error.InvalidColumnType, decode(types.Text, .{ .blob = "nope" }));
+}
+
+test "decode maps strict temporal wrappers from text" {
+    const date = try decode(
+        types.Date,
+        .{ .text = "2024-02-29" },
+    );
+    const time = try decode(
+        types.Time,
+        .{ .text = "04:05:06.007" },
+    );
+    const naive = try decode(
+        types.Timestamp,
+        .{ .text = "2024-02-29 04:05:06.000007" },
+    );
+    const offset = try decode(
+        types.Timestamp,
+        .{ .text = "2024-02-29 06:05:06+02:00" },
+    );
+
+    try std.testing.expectEqual(@as(i32, 19782), date.days_since_unix_epoch);
+    try std.testing.expectEqual(@as(u64, ((4 * 60 + 5) * 60 + 6) * 1_000_000_000 + 7_000_000), time.ns_since_midnight);
+    try std.testing.expectEqual(@as(i64, 1709179506000007), naive.unix_us);
+    try std.testing.expectEqual(@as(i64, 1709179506000000), offset.unix_us);
+
+    try std.testing.expectError(error.TypeMismatch, decode(types.Date, .{ .text = "2024-02-30" }));
+    try std.testing.expectError(error.TypeMismatch, decode(types.Time, .{ .text = "24:00:00" }));
+    try std.testing.expectError(error.TypeMismatch, decode(types.Timestamp, .{ .text = "not-a-time" }));
+    try std.testing.expectError(error.InvalidColumnType, decode(types.Date, .{ .integer = 19782 }));
+}
+
+test "Row maps optional temporal wrapper fields" {
+    const Event = struct {
+        occurred_on: ?types.Date,
+        occurred_at: ?types.Timestamp,
+    };
+
+    const row = try Row.init(&.{ "occurred_on", "occurred_at" }, &.{
+        .{ .text = "2024-02-29" },
+        .{ .text = "2024-02-29 04:05:06+00" },
+    });
+    const event = try row.to(Event);
+    try std.testing.expectEqual(@as(i32, 19782), event.occurred_on.?.days_since_unix_epoch);
+    try std.testing.expectEqual(@as(i64, 1709179506000000), event.occurred_at.?.unix_us);
+
+    const nulls = try Row.init(&.{ "occurred_on", "occurred_at" }, &.{ .null, .null });
+    const empty = try nulls.to(Event);
+    try std.testing.expectEqual(@as(?types.Date, null), empty.occurred_on);
+    try std.testing.expectEqual(@as(?types.Timestamp, null), empty.occurred_at);
 }
 
 test "Row maps to struct by field name and ordinal fallback" {

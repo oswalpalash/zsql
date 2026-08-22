@@ -680,18 +680,20 @@ After `ReadyForQuery`, column-name duplication and final column/row ownership
 transfers are failure-atomic, so an OOM preserves connection reuse without
 leaking any partially collected result storage.
 
-`zsql.types.Text`, `Blob`, `Numeric`, and canonical-text `Uuid` decode through
-the same borrowed row path. `Uuid.formatCanonical` emits lowercase hyphenated
-text without allocation. PostgreSQL `date`, `time`, `timestamp`, and
-`timestamptz` intentionally remain raw text by default: implicit parsing would
-hide timezone and precision policy. For callers that choose that policy,
-`types.parseIsoDate`, `.parseIsoTime`, `.parseIsoTimestamp`, and
-`.parseIsoTimestampTz` provide strict conversion to the explicit temporal
-wrappers, including signed/expanded years across the supported `Date` range.
-Timestamp parsing is UTC/naive and timestamptz parsing requires a wire offset
-and normalizes to UTC. Those wrappers can format back into caller buffers
-without allocation (for example, `timestamp.formatIsoUtc(&buffer)`), making the
-result straightforward to pass as SQL text.
+`zsql.types.Text`, `Blob`, `Numeric`, canonical-text `Uuid`, and explicit
+temporal wrappers decode through the same borrowed row path. `Uuid.formatCanonical`
+emits lowercase hyphenated text without allocation.
+
+PostgreSQL date/time values remain raw `.text` at the driver boundary: implicit
+parsing would hide timezone and precision policy. When a checked row field or
+`Row.to` field explicitly chooses `types.Date`, `types.Time`, or
+`types.Timestamp`, zsql applies its strict ISO parser, including signed/expanded
+years across the supported `Date` range. Naive timestamps are interpreted as UTC;
+`Z` and explicit offsets normalize to UTC. The standalone
+`parseIsoTimestamp`, `.parseIsoTimestampTz`, and `.parseIsoTimestampInstant`
+functions expose that choice directly. Wrappers can format back into caller
+buffers without allocation (for example, `timestamp.formatIsoUtc(&buffer)`),
+making the result straightforward to pass as SQL text.
 
 ### Offline checks
 
@@ -911,7 +913,8 @@ POSIX platforms; other targets retain atomic visibility and pre-publication
 file synchronization, with power-loss directory durability left to the target.
 
 Generated struct files import `zsql` themselves, map supported SQL domain types
-to `zsql.types.*`, and preserve database nullability with optional Zig fields.
+to `zsql.types.*` (including date, time, timestamp, and timestamptz), and preserve
+database nullability with optional Zig fields.
 Column fields preserve their exact SQL names through Zig's quoted-identifier
 syntax when needed. Table types remain PascalCase; normalization collisions get
 stable ordinal suffixes instead of producing duplicate declarations.
