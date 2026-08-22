@@ -9,6 +9,17 @@ pub const Blob = struct { bytes: []const u8 };
 pub const Date = struct {
     days_since_unix_epoch: i32,
 
+    /// Combine a UTC calendar date with nanoseconds since midnight.
+    pub fn toUtcDateTime(self: Date, time: Time) !Timestamp {
+        if (time.ns_since_midnight >= 86_400_000_000_000) return error.InvalidArguments;
+
+        const day_us: i128 = @as(i128, self.days_since_unix_epoch) * 86_400_000_000;
+        const time_us: i128 = @intCast(time.ns_since_midnight / 1_000);
+        const total_us: i128 = day_us + time_us;
+        const unix_us = std.math.cast(i64, total_us) orelse return error.Overflow;
+        return .{ .unix_us = unix_us };
+    }
+
     /// Exact buffer length required by `formatIso` for every representable date.
     pub const iso_buffer_len: usize = 17;
 
@@ -139,6 +150,30 @@ pub const Timestamp = struct {
     /// Exact buffer length required by `formatIsoUtc` for every representable
     /// timestamp.
     pub const iso_buffer_len: usize = 32;
+
+    /// A UTC timestamp decomposed into explicit calendar and wall-clock parts.
+    pub const UtcDateTime = struct {
+        date: Date,
+        time: Time,
+    };
+
+    /// Decompose into a UTC calendar date and nanosecond-precision time.
+    pub fn toUtcDateTime(self: Timestamp) !UtcDateTime {
+        const seconds = @divFloor(self.unix_us, 1_000_000);
+        const microseconds: u32 = @intCast(@mod(self.unix_us, 1_000_000));
+        const days_i64 = @divFloor(seconds, 86_400);
+        const days = std.math.cast(i32, days_i64) orelse return error.Overflow;
+        const second_of_day_i64 = @mod(seconds, 86_400);
+        const second_of_day: u32 = @intCast(second_of_day_i64);
+
+        return .{
+            .date = .{ .days_since_unix_epoch = days },
+            .time = .{
+                .ns_since_midnight = @as(u64, second_of_day) * 1_000_000_000 +
+                    @as(u64, microseconds) * 1_000,
+            },
+        };
+    }
 
     /// Format as an ISO UTC timestamp ending in `Z`, omitting an all-zero or
     /// trailing-zero fractional part.
@@ -866,6 +901,33 @@ test "combine timezone-aware time with calendar date in UTC" {
 
     const invalid_time = TimeTz{ .nanos_since_midnight = 86_400_000_000_000, .offset_seconds = 0 };
     try std.testing.expectError(error.InvalidArguments, invalid_time.utcTimestamp(epoch_date));
+}
+
+test "decompose UTC timestamps into explicit date and time" {
+    const timestamp = try parseIsoTimestampInstant("2024-02-29T04:05:06.000007Z");
+    const parts = try timestamp.toUtcDateTime();
+
+    try std.testing.expectEqual(@as(i32, 19782), parts.date.days_since_unix_epoch);
+    try std.testing.expectEqual(
+        @as(u64, ((4 * 60 + 5) * 60 + 6) * 1_000_000_000 + 7_000),
+        parts.time.ns_since_midnight,
+    );
+
+    var buffer: [Timestamp.iso_buffer_len]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "2024-02-29T04:05:06.000007Z",
+        try (try parts.date.toUtcDateTime(parts.time)).formatIsoUtc(&buffer),
+    );
+
+    for ([_]i64{ std.math.minInt(i64), -1, 0, 1, std.math.maxInt(i64) }) |unix_us| {
+        const extreme = Timestamp{ .unix_us = unix_us };
+        const extreme_parts = try extreme.toUtcDateTime();
+        try std.testing.expect(extreme_parts.time.ns_since_midnight < 86_400_000_000_000);
+        try std.testing.expectEqual(
+            extreme,
+            try extreme_parts.date.toUtcDateTime(extreme_parts.time),
+        );
+    }
 }
 
 test "parseUuid accepts canonical text" {

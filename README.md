@@ -715,6 +715,9 @@ instants.
 accepts historical second-bearing offsets and its formatter keeps the timezone
 policy visible. Callers can combine it with a calendar date through
 `utcTimestamp`, which normalizes across day boundaries in UTC.
+`Timestamp.toUtcDateTime` decomposes an instant into an explicit `Date` and
+nanosecond-precision UTC `Time`; `Date.toUtcDateTime` performs the checked
+inverse.
 
 ### Offline checks
 
