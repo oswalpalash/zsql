@@ -764,16 +764,26 @@ fn aggregateResultType(
             const exact_numeric = std.ascii.eqlIgnoreCase(source, "numeric") or
                 std.ascii.eqlIgnoreCase(source, "decimal");
             const wide_integer = std.ascii.eqlIgnoreCase(source, "int8");
+            const float4 = std.ascii.eqlIgnoreCase(source, "float4") or
+                std.ascii.eqlIgnoreCase(source, "real");
+            const float8 = std.ascii.eqlIgnoreCase(source, "float8") or
+                std.ascii.eqlIgnoreCase(source, "double");
 
             return switch (kind) {
                 .sum => if (exact_integer)
                     "INT8"
                 else if (wide_integer or exact_numeric)
                     "NUMERIC"
+                else if (float4)
+                    "FLOAT4"
+                else if (float8)
+                    "FLOAT8"
                 else
                     null,
                 .avg => if (exact_integer or wide_integer or exact_numeric)
                     "NUMERIC"
+                else if (float4 or float8)
+                    "FLOAT8"
                 else
                     null,
                 else => null,
@@ -791,7 +801,14 @@ fn aggregateResultType(
                 std.ascii.eqlIgnoreCase(source, "double");
 
             return switch (kind) {
-                .sum => if (integer) "INT8" else if (real) "FLOAT8" else null,
+                .sum => if (integer) "INT8" else if (real)
+                    "FLOAT8"
+                else if (std.ascii.eqlIgnoreCase(source, "numeric"))
+                    // SQLite NUMERIC storage can yield either integer or real;
+                    // both decode safely into an f64 field.
+                    "FLOAT8"
+                else
+                    null,
                 .avg => if (integer or real or std.ascii.eqlIgnoreCase(source, "numeric"))
                     "FLOAT8"
                 else
@@ -3125,11 +3142,25 @@ test "checked rows support bounded aggregate projection aliases" {
             .{ .name = "small_value", .type_name = "int4", .nullable = true },
             .{ .name = "wide_value", .type_name = "int8", .nullable = true },
             .{ .name = "amount", .type_name = "numeric", .nullable = true },
+            .{ .name = "sample", .type_name = "float4", .nullable = true },
+            .{ .name = "measurement", .type_name = "float8", .nullable = true },
         },
     }} };
     const postgres_aggregates = checkedQuery(.{
-        .sql = "select sum(small_value) as small_sum, sum(wide_value) as wide_sum, avg(amount) as average from metrics",
-        .row = struct { small_sum: ?i64, wide_sum: ?sql_types.Numeric, average: ?sql_types.Numeric },
+        .sql =
+        \\select sum(small_value) as small_sum, sum(wide_value) as wide_sum,
+        \\  sum(sample) as sample_sum, sum(measurement) as measurement_sum,
+        \\  avg(amount) as average, avg(sample) as sample_average
+        \\from metrics
+        ,
+        .row = struct {
+            small_sum: ?i64,
+            wide_sum: ?sql_types.Numeric,
+            sample_sum: ?f32,
+            measurement_sum: ?f64,
+            average: ?sql_types.Numeric,
+            sample_average: ?f64,
+        },
     });
     try postgres_aggregates.validate(pg_schema);
 
@@ -3138,11 +3169,12 @@ test "checked rows support bounded aggregate projection aliases" {
         .columns = &.{
             .{ .name = "count_value", .type_name = "INTEGER", .nullable = true },
             .{ .name = "score", .type_name = "REAL", .nullable = true },
+            .{ .name = "price", .type_name = "NUMERIC", .nullable = true },
         },
     }} };
     const sqlite_aggregates = checkedQuery(.{
-        .sql = "select sum(count_value) as total, avg(score) as average from samples",
-        .row = struct { total: ?i64, average: ?f64 },
+        .sql = "select sum(count_value) as total, avg(score) as average, sum(price) as price_total from samples",
+        .row = struct { total: ?i64, average: ?f64, price_total: ?f64 },
     });
     try sqlite_aggregates.validate(sqlite_schema);
 
