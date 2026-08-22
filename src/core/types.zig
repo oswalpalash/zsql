@@ -163,9 +163,27 @@ pub const Timestamp = struct {
         date: Date,
         time: TimeTz,
 
+        /// Exact buffer length required by `formatIso` for every representable
+        /// value.
+        pub const iso_buffer_len: usize =
+            Date.iso_buffer_len + 1 + TimeTz.iso_buffer_len;
+
         /// Normalize this wall-clock date/time back to the same UTC instant.
         pub fn utcTimestamp(self: OffsetDateTime) !Timestamp {
             return self.time.utcTimestamp(self.date);
+        }
+
+        /// Format the shifted local date and timezone-aware time as one ISO
+        /// string without allocation.
+        pub fn formatIso(self: OffsetDateTime, buffer: []u8) ![]const u8 {
+            if (buffer.len < OffsetDateTime.iso_buffer_len) return error.NoSpaceLeft;
+
+            const date = try self.date.formatIso(buffer);
+            var cursor = date.len;
+            buffer[cursor] = 'T';
+            cursor += 1;
+            const time = try self.time.formatIso(buffer[cursor..]);
+            return buffer[0 .. cursor + time.len];
         }
     };
 
@@ -595,7 +613,7 @@ fn isoOffsetSeconds(text: []const u8) !i64 {
     } else {
         return error.TypeMismatch;
     }
-    if (hours > 23 or minutes > 59 or seconds > 59) return error.TypeMismatch;
+    if (hours > 24 or minutes > 59 or seconds > 59) return error.TypeMismatch;
     return sign * (@as(i64, hours) * 3_600 + @as(i64, minutes) * 60 + seconds);
 }
 
@@ -639,13 +657,17 @@ pub fn parseIsoTimeTz(text: []const u8) !TimeTz {
     };
 }
 
-fn isoCombineDateAndTime(days: i64, time_text: []const u8) !Timestamp {
+fn isoCombineDateAndTimeMicros(days: i64, time_text: []const u8) !i128 {
     const time = try isoSplitTime(time_text, 6);
     // Widen while combining so a negative date plus a positive time can cross
     // an i64-second boundary without an intermediate overflow.
     const day_us = @as(i128, days) * 86_400_000_000;
     const time_us = @as(i128, time.ns_since_midnight / 1_000);
-    const total_us = day_us + time_us;
+    return day_us + time_us;
+}
+
+fn isoCombineDateAndTime(days: i64, time_text: []const u8) !Timestamp {
+    const total_us = try isoCombineDateAndTimeMicros(days, time_text);
     return .{ .unix_us = std.math.cast(i64, total_us) orelse return error.Overflow };
 }
 
@@ -683,15 +705,16 @@ pub fn parseIsoTimestampTz(text: []const u8) !Timestamp {
     }
     const found_offset = offset_start orelse return error.TypeMismatch;
     const offset_seconds = try isoOffsetSeconds(parts.time[found_offset..]);
+    if (offset_seconds < -86_400 or offset_seconds > 86_400) return error.TypeMismatch;
 
-    var naive = try isoCombineDateAndTime(
+    const naive_us = try isoCombineDateAndTimeMicros(
         parts.days,
         parts.time[0..found_offset],
     );
 
-    const offset_us = std.math.mul(i64, offset_seconds, 1_000_000) catch return error.Overflow;
-    naive.unix_us = std.math.sub(i64, naive.unix_us, offset_us) catch return error.Overflow;
-    return naive;
+    const offset_us: i128 = @as(i128, offset_seconds) * 1_000_000;
+    const unix_us = naive_us - offset_us;
+    return .{ .unix_us = std.math.cast(i64, unix_us) orelse return error.Overflow };
 }
 
 /// Parse an ISO timestamp as a UTC instant: a naive value is interpreted as
@@ -1012,6 +1035,75 @@ test "offset decomposition round-trips deterministic instants" {
         try std.testing.expect(offset.time.nanos_since_midnight < 86_400_000_000_000);
         try std.testing.expectEqual(timestamp, try offset.utcTimestamp());
     }
+}
+
+test "format offset date/times without allocation" {
+    var buffer: [Timestamp.OffsetDateTime.iso_buffer_len]u8 = undefined;
+    var short_buffer: [Timestamp.OffsetDateTime.iso_buffer_len - 1]u8 =
+        undefined;
+    const timestamp = try parseIsoTimestampInstant("2024-03-10T01:30:00.25Z");
+    const offset = try timestamp.toOffsetDateTime(-2 * 3_600 - 30 * 60);
+
+    try std.testing.expectEqualStrings(
+        "2024-03-09T23:00:00.25-02:30",
+        try offset.formatIso(&buffer),
+    );
+    try std.testing.expectEqual(
+        timestamp,
+        try parseIsoTimestampInstant(try offset.formatIso(&buffer)),
+    );
+    try std.testing.expectError(error.NoSpaceLeft, offset.formatIso(&short_buffer));
+
+    const wide_date = try parseIsoDate("12000-01-01");
+    const historical_time = try parseIsoTimeTz("04:05:06.007000000+07:52:58");
+    const wide_offset = Timestamp.OffsetDateTime{
+        .date = wide_date,
+        .time = historical_time,
+    };
+    try std.testing.expectEqualStrings(
+        "12000-01-01T04:05:06.007+07:52:58",
+        try wide_offset.formatIso(&buffer),
+    );
+
+    const invalid = Timestamp.OffsetDateTime{
+        .date = wide_date,
+        .time = .{
+            .nanos_since_midnight = 86_400_000_000_000,
+            .offset_seconds = 0,
+        },
+    };
+    try std.testing.expectError(error.InvalidArguments, invalid.formatIso(&buffer));
+}
+
+test "offset formatting round-trips temporal extrema" {
+    var buffer: [Timestamp.OffsetDateTime.iso_buffer_len]u8 = undefined;
+
+    for ([_]i64{ std.math.minInt(i64), 0, std.math.maxInt(i64) }) |unix_us| {
+        for ([_]i32{ -86_400, 0, 86_400 }) |offset_seconds| {
+            const timestamp = Timestamp{ .unix_us = unix_us };
+            const offset = try timestamp.toOffsetDateTime(offset_seconds);
+            const formatted = try offset.formatIso(&buffer);
+            try std.testing.expectEqual(
+                timestamp,
+                try parseIsoTimestampInstant(formatted),
+            );
+        }
+    }
+}
+
+test "parse exact day-long timezone offsets" {
+    try std.testing.expectEqual(@as(i32, -86_400), (try parseIsoTimeTz("00:00:00-24:00")).offset_seconds);
+    try std.testing.expectEqual(@as(i32, 86_400), (try parseIsoTimeTz("00:00:00+24:00")).offset_seconds);
+    try std.testing.expectEqual(
+        @as(i64, 86_400_000_000),
+        (try parseIsoTimestampTz("1970-01-01 00:00:00-24:00")).unix_us,
+    );
+    try std.testing.expectError(error.TypeMismatch, parseIsoTimeTz("00:00:00-24:00:01"));
+    try std.testing.expectError(
+        error.TypeMismatch,
+        parseIsoTimestampTz("1970-01-01 00:00:00-24:00:01"),
+    );
+    try std.testing.expectError(error.TypeMismatch, parseIsoTimeTz("00:00:00-25:00"));
 }
 
 test "parseUuid accepts canonical text" {
