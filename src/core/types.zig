@@ -617,6 +617,30 @@ fn isoOffsetSeconds(text: []const u8) !i64 {
     return sign * (@as(i64, hours) * 3_600 + @as(i64, minutes) * 60 + seconds);
 }
 
+const IsoTimestampOffset = struct {
+    local_time: []const u8,
+    seconds: i64,
+};
+
+fn isoSplitTimestampOffset(time_text: []const u8) !IsoTimestampOffset {
+    var offset_start: ?usize = null;
+    for (time_text, 0..) |char, index| {
+        switch (char) {
+            '+', '-', 'Z', 'z' => {
+                offset_start = index;
+                break;
+            },
+            ':', '.', '0'...'9' => {},
+            else => return error.TypeMismatch,
+        }
+    }
+
+    const start = offset_start orelse return error.TypeMismatch;
+    const seconds = try isoOffsetSeconds(time_text[start..]);
+    if (seconds < -86_400 or seconds > 86_400) return error.TypeMismatch;
+    return .{ .local_time = time_text[0..start], .seconds = seconds };
+}
+
 /// Parse an ISO-style `YYYY-MM-DD` date. This is the explicit opt-in path for
 /// PostgreSQL's default ISO date output; ordinary row decoding remains raw text.
 pub fn parseIsoDate(text: []const u8) !Date {
@@ -691,30 +715,38 @@ pub fn parseIsoTimestamp(text: []const u8) !Timestamp {
 /// normalize it to UTC in the returned `Timestamp`.
 pub fn parseIsoTimestampTz(text: []const u8) !Timestamp {
     const parts = try isoSplitTimestamp(text);
-    var offset_start: ?usize = null;
-    var index: usize = 0;
-    while (index < parts.time.len) : (index += 1) {
-        switch (parts.time[index]) {
-            '+', '-', 'Z', 'z' => {
-                offset_start = index;
-                break;
-            },
-            ':', '.', '0'...'9' => {},
-            else => return error.TypeMismatch,
-        }
-    }
-    const found_offset = offset_start orelse return error.TypeMismatch;
-    const offset_seconds = try isoOffsetSeconds(parts.time[found_offset..]);
-    if (offset_seconds < -86_400 or offset_seconds > 86_400) return error.TypeMismatch;
+    const split = try isoSplitTimestampOffset(parts.time);
 
     const naive_us = try isoCombineDateAndTimeMicros(
         parts.days,
-        parts.time[0..found_offset],
+        split.local_time,
     );
 
-    const offset_us: i128 = @as(i128, offset_seconds) * 1_000_000;
+    const offset_us: i128 = @as(i128, split.seconds) * 1_000_000;
     const unix_us = naive_us - offset_us;
     return .{ .unix_us = std.math.cast(i64, unix_us) orelse return error.Overflow };
+}
+
+/// Parse an ISO timestamp into a wall-clock date/time plus its explicit UTC
+/// offset. Unlike timestamp parsers, this preserves nanosecond precision and
+/// does not normalize away the caller's timezone policy.
+pub fn parseIsoOffsetDateTime(text: []const u8) !Timestamp.OffsetDateTime {
+    const parts = try isoSplitTimestamp(text);
+    const split = try isoSplitTimestampOffset(parts.time);
+    const time = try isoSplitTime(split.local_time, 9);
+
+    return .{
+        .date = .{
+            .days_since_unix_epoch = std.math.cast(
+                i32,
+                parts.days,
+            ) orelse return error.Overflow,
+        },
+        .time = .{
+            .nanos_since_midnight = time.ns_since_midnight,
+            .offset_seconds = @intCast(split.seconds),
+        },
+    };
 }
 
 /// Parse an ISO timestamp as a UTC instant: a naive value is interpreted as
@@ -1087,8 +1119,66 @@ test "offset formatting round-trips temporal extrema" {
                 timestamp,
                 try parseIsoTimestampInstant(formatted),
             );
+            try std.testing.expectEqual(offset, try parseIsoOffsetDateTime(formatted));
         }
     }
+}
+
+test "parse explicit offset date/times without normalization" {
+    var buffer: [Timestamp.OffsetDateTime.iso_buffer_len]u8 = undefined;
+    const parsed = try parseIsoOffsetDateTime("2024-03-09 23:00:00.25-02:30");
+
+    try std.testing.expectEqual(@as(i32, 19791), parsed.date.days_since_unix_epoch);
+    try std.testing.expectEqual(
+        @as(u64, 23 * 3_600_000_000_000 + 250_000_000),
+        parsed.time.nanos_since_midnight,
+    );
+    try std.testing.expectEqual(@as(i32, -9_000), parsed.time.offset_seconds);
+    try std.testing.expectEqualStrings(
+        "2024-03-09T23:00:00.25-02:30",
+        try parsed.formatIso(&buffer),
+    );
+    try std.testing.expectEqual(
+        try parseIsoTimestampInstant("2024-03-10T01:30:00.25Z"),
+        try parsed.utcTimestamp(),
+    );
+
+    const nanoseconds = try parseIsoOffsetDateTime(
+        "0001-01-01T00:00:00.123456789+01:02:03",
+    );
+    try std.testing.expectEqual(
+        @as(i32, -719_162),
+        nanoseconds.date.days_since_unix_epoch,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 123_456_789),
+        nanoseconds.time.nanos_since_midnight,
+    );
+    try std.testing.expectEqual(@as(i32, 3_723), nanoseconds.time.offset_seconds);
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        (try parseIsoOffsetDateTime("2024-03-09T23:00:00Z")).time.offset_seconds,
+    );
+
+    const bc = try parseIsoOffsetDateTime("0001-01-01 00:00:00+00 BC");
+    try std.testing.expectEqual(@as(i32, -719_528), bc.date.days_since_unix_epoch);
+    try std.testing.expectEqual(
+        bc,
+        try parseIsoOffsetDateTime(try bc.formatIso(&buffer)),
+    );
+
+    try std.testing.expectError(
+        error.TypeMismatch,
+        parseIsoOffsetDateTime("2024-03-09T23:00:00"),
+    );
+    try std.testing.expectError(
+        error.TypeMismatch,
+        parseIsoOffsetDateTime("2024-03-09T23:00:00-24:00:01"),
+    );
+    try std.testing.expectError(
+        error.TypeMismatch,
+        parseIsoOffsetDateTime("2024-03-09T23:00:00.1234567890Z"),
+    );
 }
 
 test "parse exact day-long timezone offsets" {

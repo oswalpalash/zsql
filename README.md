@@ -702,13 +702,17 @@ emits lowercase hyphenated text without allocation.
 
 PostgreSQL date/time values remain raw `.text` at the driver boundary: implicit
 parsing would hide timezone and precision policy. When a checked row field or
-`Row.to` field explicitly chooses `types.Date`, `types.Time`, `types.TimeTz`, or
-`types.Timestamp`, zsql applies its strict ISO parser, including signed/expanded
-years across the supported `Date` range. Naive timestamps are interpreted as UTC;
+`Row.to` field explicitly chooses `types.Date`, `types.Time`, `types.TimeTz`,
+`types.Timestamp`, or `types.Timestamp.OffsetDateTime`, zsql applies its strict
+ISO parser, including signed/expanded years across the supported `Date` range.
+Naive timestamps are interpreted as UTC;
 `Z` and explicit offsets normalize to UTC. The standalone
 `parseIsoTimestamp`, `.parseIsoTimestampTz`, and `.parseIsoTimestampInstant`
-functions expose that choice directly. Wrappers can format back into caller
-buffers without allocation (for example, `timestamp.formatIsoUtc(&buffer)`).
+functions expose that choice directly. When the wall clock and offset are the
+important data, `parseIsoOffsetDateTime` instead returns an explicit
+`OffsetDateTime` with up-to-nanosecond precision intact. Wrappers can format
+back into caller buffers without allocation (for example,
+`timestamp.formatIsoUtc(&buffer)`).
 Each wrapper exposes its exact `iso_buffer_len`, so callers can size stack
 storage without overestimating expanded-year output.
 PostgreSQL's BC era suffix and historical timezone offsets containing seconds are

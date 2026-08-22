@@ -298,6 +298,10 @@ fn convertValue(comptime T: type, value: Value) !T {
         .text => |v| try types.parseIsoTimestampInstant(v),
         else => error.InvalidColumnType,
     };
+    if (T == types.Timestamp.OffsetDateTime) return switch (value) {
+        .text => |v| try types.parseIsoOffsetDateTime(v),
+        else => error.InvalidColumnType,
+    };
 
     return switch (info) {
         .bool => convertBool(value),
@@ -481,6 +485,10 @@ test "decode maps strict temporal wrappers from text" {
         types.TimeTz,
         .{ .text = "04:05:06.007-07:52:58" },
     );
+    const offset_date_time = try decode(
+        types.Timestamp.OffsetDateTime,
+        .{ .text = "2024-03-09 23:00:00.25-02:30" },
+    );
     var buffer: [types.TimeTz.iso_buffer_len]u8 = undefined;
 
     try std.testing.expectEqual(@as(i32, 19782), date.days_since_unix_epoch);
@@ -488,11 +496,19 @@ test "decode maps strict temporal wrappers from text" {
     try std.testing.expectEqual(@as(i64, 1709179506000007), naive.unix_us);
     try std.testing.expectEqual(@as(i64, 1709179506000000), offset.unix_us);
     try std.testing.expectEqualStrings("04:05:06.007-07:52:58", try time_tz.formatIso(&buffer));
+    try std.testing.expectEqual(
+        @as(i32, -9_000),
+        offset_date_time.time.offset_seconds,
+    );
 
     try std.testing.expectError(error.TypeMismatch, decode(types.Date, .{ .text = "2024-02-30" }));
     try std.testing.expectError(error.TypeMismatch, decode(types.Time, .{ .text = "24:00:00" }));
     try std.testing.expectError(error.TypeMismatch, decode(types.TimeTz, .{ .text = "12:00:00" }));
     try std.testing.expectError(error.TypeMismatch, decode(types.Timestamp, .{ .text = "not-a-time" }));
+    try std.testing.expectError(
+        error.TypeMismatch,
+        decode(types.Timestamp.OffsetDateTime, .{ .text = "2024-03-09T23:00:00" }),
+    );
     try std.testing.expectError(error.InvalidColumnType, decode(types.Date, .{ .integer = 19782 }));
 }
 
@@ -500,20 +516,33 @@ test "Row maps optional temporal wrapper fields" {
     const Event = struct {
         occurred_on: ?types.Date,
         occurred_at: ?types.Timestamp,
+        local_at: ?types.Timestamp.OffsetDateTime,
     };
 
-    const row = try Row.init(&.{ "occurred_on", "occurred_at" }, &.{
+    const row = try Row.init(&.{ "occurred_on", "occurred_at", "local_at" }, &.{
         .{ .text = "2024-02-29" },
         .{ .text = "2024-02-29 04:05:06+00" },
+        .{ .text = "2024-03-09 23:00:00.25-02:30" },
     });
     const event = try row.to(Event);
     try std.testing.expectEqual(@as(i32, 19782), event.occurred_on.?.days_since_unix_epoch);
     try std.testing.expectEqual(@as(i64, 1709179506000000), event.occurred_at.?.unix_us);
+    try std.testing.expectEqual(
+        @as(i32, -9_000),
+        event.local_at.?.time.offset_seconds,
+    );
 
-    const nulls = try Row.init(&.{ "occurred_on", "occurred_at" }, &.{ .null, .null });
+    const nulls = try Row.init(
+        &.{ "occurred_on", "occurred_at", "local_at" },
+        &.{ .null, .null, .null },
+    );
     const empty = try nulls.to(Event);
     try std.testing.expectEqual(@as(?types.Date, null), empty.occurred_on);
     try std.testing.expectEqual(@as(?types.Timestamp, null), empty.occurred_at);
+    try std.testing.expectEqual(
+        @as(?types.Timestamp.OffsetDateTime, null),
+        empty.local_at,
+    );
 }
 
 test "Row maps to struct by field name and ordinal fallback" {
