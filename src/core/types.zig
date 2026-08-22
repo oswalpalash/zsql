@@ -190,6 +190,36 @@ pub const Timestamp = struct {
     pub const UtcDateTime = struct {
         date: Date,
         time: Time,
+
+        /// Render this UTC date/time at an explicit offset while retaining all
+        /// nine nanoseconds.
+        pub fn toOffsetDateTime(
+            self: UtcDateTime,
+            offset_seconds: i32,
+        ) !Timestamp.OffsetDateTime {
+            if (self.time.ns_since_midnight >= 86_400_000_000_000 or
+                offset_seconds < -86_400 or offset_seconds > 86_400)
+            {
+                return error.InvalidArguments;
+            }
+
+            const local_ns: i128 = @as(i128, self.date.days_since_unix_epoch) *
+                86_400_000_000_000 +
+                @as(i128, self.time.ns_since_midnight) +
+                @as(i128, offset_seconds) * 1_000_000_000;
+            const days_i128 = @divFloor(local_ns, 86_400_000_000_000);
+            const days = std.math.cast(i32, days_i128) orelse return error.Overflow;
+
+            return .{
+                .date = .{ .days_since_unix_epoch = days },
+                .time = .{
+                    .nanos_since_midnight = @intCast(
+                        @mod(local_ns, 86_400_000_000_000),
+                    ),
+                    .offset_seconds = offset_seconds,
+                },
+            };
+        }
     };
 
     /// A timestamp decomposed into an explicit calendar date and a local time
@@ -1322,6 +1352,71 @@ test "decompose offset date/times into UTC without precision loss" {
         },
     };
     try std.testing.expectError(error.InvalidArguments, invalid_offset.toUtcDateTime());
+}
+
+test "compose UTC date/times into explicit offsets without precision loss" {
+    var buffer: [OffsetDateTime.iso_buffer_len]u8 = undefined;
+    const utc = Timestamp.UtcDateTime{
+        .date = try parseIsoDate("2024-03-10"),
+        .time = try parseIsoTime("04:30:00.123456789"),
+    };
+
+    const behind = try utc.toOffsetDateTime(-2 * 3_600 - 30 * 60);
+    try std.testing.expectEqual(@as(i32, 19792), behind.date.days_since_unix_epoch);
+    try std.testing.expectEqual(
+        @as(u64, (2 * 3_600) * 1_000_000_000 + 123_456_789),
+        behind.time.nanos_since_midnight,
+    );
+    try std.testing.expectEqual(@as(i32, -9_000), behind.time.offset_seconds);
+    try std.testing.expectEqualStrings(
+        "2024-03-10T02:00:00.123456789-02:30",
+        try behind.formatIso(&buffer),
+    );
+
+    const ahead = try utc.toOffsetDateTime(23 * 3_600 + 30 * 60);
+    try std.testing.expectEqual(@as(i32, 19793), ahead.date.days_since_unix_epoch);
+    try std.testing.expectEqual(
+        @as(u64, 4 * 3_600 * 1_000_000_000 + 123_456_789),
+        ahead.time.nanos_since_midnight,
+    );
+    try std.testing.expectEqual(
+        utc,
+        try ahead.toUtcDateTime(),
+    );
+
+    for ([_]i64{ std.math.minInt(i64), 0, std.math.maxInt(i64) }) |unix_us| {
+        const timestamp = Timestamp{ .unix_us = unix_us };
+        const source = try timestamp.toUtcDateTime();
+        for ([_]i32{ -86_400, -9_000, 0, 3_600, 86_400 }) |offset_seconds| {
+            const offset = try source.toOffsetDateTime(offset_seconds);
+            try std.testing.expectEqual(
+                try timestamp.toOffsetDateTime(offset_seconds),
+                offset,
+            );
+            try std.testing.expectEqual(
+                try timestamp.toUtcDateTime(),
+                try offset.toUtcDateTime(),
+            );
+        }
+    }
+
+    const invalid_nanos = Timestamp.UtcDateTime{
+        .date = try parseIsoDate("2024-03-10"),
+        .time = .{ .ns_since_midnight = 86_400_000_000_000 },
+    };
+    try std.testing.expectError(error.InvalidArguments, invalid_nanos.toOffsetDateTime(0));
+
+    const maximum_date = Timestamp.UtcDateTime{
+        .date = .{ .days_since_unix_epoch = std.math.maxInt(i32) },
+        .time = .{ .ns_since_midnight = 86_399_999_999_999 },
+    };
+    try std.testing.expectError(error.Overflow, maximum_date.toOffsetDateTime(86_400));
+
+    const minimum_date = Timestamp.UtcDateTime{
+        .date = .{ .days_since_unix_epoch = std.math.minInt(i32) },
+        .time = .{ .ns_since_midnight = 0 },
+    };
+    try std.testing.expectError(error.Overflow, minimum_date.toOffsetDateTime(-86_400));
 }
 
 test "offset decomposition round-trips deterministic instants" {

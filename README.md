@@ -733,6 +733,8 @@ returns the shifted calendar date plus an offset-preserving `TimeTz`.
 `OffsetDateTime.toUtcDateTime` performs the same decomposition directly, so a
 offset date/time keeps all nine fractional digits without an intermediate
 microsecond-only timestamp.
+`Timestamp.UtcDateTime.toOffsetDateTime(offset)` is its direct inverse and also
+preserves nanoseconds across day-boundary shifts.
 `Date.toOffsetDateTime(timeTz)` checks and combines the original wall clock,
 offset, and nanoseconds without normalization.
 `OffsetDateTime.formatIso` renders that local date, time, and numeric offset as
