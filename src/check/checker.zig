@@ -336,7 +336,7 @@ fn resolveAggregateProjection(schema: inspect.Schema, scope: []const TableRef, p
         .sum, .avg => .{
             .name = @tagName(projection.kind),
             .type_name = aggregateResultType(schema.dialect, projection.kind, source.?.col.type_name) orelse
-                return error.TypeMismatch,
+                return error.UnsupportedAggregateType,
             // Aggregates over an empty input, or SUM/AVG over all-null input,
             // produce SQL NULL.
             .nullable = true,
@@ -3178,7 +3178,7 @@ test "checked rows support bounded aggregate projection aliases" {
     });
     try sqlite_aggregates.validate(sqlite_schema);
 
-    try std.testing.expectError(error.TypeMismatch, checkQuery(.{
+    try std.testing.expectError(error.UnsupportedAggregateType, checkQuery(.{
         .sql = "select sum(email) as total from users",
         .schema = schema,
         .row = &.{.{ .name = "total", .type_name = "NUMERIC", .nullable = true }},
