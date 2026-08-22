@@ -649,6 +649,11 @@ fn typesCompatible(want: []const u8, have: []const u8) bool {
     if (isBoolType(a) and isBoolType(b)) return true;
     // Blob family
     if (isBlobType(a) and isBlobType(b)) return true;
+    // Explicit temporal wrappers have distinct SQL families. TIME WITH TIME
+    // ZONE is deliberately excluded because Time has no offset field.
+    if (isDateType(a) and isDateType(b)) return true;
+    if (isTimestampType(a) and isTimestampType(b)) return true;
+    if (isNaiveTimeType(a) and isNaiveTimeType(b)) return true;
     return false;
 }
 
@@ -657,6 +662,7 @@ fn normalizeTypeName(name: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(name, "character varying")) return "varchar";
     if (std.ascii.eqlIgnoreCase(name, "double precision")) return "float8";
     if (std.ascii.indexOfIgnoreCase(name, "timestamp") != null) return "timestamp";
+    if (std.ascii.eqlIgnoreCase(name, "time without time zone")) return "time";
     return name;
 }
 
@@ -716,6 +722,19 @@ fn isBlobType(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "blob") or
         std.ascii.eqlIgnoreCase(name, "bytea") or
         std.ascii.eqlIgnoreCase(name, "bytes");
+}
+
+fn isDateType(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "date");
+}
+
+fn isTimestampType(name: []const u8) bool {
+    // normalizeTypeName folds timestamp, timestamptz, and timezone modifiers.
+    return std.ascii.eqlIgnoreCase(name, "timestamp");
+}
+
+fn isNaiveTimeType(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "time");
 }
 
 // --- Lightweight SQL surface scan (quotes / comments aware) ---
@@ -2013,6 +2032,9 @@ fn zigTypeName(comptime T: type) ?[]const u8 {
     if (base == sql_types.Blob) return "BLOB";
     if (base == sql_types.Numeric) return "NUMERIC";
     if (base == sql_types.Uuid) return "UUID";
+    if (base == sql_types.Date) return "DATE";
+    if (base == sql_types.Time) return "TIME";
+    if (base == sql_types.Timestamp) return "TIMESTAMP";
     if (@typeInfo(base) == .@"enum") return "TEXT";
     return null;
 }
@@ -2200,6 +2222,60 @@ test "typed checkedQuery validates zsql domain wrappers" {
         .from_table = "documents",
     });
     try q.validate(schema);
+}
+
+test "checkedQuery validates explicit temporal row wrappers" {
+    const schema = inspect.Schema{ .tables = &.{.{ .name = "events", .columns = &.{
+        .{ .name = "occurred_on", .type_name = "date", .nullable = false },
+        .{ .name = "local_time", .type_name = "time without time zone", .nullable = true },
+        .{ .name = "recorded_at", .type_name = "timestamp with time zone", .nullable = false },
+    } }} };
+
+    const q = checkedQuery(.{
+        .sql = "select occurred_on, local_time, recorded_at from events",
+        .row = struct {
+            occurred_on: sql_types.Date,
+            local_time: ?sql_types.Time,
+            recorded_at: sql_types.Timestamp,
+        },
+        .from_table = "events",
+    });
+    try q.validate(schema);
+}
+
+test "checkedQuery rejects temporal family mismatches" {
+    const schema = inspect.Schema{ .tables = &.{.{ .name = "events", .columns = &.{
+        .{ .name = "occurred_on", .type_name = "date", .nullable = false },
+        .{ .name = "local_time", .type_name = "time without time zone", .nullable = false },
+        .{ .name = "recorded_at", .type_name = "timestamptz", .nullable = false },
+    } }} };
+
+    const date_as_timestamp = checkedQuery(.{
+        .sql = "select occurred_on from events",
+        .row = struct { occurred_on: sql_types.Timestamp },
+        .from_table = "events",
+    });
+    try std.testing.expect(!typesCompatible("TIMESTAMP", "date"));
+    try std.testing.expect(!typesCompatible("TIME", "timetz"));
+    try std.testing.expect(!typesCompatible("DATE", "timestamptz"));
+    try std.testing.expectError(error.TypeMismatch, date_as_timestamp.validate(schema));
+
+    const timetz_schema = inspect.Schema{ .tables = &.{.{ .name = "events", .columns = &.{
+        .{ .name = "local_time", .type_name = "timetz", .nullable = false },
+    } }} };
+    const timetz_as_naive_time = checkedQuery(.{
+        .sql = "select local_time from events",
+        .row = struct { local_time: sql_types.Time },
+        .from_table = "events",
+    });
+    try std.testing.expectError(error.TypeMismatch, timetz_as_naive_time.validate(timetz_schema));
+
+    const timestamp_as_date = checkedQuery(.{
+        .sql = "select recorded_at from events",
+        .row = struct { recorded_at: sql_types.Date },
+        .from_table = "events",
+    });
+    try std.testing.expectError(error.TypeMismatch, timestamp_as_date.validate(schema));
 }
 
 test "typed checkedQuery rejects authoritative numeric narrowing" {
