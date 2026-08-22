@@ -796,6 +796,57 @@ test "postgres live: migrator rejects incomplete and out of order plans" {
     try conn.ping();
 }
 
+test "postgres live: migrator rejects transaction control before SQL and marker" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, std.testing.io, config);
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists zsql_transaction_control_rejected");
+    _ = try conn.exec("drop table if exists zsql_migrations");
+
+    const sql =
+        \\create table zsql_transaction_control_rejected (id bigint primary key);
+        \\commit;
+    ;
+    const migrations = [_]zsql.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "transaction_control",
+            .filename = "V0001__transaction_control.sql",
+        },
+        .sql = sql,
+        .checksum = zsql.migrate.checksumSql(sql),
+    }};
+
+    const migrator = pg.Migrator.init(&conn);
+    try std.testing.expectError(
+        error.MigrationTransactionControlNotAllowed,
+        migrator.apply(&migrations),
+    );
+
+    var absent = try conn.queryOneParams(
+        \\select not exists (
+        \\  select 1 from information_schema.tables
+        \\  where table_schema = current_schema()
+        \\    and table_name = 'zsql_transaction_control_rejected'
+        \\) as applied_schema,
+        \\not exists (select 1 from zsql_migrations) as markers
+    ,
+        &.{},
+    );
+    defer absent.deinit();
+    try std.testing.expect(try (try absent.getName("applied_schema")).asBool());
+    try std.testing.expect(try (try absent.getName("markers")).asBool());
+    try conn.ping();
+}
+
 test "postgres live: migration unlock failure is surfaced and releases session" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer std.debug.assert(gpa_state.deinit() == .ok);

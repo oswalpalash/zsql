@@ -51,6 +51,8 @@ pub fn dirtyFailure(
     return original;
 }
 
+pub const Dialect = enum { sqlite, postgres };
+
 pub fn parseFilename(path_or_filename: []const u8) !MigrationId {
     const filename = std.fs.path.basename(path_or_filename);
     if (!std.mem.startsWith(u8, filename, "V")) return error.InvalidMigrationFilename;
@@ -132,6 +134,111 @@ pub fn checksumSql(sql: []const u8) Checksum {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
+/// Return true when SQL directly controls its surrounding transaction.
+///
+/// zsql owns each migration's transaction, so scripts may not issue transaction
+/// commands. The scanner recognizes only command positions: occurrences inside
+/// literals, comments, quoted identifiers, and dollar-quoted bodies do not
+/// count. SQLite trigger bodies are exempt because `BEGIN ... END` is
+/// procedural syntax rather than a transaction boundary.
+pub fn containsTransactionControl(sql: []const u8, dialect: Dialect) bool {
+    var index: usize = 0;
+    var statement_start = true;
+    var saw_create = false;
+    var trigger_statement = false;
+    var sqlite_trigger_body_depth: ?usize = null;
+
+    while (index < sql.len) {
+        const c = sql[index];
+
+        if (isSpace(c)) {
+            index += 1;
+            continue;
+        }
+        if (c == '-' and lineCommentAt(sql, index)) {
+            index = skipLineComment(sql, index);
+            continue;
+        }
+        if (c == '/' and blockCommentAt(sql, index)) {
+            index = skipBlockComment(sql, index, dialect == .postgres) orelse return false;
+            continue;
+        }
+        if (c == ';') {
+            // SQLite trigger statements contain separators inside BEGIN/END,
+            // so body depth survives those inner semicolons.
+            if (sqlite_trigger_body_depth == null) {
+                statement_start = true;
+                saw_create = false;
+                trigger_statement = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if (c == '\'') {
+            index = skipSingleQuoted(sql, index);
+            statement_start = false;
+            continue;
+        }
+        if (c == '"') {
+            index = skipDelimited(sql, index, '"');
+            statement_start = false;
+            continue;
+        }
+        if (c == '`') {
+            index = skipDelimited(sql, index, '`');
+            statement_start = false;
+            continue;
+        }
+        if (c == '[') {
+            index = skipBracketIdentifier(sql, index);
+            statement_start = false;
+            continue;
+        }
+        if (c == '$') {
+            if (dollarQuoteTagAt(sql, index)) |tag_end| {
+                index = skipDollarQuoted(sql, index, tag_end) orelse return false;
+                statement_start = false;
+                continue;
+            }
+        }
+        if (!isIdentifierStart(c)) {
+            statement_start = false;
+            index += 1;
+            continue;
+        }
+
+        const token_end = identifierEnd(sql, index);
+        const word = sql[index..token_end];
+        if (saw_create and eqlWord(word, "trigger")) trigger_statement = true;
+
+        if (sqlite_trigger_body_depth) |depth| {
+            if (eqlWord(word, "begin") or eqlWord(word, "case")) {
+                sqlite_trigger_body_depth = depth + 1;
+            } else if (eqlWord(word, "end")) {
+                sqlite_trigger_body_depth = if (depth == 1) null else depth - 1;
+            }
+        } else if (statement_start and !trigger_statement) {
+            if (transactionCommandAt(sql, index)) return true;
+            if (eqlWord(word, "create")) saw_create = true;
+            if (saw_create and eqlWord(word, "trigger")) trigger_statement = true;
+        } else if (dialect == .sqlite and trigger_statement and eqlWord(word, "begin")) {
+            sqlite_trigger_body_depth = 1;
+        }
+
+        index = token_end;
+        statement_start = false;
+    }
+
+    return false;
+}
+
+pub fn ensureNoTransactionControl(sql: []const u8, dialect: Dialect) !void {
+    if (containsTransactionControl(sql, dialect)) {
+        return error.MigrationTransactionControlNotAllowed;
+    }
+}
+
 /// Validate that a migration plan is a strict, complete continuation of the
 /// applied history. Plans must be sorted by increasing version with no
 /// duplicates, every applied version must remain resolvable, and a pending
@@ -169,6 +276,150 @@ fn isValidName(name: []const u8) bool {
         return false;
     }
     return true;
+}
+
+fn isSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+}
+
+fn isIdentifierStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_';
+}
+
+fn isIdentifierChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
+}
+
+fn identifierEnd(sql: []const u8, start: usize) usize {
+    var index = start;
+    while (index < sql.len and isIdentifierChar(sql[index])) index += 1;
+    return index;
+}
+
+fn eqlWord(word: []const u8, expected: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(word, expected);
+}
+
+fn startsKeyword(sql: []const u8, start: usize, keyword: []const u8) ?usize {
+    const end = start + keyword.len;
+    if (end > sql.len or !std.ascii.eqlIgnoreCase(sql[start..end], keyword)) return null;
+    if (end < sql.len and isIdentifierChar(sql[end])) return null;
+    return end;
+}
+
+fn separatorEnd(sql: []const u8, start: usize) ?usize {
+    var index = start;
+    while (index < sql.len) {
+        const c = sql[index];
+        if (isSpace(c)) {
+            index += 1;
+        } else if (c == '-' and lineCommentAt(sql, index)) {
+            index = skipLineComment(sql, index);
+        } else if (c == '/' and blockCommentAt(sql, index)) {
+            index = skipBlockComment(sql, index, true) orelse return null;
+        } else break;
+    }
+    if (index >= sql.len or index == start) return null;
+    return index;
+}
+
+fn twoKeywordAt(sql: []const u8, start: usize, first: []const u8, second: []const u8) bool {
+    const after_first = startsKeyword(sql, start, first) orelse return false;
+    const after_separator = separatorEnd(sql, after_first) orelse return false;
+    return startsKeyword(sql, after_separator, second) != null;
+}
+
+fn transactionCommandAt(sql: []const u8, start: usize) bool {
+    const single_commands = [_][]const u8{
+        "begin",   "commit", "rollback", "savepoint",
+        "release", "abort",  "end",
+    };
+    for (single_commands) |command| {
+        if (startsKeyword(sql, start, command) != null) return true;
+    }
+    if (twoKeywordAt(sql, start, "start", "transaction")) return true;
+    return twoKeywordAt(sql, start, "prepare", "transaction");
+}
+
+fn lineCommentAt(sql: []const u8, start: usize) bool {
+    return start + 1 < sql.len and sql[start + 1] == '-';
+}
+
+fn blockCommentAt(sql: []const u8, start: usize) bool {
+    return start + 1 < sql.len and sql[start + 1] == '*';
+}
+
+fn skipLineComment(sql: []const u8, start: usize) usize {
+    const newline = std.mem.indexOfScalarPos(u8, sql, start + 2, '\n') orelse return sql.len;
+    return newline + 1;
+}
+
+fn skipBlockComment(sql: []const u8, start: usize, nested: bool) ?usize {
+    var index = start + 2;
+    var depth: usize = 1;
+    while (index < sql.len) {
+        if (nested and sql[index] == '/' and blockCommentAt(sql, index)) {
+            depth += 1;
+            index += 2;
+        } else if (sql[index] == '*' and index + 1 < sql.len and sql[index + 1] == '/') {
+            depth -= 1;
+            index += 2;
+            if (depth == 0) return index;
+        } else {
+            index += 1;
+        }
+    }
+    return null;
+}
+
+fn skipSingleQuoted(sql: []const u8, start: usize) usize {
+    return skipDelimited(sql, start, '\'');
+}
+
+fn skipDelimited(sql: []const u8, start: usize, delimiter: u8) usize {
+    var index = start + 1;
+    while (index < sql.len) {
+        if (sql[index] != delimiter) {
+            index += 1;
+            continue;
+        }
+        if (index + 1 < sql.len and sql[index + 1] == delimiter) {
+            index += 2;
+            continue;
+        }
+        return index + 1;
+    }
+    return sql.len;
+}
+
+fn skipBracketIdentifier(sql: []const u8, start: usize) usize {
+    var index = start + 1;
+    while (index < sql.len) {
+        if (sql[index] != ']') {
+            index += 1;
+            continue;
+        }
+        if (index + 1 < sql.len and sql[index + 1] == ']') {
+            index += 2;
+            continue;
+        }
+        return index + 1;
+    }
+    return sql.len;
+}
+
+fn dollarQuoteTagAt(sql: []const u8, start: usize) ?usize {
+    var index = start + 1;
+    if (index < sql.len and sql[index] == '$') return index;
+    while (index < sql.len and (std.ascii.isAlphanumeric(sql[index]) or sql[index] == '_')) index += 1;
+    if (index < sql.len and sql[index] == '$') return index;
+    return null;
+}
+
+fn skipDollarQuoted(sql: []const u8, start: usize, tag_end: usize) ?usize {
+    const opener = sql[start .. tag_end + 1];
+    const closer_index = std.mem.indexOfPos(u8, sql, tag_end + 1, opener) orelse return null;
+    return closer_index + opener.len;
 }
 
 fn migrationFileLessThan(_: void, lhs: MigrationFile, rhs: MigrationFile) bool {
@@ -317,4 +568,65 @@ test "migration plan requires ordered unique complete history" {
         error.MigrationVersionConflict,
         validatePlan(&files, &[_]Record{ .{ .version = 2 }, .{ .version = 1 } }),
     );
+}
+
+test "migration transaction scanner accepts ordinary scripts and quoted words" {
+    const accepted = [_][]const u8{
+        "",
+        "create table users (id integer primary key);\ninsert into users values (1);",
+        "beginning",
+        "committed",
+        "prepare data as select 1",
+        "select 'commit it''s beginning', \"rollback\", [end], `abort` from savepoints",
+        "select 1 -- commit\nfrom transactions\n/* rollback */",
+        "/* begin */ select 1;",
+        "do $body$ begin perform 1; end $body$;",
+    };
+
+    for (accepted) |sql| {
+        try std.testing.expect(!containsTransactionControl(sql, .sqlite));
+        try std.testing.expect(!containsTransactionControl(sql, .postgres));
+    }
+}
+
+test "migration transaction scanner accepts SQLite trigger bodies" {
+    const sql =
+        \\create trigger users_audit
+        \\after insert on users
+        \\begin
+        \\  insert into audit (name) values (new.name);
+        \\  insert into snapshots (value)
+        \\  values (case when new.id > 0 then new.id else 0 end);
+        \\end
+    ;
+
+    try std.testing.expect(!containsTransactionControl(sql, .sqlite));
+    try std.testing.expect(containsTransactionControl(sql ++ "; commit;", .sqlite));
+}
+
+test "migration transaction scanner rejects leading command controls" {
+    const rejected = [_]struct { sql: []const u8, dialect: Dialect }{
+        .{ .sql = "begin", .dialect = .sqlite },
+        .{ .sql = "BEGIN IMMEDIATE;", .dialect = .sqlite },
+        .{ .sql = "start transaction", .dialect = .postgres },
+        .{ .sql = "start /* dialect */ transaction", .dialect = .postgres },
+        .{ .sql = "commit work", .dialect = .postgres },
+        .{ .sql = "end transaction", .dialect = .sqlite },
+        .{ .sql = "rollback to savepoint repair", .dialect = .postgres },
+        .{ .sql = "savepoint before_change", .dialect = .sqlite },
+        .{ .sql = "release savepoint before_change", .dialect = .postgres },
+        .{ .sql = "abort", .dialect = .postgres },
+        .{ .sql = "prepare transaction 'pending'", .dialect = .postgres },
+        .{ .sql = "/* explain */ commit", .dialect = .sqlite },
+        .{ .sql = "create table ready (id integer); commit;", .dialect = .sqlite },
+        .{ .sql = "create table ready (id integer); rollback;", .dialect = .postgres },
+    };
+
+    for (rejected) |case| {
+        try std.testing.expect(containsTransactionControl(case.sql, case.dialect));
+        try std.testing.expectError(
+            error.MigrationTransactionControlNotAllowed,
+            ensureNoTransactionControl(case.sql, case.dialect),
+        );
+    }
 }

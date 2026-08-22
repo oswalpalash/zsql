@@ -1542,6 +1542,7 @@ fn applyMigrationsTransaction(
     var applied: usize = 0;
     for (migrations) |migration| {
         if (findMigrationRecord(status.records, migration.id.version) != null) continue;
+        try core.migrate.ensureNoTransactionControl(migration.sql, .sqlite);
         active_migration.* = migration;
         if (std.mem.trim(u8, migration.sql, " \t\r\n").len == 0) return error.InvalidSql;
 
@@ -4641,6 +4642,45 @@ test "SQLite migration apply executes multi-statement scripts" {
     defer rows.deinit();
     const row = (try rows.next()).?;
     try std.testing.expectEqualStrings("grace", try (try row.value("name")).asText());
+}
+
+test "SQLite migration apply rejects transaction control before SQL and marker" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    const script =
+        \\create table rejected_transaction_users (id integer primary key);
+        \\commit;
+    ;
+    const migrations = [_]core.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "transaction_control",
+            .filename = "V0001__transaction_control.sql",
+        },
+        .sql = script,
+        .checksum = core.migrate.checksumSql(script),
+    }};
+
+    try std.testing.expectError(
+        error.MigrationTransactionControlNotAllowed,
+        applyMigrations(&conn, &migrations),
+    );
+
+    var rows = try conn.query(
+        \\select
+        \\  (select count(*) from sqlite_master
+        \\   where type = 'table' and name = 'rejected_transaction_users') as applied_schema,
+        \\  count(*) as markers
+        \\from zsql_migrations
+    , &.{});
+    defer rows.deinit();
+    const row = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 0), try (try row.value("applied_schema")).asInt());
+    try std.testing.expectEqual(@as(i64, 0), try (try row.value("markers")).asInt());
 }
 
 test "SQLite migration apply works from scanned directory" {

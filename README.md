@@ -816,6 +816,12 @@ fails, schema changes roll back and zsql persists that version/checksum as
 `dirty` after rollback. Later applies return `error.MigrationDirty` until an
 operator inspects and repairs or removes the failed record; zsql does not hide
 or automatically retry an uncertain migration.
+zsql owns the surrounding migration transaction. Before pending SQL executes,
+both migrators reject statement-leading `BEGIN`, `START TRANSACTION`, `COMMIT`,
+`END`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `ABORT`, and
+`PREPARE TRANSACTION`. Words inside strings, comments, quoted identifiers, and
+dollar-quoted bodies are ignored; SQLite procedural `BEGIN ... END` in a trigger
+remains valid.
 If the post-rollback marker write itself fails, that persistence error takes
 precedence over the original SQL error: zsql never reports the original failure
 as durably guarded when it could not record the guard.

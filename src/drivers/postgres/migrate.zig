@@ -201,6 +201,7 @@ pub const Migrator = struct {
         var applied: usize = 0;
         for (migrations) |migration| {
             if (findRecord(records, migration.id.version) != null) continue;
+            try core.migrate.ensureNoTransactionControl(migration.sql, .postgres);
             active_migration.* = migration;
             if (std.mem.trim(u8, migration.sql, " \t\r\n").len == 0) return error.InvalidSql;
 
