@@ -9,9 +9,15 @@ pub const Blob = struct { bytes: []const u8 };
 pub const Date = struct {
     days_since_unix_epoch: i32,
 
-    /// Combine a UTC calendar date with nanoseconds since midnight.
+    /// Combine a UTC calendar date with a microsecond-representable time.
+    /// Sub-microsecond Time values are rejected rather than silently
+    /// truncated because `Timestamp` stores microseconds.
     pub fn toUtcDateTime(self: Date, time: Time) !Timestamp {
-        if (time.ns_since_midnight >= 86_400_000_000_000) return error.InvalidArguments;
+        if (time.ns_since_midnight >= 86_400_000_000_000 or
+            time.ns_since_midnight % 1_000 != 0)
+        {
+            return error.InvalidArguments;
+        }
 
         const day_us: i128 = @as(i128, self.days_since_unix_epoch) * 86_400_000_000;
         const time_us: i128 = @intCast(time.ns_since_midnight / 1_000);
@@ -1259,6 +1265,23 @@ test "decompose UTC timestamps into explicit date and time" {
             try extreme_parts.date.toUtcDateTime(extreme_parts.time),
         );
     }
+}
+
+test "reject sub-microsecond loss in UTC composition" {
+    const date = try parseIsoDate("2024-02-29");
+    const microsecond = try parseIsoTime("04:05:06.123456");
+    try std.testing.expectEqual(
+        try parseIsoTimestamp("2024-02-29T04:05:06.123456"),
+        try date.toUtcDateTime(microsecond),
+    );
+
+    const sub_microsecond = try parseIsoTime("04:05:06.123456789");
+    try std.testing.expectError(error.InvalidArguments, date.toUtcDateTime(sub_microsecond));
+
+    const one_nanosecond = Time{
+        .ns_since_midnight = (4 * 3_600 + 5 * 60 + 6) * 1_000_000_000 + 1,
+    };
+    try std.testing.expectError(error.InvalidArguments, date.toUtcDateTime(one_nanosecond));
 }
 
 test "decompose timestamps into explicit offset date and time" {

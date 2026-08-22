@@ -728,7 +728,10 @@ policy visible. Callers can combine it with a calendar date through
 nanosecond precision, wrapping the wall clock across midnight when needed.
 `Timestamp.toUtcDateTime` decomposes an instant into an explicit `Date` and
 nanosecond-precision UTC `Time`; `Date.toUtcDateTime` performs the checked
-inverse. For explicit timezone rendering, `Timestamp.toOffsetDateTime(offset)`
+inverse for microsecond-representable times and rejects sub-microsecond input
+rather than silently truncating it. For full nanosecond precision, use the
+direct offset date/time decomposition and recomposition APIs. For explicit
+timezone rendering, `Timestamp.toOffsetDateTime(offset)`
 returns the shifted calendar date plus an offset-preserving `TimeTz`.
 `OffsetDateTime.toUtcDateTime` performs the same decomposition directly, so a
 offset date/time keeps all nine fractional digits without an intermediate
