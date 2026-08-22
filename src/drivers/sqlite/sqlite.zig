@@ -4683,6 +4683,46 @@ test "SQLite migration apply rejects transaction control before SQL and marker" 
     try std.testing.expectEqual(@as(i64, 0), try (try row.value("markers")).asInt());
 }
 
+test "SQLite migration apply executes procedural trigger bodies" {
+    var db = try Database.open(std.testing.allocator, .{});
+    defer db.deinit();
+
+    var conn = try db.connect();
+    defer conn.close();
+
+    const script =
+        \\create table trigger_sources (id integer primary key);
+        \\create table trigger_audit (source_id integer not null);
+        \\create trigger trigger_sources_audit
+        \\after insert on trigger_sources
+        \\begin
+        \\  insert into trigger_audit (source_id) values (new.id);
+        \\end
+    ;
+    const migrations = [_]core.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "trigger_body",
+            .filename = "V0001__trigger_body.sql",
+        },
+        .sql = script,
+        .checksum = core.migrate.checksumSql(script),
+    }};
+
+    try std.testing.expectEqual(@as(usize, 1), (try applyMigrations(&conn, &migrations)).applied);
+    _ = try conn.exec("insert into trigger_sources (id) values (7)", &.{});
+
+    var rows = try conn.query("select source_id from trigger_audit", &.{});
+    defer rows.deinit();
+    const row = (try rows.next()).?;
+    try std.testing.expectEqual(@as(i64, 7), try (try row.value("source_id")).asInt());
+
+    var status = try migrationStatus(std.testing.allocator, &conn);
+    defer status.deinit();
+    try std.testing.expectEqual(@as(usize, 1), status.records.len);
+    try std.testing.expect(!status.records[0].dirty);
+}
+
 test "SQLite migration apply works from scanned directory" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

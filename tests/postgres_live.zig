@@ -847,6 +847,68 @@ test "postgres live: migrator rejects transaction control before SQL and marker"
     try conn.ping();
 }
 
+test "postgres live: migrator applies dollar-quoted procedural bodies" {
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const allocator = gpa_state.allocator();
+    const url_str = try requireUrl(allocator);
+    defer allocator.free(url_str);
+
+    var config = try pg.parseUrl(allocator, url_str);
+    defer config.deinit();
+    var conn = try pg.Conn.open(allocator, std.testing.io, config);
+    defer conn.deinit();
+
+    _ = try conn.exec("drop table if exists zsql_procedural_migration_source");
+    _ = try conn.exec("drop table if exists zsql_procedural_migration_events");
+    _ = try conn.exec("drop function if exists zsql_procedural_migration_fn()");
+    defer _ = conn.exec("drop table if exists zsql_procedural_migration_source") catch {};
+    defer _ = conn.exec("drop table if exists zsql_procedural_migration_events") catch {};
+    defer _ = conn.exec("drop function if exists zsql_procedural_migration_fn()") catch {};
+
+    const script =
+        \\create table zsql_procedural_migration_events (id bigint primary key);
+        \\create table zsql_procedural_migration_source (id bigint primary key);
+        \\create function zsql_procedural_migration_fn() returns trigger
+        \\language plpgsql as $body$
+        \\begin
+        \\  -- commit rollback savepoint are only comments here
+        \\  insert into zsql_procedural_migration_events values (new.id);
+        \\  return new;
+        \\end
+        \\$body$;
+        \\create trigger zsql_procedural_migration_trigger
+        \\after insert on zsql_procedural_migration_source
+        \\for each row execute function zsql_procedural_migration_fn()
+    ;
+    const migrations = [_]zsql.migrate.MigrationFile{.{
+        .id = .{
+            .version = 1,
+            .name = "procedural_body",
+            .filename = "V0001__procedural_body.sql",
+        },
+        .sql = script,
+        .checksum = zsql.migrate.checksumSql(script),
+    }};
+
+    const migrator = pg.Migrator.init(&conn);
+    try std.testing.expectEqual(@as(usize, 1), (try migrator.apply(&migrations)).applied);
+    _ = try conn.exec("insert into zsql_procedural_migration_source values (11)");
+
+    var rows = try conn.queryOneParams(
+        "select count(*)::bigint as n from zsql_procedural_migration_events",
+        &.{},
+    );
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try (try rows.getName("n")).asInt());
+
+    var status = try migrator.status(allocator);
+    defer status.deinit();
+    try std.testing.expectEqual(@as(usize, 1), status.records.len);
+    try std.testing.expect(!status.records[0].dirty);
+    try conn.ping();
+}
+
 test "postgres live: migration unlock failure is surfaced and releases session" {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer std.debug.assert(gpa_state.deinit() == .ok);
