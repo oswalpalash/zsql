@@ -62,6 +62,38 @@ pub fn validate() void {
             "parseIsoTimestampInstant",
         });
 
+        requireDecls(zsql.inspect, .{
+            "Dialect",
+            "TimestampKind",
+            "timestampTypeKind",
+            "Column",
+            "Index",
+            "Table",
+            "Schema",
+            "freeSchema",
+            "freeIndexes",
+            "freeColumns",
+            "writeSchemaZon",
+            "parseSchemaZon",
+            "freeParsedSchemaZon",
+        });
+
+        requireDecls(zsql.codegen, .{
+            "TimestampMapping",
+            "StructOptions",
+            "writeStructs",
+            "writeStructsWithOptions",
+        });
+
+        const codegen_options = zsql.codegen.StructOptions{};
+        if (codegen_options.timestamps != .utc) {
+            @compileError("codegen StructOptions must preserve the UTC default");
+        }
+        switch (zsql.inspect.timestampTypeKind("timestamptz(6)")) {
+            .timezone_aware => {},
+            else => @compileError("schema inspection must classify parameterized timestamptz"),
+        }
+
         requireDriver(zsql.drivers.postgres.Driver);
         requireDecls(zsql.drivers.postgres, .{
             "Config",
