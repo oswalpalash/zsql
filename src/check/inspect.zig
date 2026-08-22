@@ -8,6 +8,70 @@ pub const Dialect = enum {
     postgres,
 };
 
+/// The timezone policy carried by a SQL timestamp spelling. Parameterized
+/// forms such as `timestamptz(6)` and `timestamp(3) with time zone` retain
+/// their distinct policy instead of collapsing into a generic substring match.
+pub const TimestampKind = enum {
+    not_timestamp,
+    naive,
+    timezone_aware,
+};
+
+fn eqlIgnoreAscii(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+fn consumeTimestampPrecision(text: []const u8) ?[]const u8 {
+    var cursor = trimLeadingWhitespace(text);
+    if (cursor.len == 0 or cursor[0] != '(') return cursor;
+    const open = std.mem.indexOfScalar(u8, cursor, '(').?;
+    const close = std.mem.indexOfScalarPos(u8, cursor, open + 1, ')') orelse return null;
+    if (close == open + 1) return null;
+    for (cursor[open + 1 .. close]) |digit| {
+        if (!std.ascii.isDigit(digit)) return null;
+    }
+    return cursor[close + 1 ..];
+}
+
+fn trimLeadingWhitespace(text: []const u8) []const u8 {
+    var index: usize = 0;
+    while (index < text.len and std.ascii.isWhitespace(text[index])) index += 1;
+    return text[index..];
+}
+
+/// Classify common PostgreSQL timestamp spellings, including explicit
+/// fractional-second precision modifiers.
+pub fn timestampTypeKind(sql_type: []const u8) TimestampKind {
+    if (eqlIgnoreAscii(sql_type, "timestamptz")) return .timezone_aware;
+    const alias = "timestamptz";
+    if (sql_type.len > alias.len and
+        eqlIgnoreAscii(sql_type[0..alias.len], alias) and
+        sql_type[alias.len] == '(')
+    {
+        if (consumeTimestampPrecision(sql_type[alias.len..])) |suffix| {
+            if (suffix.len == 0) return .timezone_aware;
+        }
+    }
+
+    const marker = "timestamp";
+    const marker_index = std.ascii.indexOfIgnoreCase(sql_type, marker) orelse
+        return .not_timestamp;
+    if (marker_index > 0) {
+        const prefix = sql_type[marker_index - 1];
+        if (std.ascii.isAlphanumeric(prefix) or prefix == '_') return .not_timestamp;
+    }
+
+    const with_precision = consumeTimestampPrecision(
+        sql_type[marker_index + marker.len ..],
+    ) orelse return .not_timestamp;
+    const qualifier = trimLeadingWhitespace(with_precision);
+    if (qualifier.len == 0 or eqlIgnoreAscii(qualifier, "without time zone")) {
+        return .naive;
+    }
+    if (eqlIgnoreAscii(qualifier, "with time zone")) return .timezone_aware;
+    return .not_timestamp;
+}
+
 /// Minimal schema model for offline query checking artifacts.
 pub const Column = struct {
     name: []const u8,
@@ -384,6 +448,34 @@ test "columnsFromPostgresColumnInfo maps nullability and pk" {
     try std.testing.expect(!columns[1].nullable);
     try std.testing.expect(columns[2].nullable);
     try std.testing.expectEqualStrings("int8", columns[0].type_name);
+}
+
+test "timestampTypeKind preserves timezone policy across precision modifiers" {
+    try std.testing.expectEqual(TimestampKind.naive, timestampTypeKind("timestamp"));
+    try std.testing.expectEqual(
+        TimestampKind.naive,
+        timestampTypeKind("timestamp(3) without time zone"),
+    );
+    try std.testing.expectEqual(
+        TimestampKind.timezone_aware,
+        timestampTypeKind("timestamptz"),
+    );
+    try std.testing.expectEqual(
+        TimestampKind.timezone_aware,
+        timestampTypeKind("TIMESTAMPTZ(6)"),
+    );
+    try std.testing.expectEqual(
+        TimestampKind.timezone_aware,
+        timestampTypeKind("timestamp (3) with time zone"),
+    );
+    try std.testing.expectEqual(
+        TimestampKind.not_timestamp,
+        timestampTypeKind("timestampx"),
+    );
+    try std.testing.expectEqual(
+        TimestampKind.not_timestamp,
+        timestampTypeKind("timestamp(a) with time zone"),
+    );
 }
 
 test "postgres inspection SQL is parameterized and catalog-safe" {

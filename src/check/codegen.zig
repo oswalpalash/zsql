@@ -60,14 +60,13 @@ fn zigType(sql_type: []const u8, timestamps: TimestampMapping) []const u8 {
     if (eq(sql_type, "numeric") or eq(sql_type, "decimal")) return "zsql.types.Numeric";
     if (eq(sql_type, "bytea") or eq(sql_type, "blob")) return "zsql.types.Blob";
     if (eq(sql_type, "date")) return "zsql.types.Date";
-    if (eq(sql_type, "timestamp") or eq(sql_type, "timestamp without time zone")) {
-        return "zsql.types.Timestamp";
-    }
-    if (eq(sql_type, "timestamp with time zone") or eq(sql_type, "timestamptz")) {
-        return switch (timestamps) {
+    switch (inspect.timestampTypeKind(sql_type)) {
+        .naive => return "zsql.types.Timestamp",
+        .timezone_aware => return switch (timestamps) {
             .utc => "zsql.types.Timestamp",
             .offset => "zsql.types.OffsetDateTime",
-        };
+        },
+        .not_timestamp => {},
     }
     if (eq(sql_type, "time") or eq(sql_type, "time without time zone")) return "zsql.types.Time";
     if (eq(sql_type, "timetz") or eq(sql_type, "time with time zone")) return "zsql.types.TimeTz";
@@ -218,8 +217,8 @@ test "writeStructs maps common schema types" {
 
 test "writeStructs keeps naive timestamps out of opt-in offset mode" {
     const schema = inspect.Schema{ .tables = &.{.{ .name = "events", .columns = &.{
-        .{ .name = "naive_at", .type_name = "timestamp without time zone", .nullable = false },
-        .{ .name = "remote_at", .type_name = "timestamp with time zone", .nullable = false },
+        .{ .name = "naive_at", .type_name = "timestamp(3) without time zone", .nullable = false },
+        .{ .name = "remote_at", .type_name = "timestamp(6) with time zone", .nullable = false },
     } }} };
     var buffer: [512]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
