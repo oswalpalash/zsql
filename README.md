@@ -723,7 +723,8 @@ instants.
 `types.TimeTz` preserves both wall-clock time and numeric UTC offset; its parser
 accepts historical second-bearing offsets and its formatter keeps the timezone
 policy visible. Callers can combine it with a calendar date through
-`utcTimestamp`, which normalizes across day boundaries in UTC.
+`utcTimestamp`, which normalizes across day boundaries in UTC but requires a
+microsecond-representable time rather than silently truncating nanoseconds.
 `TimeTz.toOffset(offset)` converts to another explicit offset while retaining
 nanosecond precision, wrapping the wall clock across midnight when needed.
 `Timestamp.toUtcDateTime` decomposes an instant into an explicit `Date` and

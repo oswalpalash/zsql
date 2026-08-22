@@ -132,14 +132,16 @@ pub const TimeTz = struct {
         };
     }
 
-    /// Combine this timezone-aware time with a calendar date and normalize the
-    /// result to UTC. The wall-clock date may shift when the offset crosses
-    /// midnight.
+    /// Combine this timezone-aware time with a calendar date and normalize a
+    /// microsecond-representable result to UTC. Sub-microsecond fractions are
+    /// rejected rather than silently truncated. The wall-clock date may shift
+    /// when the offset crosses midnight.
     pub fn utcTimestamp(self: TimeTz, date: Date) !Timestamp {
         if (self.nanos_since_midnight >= 86_400_000_000_000) return error.InvalidArguments;
         if (self.offset_seconds < -86_400 or self.offset_seconds > 86_400) {
             return error.InvalidArguments;
         }
+        if (self.nanos_since_midnight % 1_000 != 0) return error.InvalidArguments;
 
         const day_us: i128 = @as(i128, date.days_since_unix_epoch) * 86_400_000_000;
         const local_us: i128 = @intCast(self.nanos_since_midnight / 1_000);
@@ -1147,9 +1149,16 @@ test "combine date and timezone-aware time without precision loss" {
         "2024-02-29T01:30:00.123456789-02:30",
         try combined.formatIso(&buffer),
     );
+
+    // The UTC Timestamp domain cannot retain the final three digits, so
+    // normalization must fail rather than discard them.
+    try std.testing.expectError(error.InvalidArguments, combined.utcTimestamp());
+
+    const microsecond_time = try parseIsoTimeTz("01:30:00.123456-02:30");
+    const microsecond_combined = try date.toOffsetDateTime(microsecond_time);
     try std.testing.expectEqual(
         try parseIsoTimestampInstant("2024-02-29T04:00:00.123456Z"),
-        try combined.utcTimestamp(),
+        try microsecond_combined.utcTimestamp(),
     );
 
     for ([_]i32{ -86_400, 0, 86_400 }) |offset_seconds| {
@@ -1282,6 +1291,29 @@ test "reject sub-microsecond loss in UTC composition" {
         .ns_since_midnight = (4 * 3_600 + 5 * 60 + 6) * 1_000_000_000 + 1,
     };
     try std.testing.expectError(error.InvalidArguments, date.toUtcDateTime(one_nanosecond));
+
+    const timezone_microsecond = try parseIsoTimeTz("04:05:06.123456-02:30");
+    try std.testing.expectEqual(
+        try parseIsoTimestampInstant("2024-02-29T06:35:06.123456Z"),
+        try timezone_microsecond.utcTimestamp(date),
+    );
+
+    const timezone_sub_microsecond = try parseIsoTimeTz(
+        "04:05:06.123456789-02:30",
+    );
+    try std.testing.expectError(
+        error.InvalidArguments,
+        timezone_sub_microsecond.utcTimestamp(date),
+    );
+
+    const timezone_one_nanosecond = TimeTz{
+        .nanos_since_midnight = (4 * 3_600 + 5 * 60 + 6) * 1_000_000_000 + 1,
+        .offset_seconds = -9_000,
+    };
+    try std.testing.expectError(
+        error.InvalidArguments,
+        timezone_one_nanosecond.utcTimestamp(date),
+    );
 }
 
 test "decompose timestamps into explicit offset date and time" {
@@ -1592,10 +1624,8 @@ test "convert offset date/times while retaining nanoseconds" {
         "2024-03-10T05:00:00.123456789+01:00",
         try ahead.formatIso(&buffer),
     );
-    try std.testing.expectEqual(
-        try source.utcTimestamp(),
-        try ahead.utcTimestamp(),
-    );
+    try std.testing.expectError(error.InvalidArguments, source.utcTimestamp());
+    try std.testing.expectError(error.InvalidArguments, ahead.utcTimestamp());
 
     const behind = try (try parseIsoOffsetDateTime(
         "2024-03-10T01:30:00.123456789+05:30",
