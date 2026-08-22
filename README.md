@@ -936,6 +936,8 @@ zig build -Denable-sqlite=true
 
 # Optional schema-to-Zig struct generation:
 ./zig-out/bin/zsql gen structs --schema schema.zon --out src/db/schema.zig
+# Preserve PostgreSQL timezone-aware timestamp wall clocks instead of UTC:
+./zig-out/bin/zsql gen structs --schema schema.zon --out src/db/schema.zig --timestamps=offset
 
 zig build checked-queries-example
 # CI-friendly alias for validating the checked-query schema artifact/example:
@@ -962,6 +964,9 @@ file synchronization, with power-loss directory durability left to the target.
 Generated struct files import `zsql` themselves, map supported SQL domain types
 to `zsql.types.*` (including date, time, timestamp, and timestamptz), and preserve
 database nullability with optional Zig fields.
+Timestamps default to the normalized UTC wrapper. Pass `--timestamps=offset`
+to map timezone-aware timestamps to `Timestamp.OffsetDateTime`; naive timestamps
+remain UTC-backed in that mode.
 Column fields preserve their exact SQL names through Zig's quoted-identifier
 syntax when needed. Table types remain PascalCase; normalization collisions get
 stable ordinal suffixes instead of producing duplicate declarations.

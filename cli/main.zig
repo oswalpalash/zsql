@@ -170,7 +170,7 @@ fn printHelp(io: std.Io) !void {
         \\  zsql migrate repair --url <postgres-url> --version <n> [--dir migrations]
         \\  zsql inspect --database <path> [--out schema.zon]
         \\  zsql inspect --url <postgres-url> [--out schema.zon]
-        \\  zsql gen structs --schema <schema.zon> --out <schema.zig>
+        \\  zsql gen structs --schema <schema.zon> --out <schema.zig> [--timestamps=utc|offset]
         \\  zsql --help
         \\
         \\SQLite migrate/inspect require -Denable-sqlite=true.
@@ -197,11 +197,14 @@ fn printMigrateHelp(io: std.Io) !void {
 fn cmdGenStructs(init: std.process.Init, args: *std.process.Args.Iterator) !void {
     var schema_path: ?[]const u8 = null;
     var out_path: ?[]const u8 = null;
+    var timestamps: zsql.codegen.TimestampMapping = .utc;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--schema")) {
             schema_path = args.next() orelse return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--out")) {
             out_path = args.next() orelse return error.InvalidArguments;
+        } else if (std.mem.startsWith(u8, arg, "--timestamps=")) {
+            timestamps = try parseTimestampMapping(arg["--timestamps=".len..]);
         } else return error.InvalidArguments;
     }
     const source_path = schema_path orelse return error.InvalidArguments;
@@ -214,8 +217,18 @@ fn cmdGenStructs(init: std.process.Init, args: *std.process.Args.Iterator) !void
     defer zsql.inspect.freeParsedSchemaZon(init.gpa, schema);
     var growing: std.Io.Writer.Allocating = .init(init.gpa);
     defer growing.deinit();
-    try zsql.codegen.writeStructs(&growing.writer, schema);
+    try zsql.codegen.writeStructsWithOptions(
+        &growing.writer,
+        schema,
+        .{ .timestamps = timestamps },
+    );
     try writeFileAtomic(std.Io.Dir.cwd(), init.io, dest_path, growing.written(), .replace);
+}
+
+fn parseTimestampMapping(value: []const u8) !zsql.codegen.TimestampMapping {
+    if (std.mem.eql(u8, value, "utc")) return .utc;
+    if (std.mem.eql(u8, value, "offset")) return .offset;
+    return error.InvalidArguments;
 }
 
 fn cmdDoctor(io: std.Io) !void {
@@ -509,6 +522,13 @@ test "migration repair version parser is strict" {
     try std.testing.expectEqual(@as(u64, 42), try parseMigrationVersion("42"));
     try std.testing.expectError(error.InvalidArguments, parseMigrationVersion("-1"));
     try std.testing.expectError(error.InvalidArguments, parseMigrationVersion("abc"));
+}
+
+test "generated timestamp mapping parser is strict" {
+    try std.testing.expectEqual(.utc, try parseTimestampMapping("utc"));
+    try std.testing.expectEqual(.offset, try parseTimestampMapping("offset"));
+    try std.testing.expectError(error.InvalidArguments, parseTimestampMapping(""));
+    try std.testing.expectError(error.InvalidArguments, parseTimestampMapping("local"));
 }
 
 test "migration repair finds exact version" {
