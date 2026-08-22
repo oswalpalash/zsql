@@ -747,6 +747,10 @@ one string in `types.OffsetDateTime.iso_buffer_len` bytes. Exact day-long
 `OffsetDateTime.toOffset(offset)` converts the same instant to another explicit
 offset while retaining nanosecond precision and shifting the wall-clock date as
 needed.
+Checked fixed-unit arithmetic is available for explicit domains: `Date.addDays`
+and `Timestamp.addMicros` reject range overflow, while `Time.addNanos`,
+`TimeTz.addNanos`, and `OffsetDateTime.addNanos` preserve nanoseconds and apply
+midnight or timezone shifts explicitly.
 
 ### Offline checks
 

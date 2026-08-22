@@ -26,6 +26,15 @@ pub const Date = struct {
         return .{ .unix_us = unix_us };
     }
 
+    /// Shift a calendar date by whole days, rejecting dates outside the
+    /// supported `i32` day range.
+    pub fn addDays(self: Date, days: i64) !Date {
+        const result = std.math.add(i64, self.days_since_unix_epoch, days) catch
+            return error.Overflow;
+        const day_number = std.math.cast(i32, result) orelse return error.Overflow;
+        return .{ .days_since_unix_epoch = day_number };
+    }
+
     /// Combine a calendar date with an offset-aware time without normalizing
     /// away the timezone policy or truncating nanosecond precision.
     pub fn toOffsetDateTime(self: Date, time: TimeTz) !Timestamp.OffsetDateTime {
@@ -56,6 +65,15 @@ pub const Date = struct {
 pub const Time = struct {
     ns_since_midnight: u64,
 
+    /// Add nanoseconds to a valid wall-clock time, wrapping across midnight.
+    pub fn addNanos(self: Time, nanoseconds: i64) !Time {
+        if (self.ns_since_midnight >= 86_400_000_000_000) return error.InvalidArguments;
+
+        const total_ns: i128 = @as(i128, self.ns_since_midnight) + nanoseconds;
+        return .{
+            .ns_since_midnight = @intCast(@mod(total_ns, 86_400_000_000_000)),
+        };
+    }
     /// Exact buffer length required by `formatIso` for every valid time.
     pub const iso_buffer_len: usize = 18;
 
@@ -148,6 +166,24 @@ pub const TimeTz = struct {
         const offset_us: i128 = @as(i128, self.offset_seconds) * 1_000_000;
         const total_us: i128 = @as(i128, day_us) + local_us - offset_us;
         return .{ .unix_us = std.math.cast(i64, total_us) orelse return error.Overflow };
+    }
+
+    /// Add nanoseconds to a valid timezone-aware wall-clock time while keeping
+    /// its offset and wrapping across midnight.
+    pub fn addNanos(self: TimeTz, nanoseconds: i64) !TimeTz {
+        if (self.nanos_since_midnight >= 86_400_000_000_000 or
+            self.offset_seconds < -86_400 or self.offset_seconds > 86_400)
+        {
+            return error.InvalidArguments;
+        }
+
+        const local = try (Time{
+            .ns_since_midnight = self.nanos_since_midnight,
+        }).addNanos(nanoseconds);
+        return .{
+            .nanos_since_midnight = local.ns_since_midnight,
+            .offset_seconds = self.offset_seconds,
+        };
     }
 
     /// Format the local time plus an explicit numeric UTC offset. A zero offset
@@ -310,6 +346,45 @@ pub const Timestamp = struct {
             };
         }
 
+        /// Add nanoseconds to the instant represented by an explicit-offset
+        /// date/time as elapsed absolute time, retaining all nine fractional
+        /// digits and its offset.
+        pub fn addNanos(
+            self: Timestamp.OffsetDateTime,
+            nanoseconds: i64,
+        ) !Timestamp.OffsetDateTime {
+            if (self.time.nanos_since_midnight >= 86_400_000_000_000 or
+                self.time.offset_seconds < -86_400 or
+                self.time.offset_seconds > 86_400)
+            {
+                return error.InvalidArguments;
+            }
+
+            const total_ns: i128 = @as(i128, self.date.days_since_unix_epoch) *
+                86_400_000_000_000 +
+                @as(i128, self.time.nanos_since_midnight) -
+                @as(i128, self.time.offset_seconds) * 1_000_000_000 +
+                nanoseconds;
+            const days_i128 = @divFloor(total_ns, 86_400_000_000_000);
+            const utc_time_ns = total_ns - days_i128 * 86_400_000_000_000;
+            const local_ns = utc_time_ns +
+                @as(i128, self.time.offset_seconds) * 1_000_000_000;
+            const local_days_i128 = days_i128 +
+                @divFloor(local_ns, 86_400_000_000_000);
+            const days = std.math.cast(i32, local_days_i128) orelse
+                return error.Overflow;
+
+            return .{
+                .date = .{ .days_since_unix_epoch = days },
+                .time = .{
+                    .nanos_since_midnight = @intCast(
+                        @mod(local_ns, 86_400_000_000_000),
+                    ),
+                    .offset_seconds = self.time.offset_seconds,
+                },
+            };
+        }
+
         /// Format the shifted local date and timezone-aware time as one ISO
         /// string without allocation.
         pub fn formatIso(self: Timestamp.OffsetDateTime, buffer: []u8) ![]const u8 {
@@ -408,6 +483,15 @@ pub const Timestamp = struct {
         cursor += time_len;
         cursor += try isoWriteByte(buffer[cursor..], 'Z');
         return buffer[0..cursor];
+    }
+
+    /// Add microseconds to an instant, returning `error.Overflow` instead of
+    /// wrapping the representable range.
+    pub fn addMicros(self: Timestamp, microseconds: i64) !Timestamp {
+        return .{
+            .unix_us = std.math.add(i64, self.unix_us, microseconds) catch
+                return error.Overflow,
+        };
     }
 };
 
@@ -1314,6 +1398,83 @@ test "reject sub-microsecond loss in UTC composition" {
         error.InvalidArguments,
         timezone_one_nanosecond.utcTimestamp(date),
     );
+}
+
+test "perform checked fixed-unit temporal arithmetic" {
+    const leap_day = try parseIsoDate("2024-02-29");
+    try std.testing.expectEqual(
+        try parseIsoDate("2024-03-01"),
+        try leap_day.addDays(1),
+    );
+    try std.testing.expectEqual(leap_day, try (try leap_day.addDays(1)).addDays(-1));
+
+    const minimum_date = Date{ .days_since_unix_epoch = std.math.minInt(i32) };
+    const maximum_date = Date{ .days_since_unix_epoch = std.math.maxInt(i32) };
+    try std.testing.expectError(error.Overflow, minimum_date.addDays(-1));
+    try std.testing.expectError(error.Overflow, maximum_date.addDays(1));
+
+    const end_of_day = Time{ .ns_since_midnight = 86_400_000_000_000 - 1 };
+    const start_of_day = Time{ .ns_since_midnight = 0 };
+    try std.testing.expectEqual(start_of_day, try end_of_day.addNanos(1));
+    try std.testing.expectEqual(end_of_day, try start_of_day.addNanos(-1));
+    try std.testing.expectError(error.InvalidArguments, (Time{
+        .ns_since_midnight = 86_400_000_000_000,
+    }).addNanos(0));
+
+    const timestamp = try parseIsoTimestampInstant("2024-02-29T23:59:59.999999Z");
+    try std.testing.expectEqual(
+        try parseIsoTimestampInstant("2024-03-01T00:00:00Z"),
+        try timestamp.addMicros(1),
+    );
+    try std.testing.expectEqual(timestamp, try (try timestamp.addMicros(1)).addMicros(-1));
+    try std.testing.expectError(error.Overflow, (Timestamp{
+        .unix_us = std.math.maxInt(i64),
+    }).addMicros(1));
+    try std.testing.expectError(error.Overflow, (Timestamp{
+        .unix_us = std.math.minInt(i64),
+    }).addMicros(-1));
+}
+
+test "checked timezone-aware arithmetic retains nanoseconds and offsets" {
+    const source_time = try parseIsoTimeTz("23:59:59.999999999-02:30");
+    const wrapped_time = try source_time.addNanos(1);
+    try std.testing.expectEqual(@as(u64, 0), wrapped_time.nanos_since_midnight);
+    try std.testing.expectEqual(source_time.offset_seconds, wrapped_time.offset_seconds);
+    try std.testing.expectError(error.InvalidArguments, (TimeTz{
+        .nanos_since_midnight = 86_400_000_000_000,
+        .offset_seconds = 0,
+    }).addNanos(0));
+
+    var buffer: [OffsetDateTime.iso_buffer_len]u8 = undefined;
+    const source = try parseIsoOffsetDateTime(
+        "2024-03-10T23:59:59.999999999-02:30",
+    );
+    const next_day = try source.addNanos(1);
+    try std.testing.expectEqual(@as(i32, 19793), next_day.date.days_since_unix_epoch);
+    try std.testing.expectEqual(@as(u64, 0), next_day.time.nanos_since_midnight);
+    try std.testing.expectEqual(source.time.offset_seconds, next_day.time.offset_seconds);
+    try std.testing.expectEqualStrings(
+        "2024-03-11T00:00:00-02:30",
+        try next_day.formatIso(&buffer),
+    );
+    const round_trip = try next_day.addNanos(-1);
+    try std.testing.expectEqual(@as(i32, 19792), round_trip.date.days_since_unix_epoch);
+    try std.testing.expectEqual(@as(u64, 23 * 3_600_000_000_000 + (59 * 60 + 59) * 1_000_000_000 + 999_999_999), round_trip.time.nanos_since_midnight);
+    const source_utc = try source.toUtcDateTime();
+    const round_trip_utc = try round_trip.toUtcDateTime();
+    try std.testing.expectEqual(source_utc.date, round_trip_utc.date);
+    try std.testing.expectEqual(source_utc.time, round_trip_utc.time);
+
+    const maximum_date = OffsetDateTime{
+        .date = .{ .days_since_unix_epoch = std.math.maxInt(i32) },
+        .time = try parseIsoTimeTz("23:59:59.999999999Z"),
+    };
+    const minimum_date = OffsetDateTime{
+        .date = .{ .days_since_unix_epoch = std.math.minInt(i32) },
+        .time = try parseIsoTimeTz("00:00:00Z"),
+    };
+    try std.testing.expectError(error.Overflow, maximum_date.addNanos(1));
+    try std.testing.expectError(error.Overflow, minimum_date.addNanos(-1));
 }
 
 test "decompose timestamps into explicit offset date and time" {
