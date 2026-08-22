@@ -755,14 +755,15 @@ Every declared row field must map to a returned simple column projection.
 Projection aliases are the result field names and retain the source column's
 type and nullability checks. Qualified and unqualified stars are supported;
 an output name supplied by more than one projection is rejected as ambiguous.
-Portable built-in `COUNT(*)` and `COUNT([DISTINCT] simple_column)` projections
+Portable built-in `COUNT(*)` and `COUNT([ALL | DISTINCT] simple_column)`
+projections
 are also supported when explicitly aliased; their result is checked as
 non-null `INT8` (`i64` in typed rows), and column arguments must resolve in
-scope. Explicitly aliased built-in `[DISTINCT] MIN(simple_column)`,
-`[DISTINCT] MAX(simple_column)`, and similar aggregate forms are supported;
-MIN/MAX preserve the source type and are always checked as nullable, so typed
-row fields must be optional. `GROUP BY` and `ORDER BY` may refer to a unique
-projection alias.
+scope. Explicitly aliased built-in `[ALL | DISTINCT] MIN(simple_column)`,
+`[ALL | DISTINCT] MAX(simple_column)`, and similar aggregate forms are
+supported; MIN/MAX preserve the source type and are always checked as nullable,
+so typed row fields must be optional. `GROUP BY` and `ORDER BY` may refer to a
+unique projection alias.
 
 For known dialects, explicitly aliased simple-column `SUM` and `AVG` have
 conservative result inference: PostgreSQL maps narrow-integer sums to `INT8`,

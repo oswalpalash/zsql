@@ -1521,6 +1521,8 @@ fn parseAggregateProjection(sc: *Scanner, kind: ProjectionKind) CheckError!?Proj
     sc.advance();
     try sc.skipTrivia();
     const distinct = try sc.matchKeyword("distinct");
+    const explicit_all = try sc.matchKeyword("all");
+    if (distinct and explicit_all) return null;
     // COUNT/SUM/AVG/MIN/MAX DISTINCT over one simple column has the same sound
     // result type as its non-DISTINCT form; unsupported arguments still fall out
     // below.
@@ -1528,7 +1530,7 @@ fn parseAggregateProjection(sc: *Scanner, kind: ProjectionKind) CheckError!?Proj
 
     var projection = Projection{ .column = first, .kind = kind };
     if (sqlIdentEql(first, "*")) {
-        if (kind != .count or distinct) return null;
+        if (kind != .count or distinct or explicit_all) return null;
     } else {
         try sc.skipTrivia();
         if (sc.peek() == '.') {
@@ -3150,9 +3152,10 @@ test "checked rows support bounded aggregate projection aliases" {
     }} };
     const postgres_aggregates = checkedQuery(.{
         .sql =
-        \\select sum(small_value) as small_sum, sum(wide_value) as wide_sum,
-        \\  sum(sample) as sample_sum, sum(measurement) as measurement_sum,
-        \\  avg(amount) as average, avg(sample) as sample_average
+        \\select sum(all small_value) as small_sum,
+        \\  sum(wide_value) as wide_sum, sum(sample) as sample_sum,
+        \\  sum(measurement) as measurement_sum,
+        \\  avg(all amount) as average, avg(sample) as sample_average
         \\from metrics
         ,
         .row = struct {
@@ -3175,10 +3178,16 @@ test "checked rows support bounded aggregate projection aliases" {
         },
     }} };
     const sqlite_aggregates = checkedQuery(.{
-        .sql = "select sum(count_value) as total, avg(score) as average, sum(price) as price_total from samples",
+        .sql = "select sum(all count_value) as total, avg(all score) as average, sum(price) as price_total from samples",
         .row = struct { total: ?i64, average: ?f64, price_total: ?f64 },
     });
     try sqlite_aggregates.validate(sqlite_schema);
+
+    try std.testing.expectError(error.RowFieldNotProjected, checkQuery(.{
+        .sql = "select count(all *) as total from users",
+        .schema = schema,
+        .row = &.{.{ .name = "total", .type_name = "INT8" }},
+    }));
 
     try std.testing.expectError(error.UnsupportedAggregateType, checkQuery(.{
         .sql = "select sum(email) as total from users",
