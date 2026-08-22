@@ -572,6 +572,10 @@ try qb.bindJoined(.{ 2, "ada" }, ", ");
 // Typed UUIDs are formatted to canonical text and bound through the normal
 // owned-copy path; optional empty values bind SQL null.
 try qb.bindUuid(external_id);
+// Explicit temporal wrappers bind ISO text without hidden timezone policy.
+try qb.bindDate(billing_date);
+try qb.bindTime(reminder_time);
+try qb.bindTimestampUtc(updated_at);
 // qb.sqlSlice() + qb.bindsSlice() for driver execParams/queryParams
 
 // Reuse the configured builder for another statement.
@@ -587,6 +591,9 @@ allocation failure never leave a partial quoted identifier in the SQL buffer.
 `bindUuid` accepts `zsql.types.Uuid` or an optional UUID, formats the value in a
 fixed stack buffer, and copies it through the same atomic text-bind ownership
 path.
+`bindDate`, `bindTime`, and `bindTimestampUtc` provide the same contract for
+explicit temporal wrappers. The timestamp method always emits a UTC `Z` string,
+matching the wrapper's explicit policy; optional empty values bind SQL null.
 
 ### Query hooks
 

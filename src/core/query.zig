@@ -240,6 +240,57 @@ pub const QueryBuilder = struct {
         try self.bind(formatted);
     }
 
+    /// Bind a typed date as ISO calendar text. Optional empty values bind SQL
+    /// null. Formatting uses a fixed stack buffer before the normal owned-copy
+    /// bind path.
+    pub fn bindDate(self: *QueryBuilder, value: anytype) !void {
+        return self.bindTemporal(value, types.Date, "bindDate", types.Date.formatIso);
+    }
+
+    /// Bind a typed time as ISO text with nanosecond precision when present.
+    /// Optional empty values bind SQL null.
+    pub fn bindTime(self: *QueryBuilder, value: anytype) !void {
+        return self.bindTemporal(value, types.Time, "bindTime", types.Time.formatIso);
+    }
+
+    /// Bind a typed UTC timestamp as ISO text ending in `Z`. Optional empty
+    /// values bind SQL null.
+    pub fn bindTimestampUtc(self: *QueryBuilder, value: anytype) !void {
+        return self.bindTemporal(
+            value,
+            types.Timestamp,
+            "bindTimestampUtc",
+            types.Timestamp.formatIsoUtc,
+        );
+    }
+
+    fn bindTemporal(
+        self: *QueryBuilder,
+        value: anytype,
+        comptime expected: type,
+        comptime api_name: []const u8,
+        comptime format: fn (expected, []u8) anyerror![]const u8,
+    ) !void {
+        const T = @TypeOf(value);
+        if (T == @TypeOf(null)) return self.bind(.{ .null = {} });
+
+        const info = @typeInfo(T);
+        if (info == .optional) {
+            if (value) |temporal| return self.bindTemporal(temporal, expected, api_name, format);
+            return self.bind(.{ .null = {} });
+        }
+        if (T != expected) {
+            @compileError("QueryBuilder." ++ api_name ++ " accepts zsql.types." ++
+                @typeName(expected) ++ " or its optional");
+        }
+
+        // The largest documented formatter minimum is 32 bytes; 48 leaves a
+        // small maintenance margin without introducing an allocation.
+        var buffer: [48]u8 = undefined;
+        const formatted = try format(value, &buffer);
+        return self.bind(formatted);
+    }
+
     fn rollbackBind(
         self: *QueryBuilder,
         sql_len: usize,
@@ -507,6 +558,83 @@ test "QueryBuilder.bindUuid cleans every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         exerciseQueryBuilderBindUuidAllocations,
+        .{},
+    );
+}
+
+test "QueryBuilder binds typed temporal values without allocation" {
+    const date = try types.parseIsoDate("2024-02-29");
+    const time = try types.parseIsoTime("04:05:06.007000000");
+    const timestamp = try types.parseIsoTimestamp("1969-12-31 23:59:59.999999");
+
+    var postgres = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer postgres.deinit();
+    try postgres.appendTrustedSql("values (");
+    try postgres.bindDate(date);
+    try postgres.appendTrustedSql(", ");
+    try postgres.bindTime(time);
+    try postgres.appendTrustedSql(", ");
+    try postgres.bindTimestampUtc(timestamp);
+    try postgres.appendTrustedSql(", ");
+    try postgres.bindDate(null);
+    try postgres.appendTrustedSql(", ");
+    try postgres.bindTime(@as(?types.Time, time));
+    try postgres.appendTrustedSql(")");
+
+    try std.testing.expectEqualStrings(
+        "values ($1, $2, $3, $4, $5)",
+        postgres.sqlSlice(),
+    );
+    try std.testing.expectEqualStrings("2024-02-29", postgres.bindsSlice()[0].text);
+    try std.testing.expectEqualStrings("04:05:06.007", postgres.bindsSlice()[1].text);
+    try std.testing.expectEqualStrings(
+        "1969-12-31T23:59:59.999999Z",
+        postgres.bindsSlice()[2].text,
+    );
+    try std.testing.expect(postgres.bindsSlice()[3].isNull());
+    try std.testing.expectEqualStrings("04:05:06.007", postgres.bindsSlice()[4].text);
+    try std.testing.expectEqual(@as(usize, 4), postgres.owned.items.len);
+
+    var sqlite = QueryBuilder.init(std.testing.allocator, .sqlite);
+    defer sqlite.deinit();
+    try sqlite.bindTimestampUtc(timestamp);
+    try sqlite.bindDate(@as(?types.Date, null));
+    try std.testing.expectEqualStrings("??", sqlite.sqlSlice());
+    try std.testing.expectEqualStrings(
+        "1969-12-31T23:59:59.999999Z",
+        sqlite.bindsSlice()[0].text,
+    );
+    try std.testing.expect(sqlite.bindsSlice()[1].isNull());
+}
+
+test "QueryBuilder rejects an invalid typed time before mutation" {
+    var qb = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer qb.deinit();
+    try qb.appendTrustedSql("x");
+    const invalid = types.Time{ .ns_since_midnight = 86_400_000_000_000 };
+
+    try std.testing.expectEqual(
+        error.InvalidArguments,
+        qb.bindTime(invalid),
+    );
+    try std.testing.expectEqualStrings("x", qb.sqlSlice());
+    try std.testing.expectEqual(@as(usize, 0), qb.bindsSlice().len);
+    try std.testing.expectEqual(@as(usize, 0), qb.owned.items.len);
+    try std.testing.expectEqual(@as(usize, 1), qb.next_index);
+}
+
+fn exerciseQueryBuilderTemporalAllocations(allocator: std.mem.Allocator) !void {
+    var qb = QueryBuilder.init(allocator, .postgres);
+    defer qb.deinit();
+    try qb.bindDate(try types.parseIsoDate("2024-02-29"));
+    try qb.bindTime(try types.parseIsoTime("04:05:06.007"));
+    try qb.bindTimestampUtc(try types.parseIsoTimestamp("1969-12-31 23:59:59.999999"));
+}
+
+test "QueryBuilder temporal bindings clean every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseQueryBuilderTemporalAllocations,
         .{},
     );
 }
