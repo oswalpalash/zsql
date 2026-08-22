@@ -575,6 +575,9 @@ try qb.bindJoined(.{ 2, "ada" }, ", ");
 try qb.bindUuid(external_id);
 // The same wrappers work in all-at-once and joined batches.
 try qb.bindAll(.{ external_id, billing_date, reminder_time, updated_at });
+// Compose independently built fragments; PostgreSQL placeholders are renumbered
+// and every bind payload is copied into the destination builder.
+try qb.appendBuilder(&filters);
 // Explicit temporal wrappers bind ISO text without hidden timezone policy.
 try qb.bindDate(billing_date);
 try qb.bindTime(reminder_time);
@@ -588,6 +591,9 @@ qb.reset();
 Builders are deep-copyable. `clone(allocator)` duplicates SQL, placeholder
 state, and owned payload bytes into an independent builder; the source and clone
 can then evolve or reset without affecting each other.
+`appendBuilder` composes another same-dialect builder atomically, renumbering
+PostgreSQL placeholders and copying owned payloads while preserving SQLite `?`
+order.
 
 Unsafe raw append is named `rawUnsafe` on purpose.
 `bind` owns copied text/blob payloads and is failure-atomic: allocation failure

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Value = @import("value.zig").Value;
+const params = @import("params.zig");
 const types = @import("types.zig");
 
 /// Safe dynamic SQL builder for identifiers and bound values.
@@ -69,6 +70,49 @@ pub const QueryBuilder = struct {
         }
         cloned.next_index = self.next_index;
         return cloned;
+    }
+
+    /// Append another builder's SQL and binds, renumbering PostgreSQL
+    /// placeholders into this builder's sequence. The other builder is not
+    /// modified; owned text/blob payloads are copied through the normal atomic
+    /// ownership path.
+    pub fn appendBuilder(self: *QueryBuilder, other: *const QueryBuilder) !void {
+        if (self.dialect != other.dialect) return error.InvalidArguments;
+
+        const sql_len = self.sql.items.len;
+        const binds_len = self.binds.items.len;
+        const owned_len = self.owned.items.len;
+        const next_index = self.next_index;
+        errdefer self.rollbackBind(sql_len, binds_len, owned_len, next_index);
+
+        var composed_sql: std.ArrayListUnmanaged(u8) = .empty;
+        defer composed_sql.deinit(self.allocator);
+        var cursor: usize = 0;
+
+        if (self.dialect == .postgres) {
+            const shift = next_index - 1;
+            var iter = params.Iterator.init(other.sql.items);
+            while (try iter.next()) |placeholder| {
+                if (placeholder.style != .indexed) return error.InvalidArguments;
+                try composed_sql.appendSlice(self.allocator, other.sql.items[cursor..placeholder.offset]);
+                cursor = placeholder.offset + placeholder.len;
+
+                const shifted_index = std.math.add(usize, placeholder.index.?, shift) catch
+                    return error.IntegerOverflow;
+                var number_buf: [32]u8 = undefined;
+                const marker = try std.fmt.bufPrint(&number_buf, "${d}", .{shifted_index});
+                try composed_sql.appendSlice(self.allocator, marker);
+            }
+        }
+
+        try composed_sql.appendSlice(self.allocator, other.sql.items[cursor..]);
+        for (other.binds.items) |value| {
+            const stored = try self.storeValue(value);
+            try self.binds.append(self.allocator, stored);
+        }
+        try self.sql.appendSlice(self.allocator, composed_sql.items);
+        self.next_index = std.math.add(usize, next_index, other.next_index - 1) catch
+            return error.IntegerOverflow;
     }
 
     pub fn appendTrustedSql(self: *QueryBuilder, sql: []const u8) !void {
@@ -771,6 +815,83 @@ test "QueryBuilder clone cleans every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         exerciseQueryBuilderCloneAllocations,
+        .{},
+    );
+}
+
+test "QueryBuilder.appendBuilder composes placeholders and owns payloads" {
+    const date = try types.parseIsoDate("2024-02-29");
+
+    var postgres = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer postgres.deinit();
+    try postgres.appendTrustedSql("select \"id\" from \"items\" where status = ");
+    try postgres.bind(@as([]const u8, "active"));
+    try postgres.appendTrustedSql(" and created_at >= ");
+
+    var filter = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer filter.deinit();
+    try filter.bind(date);
+    try filter.appendTrustedSql(" and external_id = ");
+    const uuid = try types.parseUuid("550E8400-E29B-41D4-A716-4466554400FF");
+    try filter.bind(uuid);
+    try postgres.appendBuilder(&filter);
+
+    try std.testing.expectEqualStrings(
+        "select \"id\" from \"items\" where status = $1 and created_at >= $2 and external_id = $3",
+        postgres.sqlSlice(),
+    );
+    try std.testing.expectEqualStrings("active", postgres.bindsSlice()[0].text);
+    try std.testing.expectEqualStrings("2024-02-29", postgres.bindsSlice()[1].text);
+    try std.testing.expectEqualStrings(
+        "550e8400-e29b-41d4-a716-4466554400ff",
+        postgres.bindsSlice()[2].text,
+    );
+    try std.testing.expectEqual(@as(usize, 4), postgres.next_index);
+
+    var sqlite = QueryBuilder.init(std.testing.allocator, .sqlite);
+    defer sqlite.deinit();
+    try sqlite.appendTrustedSql("where id = ");
+    try sqlite.bind(@as(i64, 7));
+    var extra = QueryBuilder.init(std.testing.allocator, .sqlite);
+    defer extra.deinit();
+    try extra.appendTrustedSql(" or email = ");
+    try extra.bind(@as([]const u8, "ada@example.test"));
+    try sqlite.appendBuilder(&extra);
+    try std.testing.expectEqualStrings("where id = ? or email = ?", sqlite.sqlSlice());
+    try std.testing.expectEqualStrings("ada@example.test", sqlite.bindsSlice()[1].text);
+}
+
+test "QueryBuilder.appendBuilder rejects dialect mismatch atomically" {
+    var postgres = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer postgres.deinit();
+    try postgres.appendTrustedSql("select 1 where name = ");
+    try postgres.bind(@as([]const u8, "kept"));
+
+    var sqlite = QueryBuilder.init(std.testing.allocator, .sqlite);
+    defer sqlite.deinit();
+    try sqlite.bind(@as([]const u8, "ignored"));
+
+    try std.testing.expectError(error.InvalidArguments, postgres.appendBuilder(&sqlite));
+    try std.testing.expectEqualStrings("select 1 where name = $1", postgres.sqlSlice());
+    try std.testing.expectEqual(@as(usize, 1), postgres.bindsSlice().len);
+}
+
+fn exerciseQueryBuilderAppendAllocations(allocator: std.mem.Allocator) !void {
+    var base = QueryBuilder.init(allocator, .postgres);
+    defer base.deinit();
+    var extra = QueryBuilder.init(allocator, .postgres);
+    defer extra.deinit();
+    try base.appendTrustedSql("where name = ");
+    try base.bind(@as([]const u8, "first"));
+    try extra.appendTrustedSql("or note = ");
+    try extra.bind(types.Text{ .bytes = "second" });
+    try base.appendBuilder(&extra);
+}
+
+test "QueryBuilder.appendBuilder cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseQueryBuilderAppendAllocations,
         .{},
     );
 }
