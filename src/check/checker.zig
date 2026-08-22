@@ -19,6 +19,7 @@ pub const CheckError = error{
     InvalidSql,
     TooManyTables,
     TooManyProjections,
+    UnsupportedAggregateType,
 };
 
 /// Progressive offline-validation policy. Existing explicit `check_*` flags
@@ -60,6 +61,8 @@ const ProjectionKind = enum {
     column,
     star,
     count,
+    sum,
+    avg,
     min,
     max,
 };
@@ -198,7 +201,7 @@ pub fn checkQuery(options: struct {
                         _ = findProjectionTableRef(options.schema, resolve_scope, proj.schema_qualifier, q) orelse return error.UnknownTable;
                     }
                 },
-                .column, .count, .min, .max => _ = try resolveProjectionColumn(options.schema, resolve_scope, proj),
+                .column, .count, .sum, .avg, .min, .max => _ = try resolveProjectionColumn(options.schema, resolve_scope, proj),
             }
         }
     }
@@ -311,7 +314,7 @@ fn resolveProjectedField(
 fn resolveProjectionColumn(schema: inspect.Schema, scope: []const TableRef, projection: Projection) CheckError!inspect.Column {
     return switch (projection.kind) {
         .column => (try resolveProjectionRef(schema, scope, projection)).col,
-        .count, .min, .max => try resolveAggregateProjection(schema, scope, projection),
+        .count, .sum, .avg, .min, .max => try resolveAggregateProjection(schema, scope, projection),
         .star => unreachable,
     };
 }
@@ -322,11 +325,21 @@ fn resolveAggregateProjection(schema: inspect.Schema, scope: []const TableRef, p
     else
         try resolveProjectionRef(schema, scope, projection);
 
+    if (projection.kind != .count and source == null) return error.TypeMismatch;
+
     return switch (projection.kind) {
         .count => .{
             .name = "count",
             .type_name = "INT8",
             .nullable = false,
+        },
+        .sum, .avg => .{
+            .name = @tagName(projection.kind),
+            .type_name = aggregateResultType(schema.dialect, projection.kind, source.?.col.type_name) orelse
+                return error.TypeMismatch,
+            // Aggregates over an empty input, or SUM/AVG over all-null input,
+            // produce SQL NULL.
+            .nullable = true,
         },
         .min, .max => .{
             .name = if (projection.kind == .min) "min" else "max",
@@ -350,7 +363,7 @@ fn projectionMatchesField(
     dialect: inspect.Dialect,
 ) bool {
     switch (projection.kind) {
-        .count, .min, .max => {
+        .count, .sum, .avg, .min, .max => {
             const alias = projection.alias orelse return false;
             return sqlOutputIdentEql(alias, field_name, dialect);
         },
@@ -735,6 +748,59 @@ fn isTimestampType(name: []const u8) bool {
 
 fn isNaiveTimeType(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "time");
+}
+
+fn aggregateResultType(
+    dialect: inspect.Dialect,
+    kind: ProjectionKind,
+    source_name: []const u8,
+) ?[]const u8 {
+    const source = normalizeTypeName(source_name);
+
+    return switch (dialect) {
+        .postgres => {
+            const exact_integer = std.ascii.eqlIgnoreCase(source, "int2") or
+                std.ascii.eqlIgnoreCase(source, "int4");
+            const exact_numeric = std.ascii.eqlIgnoreCase(source, "numeric") or
+                std.ascii.eqlIgnoreCase(source, "decimal");
+            const wide_integer = std.ascii.eqlIgnoreCase(source, "int8");
+
+            return switch (kind) {
+                .sum => if (exact_integer)
+                    "INT8"
+                else if (wide_integer or exact_numeric)
+                    "NUMERIC"
+                else
+                    null,
+                .avg => if (exact_integer or wide_integer or exact_numeric)
+                    "NUMERIC"
+                else
+                    null,
+                else => null,
+            };
+        },
+        .sqlite => {
+            const integer = std.ascii.eqlIgnoreCase(source, "integer") or
+                std.ascii.eqlIgnoreCase(source, "int") or
+                std.ascii.eqlIgnoreCase(source, "int8") or
+                std.ascii.eqlIgnoreCase(source, "bigint") or
+                std.ascii.eqlIgnoreCase(source, "smallint");
+            const real = std.ascii.eqlIgnoreCase(source, "real") or
+                std.ascii.eqlIgnoreCase(source, "float") or
+                std.ascii.eqlIgnoreCase(source, "float8") or
+                std.ascii.eqlIgnoreCase(source, "double");
+
+            return switch (kind) {
+                .sum => if (integer) "INT8" else if (real) "FLOAT8" else null,
+                .avg => if (integer or real or std.ascii.eqlIgnoreCase(source, "numeric"))
+                    "FLOAT8"
+                else
+                    null,
+                else => null,
+            };
+        },
+        .unknown => null,
+    };
 }
 
 // --- Lightweight SQL surface scan (quotes / comments aware) ---
@@ -1426,6 +1492,8 @@ fn parseSelectProjections(sql: []const u8, buf: *[max_projections]Projection) Ch
 
 fn projectionFunctionKind(name: []const u8) ?ProjectionKind {
     if (sqlIdentKeywordEql(name, "count")) return .count;
+    if (sqlIdentKeywordEql(name, "sum")) return .sum;
+    if (sqlIdentKeywordEql(name, "avg")) return .avg;
     if (sqlIdentKeywordEql(name, "min")) return .min;
     if (sqlIdentKeywordEql(name, "max")) return .max;
     return null;
@@ -3051,10 +3119,49 @@ test "checked rows support bounded aggregate projection aliases" {
         .row = &.{.{ .name = "total", .type_name = "INT8" }},
     }));
 
+    const pg_schema = inspect.Schema{ .dialect = .postgres, .tables = &.{.{
+        .name = "metrics",
+        .columns = &.{
+            .{ .name = "small_value", .type_name = "int4", .nullable = true },
+            .{ .name = "wide_value", .type_name = "int8", .nullable = true },
+            .{ .name = "amount", .type_name = "numeric", .nullable = true },
+        },
+    }} };
+    const postgres_aggregates = checkedQuery(.{
+        .sql = "select sum(small_value) as small_sum, sum(wide_value) as wide_sum, avg(amount) as average from metrics",
+        .row = struct { small_sum: ?i64, wide_sum: ?sql_types.Numeric, average: ?sql_types.Numeric },
+    });
+    try postgres_aggregates.validate(pg_schema);
+
+    const sqlite_schema = inspect.Schema{ .dialect = .sqlite, .tables = &.{.{
+        .name = "samples",
+        .columns = &.{
+            .{ .name = "count_value", .type_name = "INTEGER", .nullable = true },
+            .{ .name = "score", .type_name = "REAL", .nullable = true },
+        },
+    }} };
+    const sqlite_aggregates = checkedQuery(.{
+        .sql = "select sum(count_value) as total, avg(score) as average from samples",
+        .row = struct { total: ?i64, average: ?f64 },
+    });
+    try sqlite_aggregates.validate(sqlite_schema);
+
+    try std.testing.expectError(error.TypeMismatch, checkQuery(.{
+        .sql = "select sum(email) as total from users",
+        .schema = schema,
+        .row = &.{.{ .name = "total", .type_name = "NUMERIC", .nullable = true }},
+    }));
+    try std.testing.expectError(error.RowFieldNotProjected, checkQuery(.{
+        .sql = "select sum(distinct id) as total from users",
+        .schema = schema,
+        .row = &.{.{ .name = "total", .type_name = "NUMERIC", .nullable = true }},
+    }));
+
     // Dialect-sensitive and context-sensitive expressions remain outside the
     // bounded inference contract, even when they expose an alias.
     for ([_][]const u8{
-        "select sum(id) as total from users",
+        "select sum(id + 1) as total from users",
+        "select avg(id + 1) as total from users",
         "select count(id + 1) as total from users",
         "select count(*) filter (where id > 0) as total from users",
         "select count(*) over () as total from users",
