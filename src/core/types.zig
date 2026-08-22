@@ -208,6 +208,33 @@ pub const Timestamp = struct {
             return self.time.utcTimestamp(self.date);
         }
 
+        /// Decompose into a UTC calendar date and time while retaining all
+        /// nine source nanoseconds.
+        pub fn toUtcDateTime(self: Timestamp.OffsetDateTime) !Timestamp.UtcDateTime {
+            if (self.time.nanos_since_midnight >= 86_400_000_000_000 or
+                self.time.offset_seconds < -86_400 or
+                self.time.offset_seconds > 86_400)
+            {
+                return error.InvalidArguments;
+            }
+
+            const total_ns: i128 = @as(i128, self.date.days_since_unix_epoch) *
+                86_400_000_000_000 +
+                @as(i128, self.time.nanos_since_midnight) -
+                @as(i128, self.time.offset_seconds) * 1_000_000_000;
+            const days_i128 = @divFloor(total_ns, 86_400_000_000_000);
+            const days = std.math.cast(i32, days_i128) orelse return error.Overflow;
+
+            return .{
+                .date = .{ .days_since_unix_epoch = days },
+                .time = .{
+                    .ns_since_midnight = @intCast(
+                        @mod(total_ns, 86_400_000_000_000),
+                    ),
+                },
+            };
+        }
+
         /// Render the same instant using another explicit UTC offset. Unlike a
         /// round trip through microsecond-precision `Timestamp`, this retains
         /// all nine source nanoseconds.
@@ -1232,6 +1259,69 @@ test "decompose timestamps into explicit offset date and time" {
     try std.testing.expectEqual(@as(i32, 84_600), ahead.time.offset_seconds);
 
     try std.testing.expectEqual(timestamp, try ahead.utcTimestamp());
+}
+
+test "decompose offset date/times into UTC without precision loss" {
+    const source = try parseIsoOffsetDateTime(
+        "2024-03-10T01:30:00.123456789-02:30",
+    );
+    const utc = try source.toUtcDateTime();
+    try std.testing.expectEqual(@as(i32, 19792), utc.date.days_since_unix_epoch);
+    try std.testing.expectEqual(
+        @as(u64, 4 * 3_600 * 1_000_000_000 + 123_456_789),
+        utc.time.ns_since_midnight,
+    );
+
+    // A large positive offset moves the UTC wall clock to the previous day.
+    const ahead = try parseIsoOffsetDateTime(
+        "2024-03-10T01:30:00.000000001+05:30",
+    );
+    const previous_day = try ahead.toUtcDateTime();
+    try std.testing.expectEqual(@as(i32, 19791), previous_day.date.days_since_unix_epoch);
+    try std.testing.expectEqual(
+        @as(u64, 20 * 3_600_000_000_000 + 1),
+        previous_day.time.ns_since_midnight,
+    );
+
+    // A negative offset can move the UTC wall clock to the next day.
+    const behind = try parseIsoOffsetDateTime(
+        "2024-03-10T23:30:00.999999999-02:30",
+    );
+    const next_day = try behind.toUtcDateTime();
+    try std.testing.expectEqual(@as(i32, 19793), next_day.date.days_since_unix_epoch);
+    try std.testing.expectEqual(
+        @as(u64, (2 * 3_600) * 1_000_000_000 + 999_999_999),
+        next_day.time.ns_since_midnight,
+    );
+
+    for ([_]i64{ std.math.minInt(i64), 0, std.math.maxInt(i64) }) |unix_us| {
+        const timestamp = Timestamp{ .unix_us = unix_us };
+        for ([_]i32{ -86_400, -9_000, 0, 3_600, 86_400 }) |offset_seconds| {
+            const offset = try timestamp.toOffsetDateTime(offset_seconds);
+            try std.testing.expectEqual(
+                try timestamp.toUtcDateTime(),
+                try offset.toUtcDateTime(),
+            );
+        }
+    }
+
+    const invalid_nanos = OffsetDateTime{
+        .date = try parseIsoDate("2024-03-10"),
+        .time = .{
+            .nanos_since_midnight = 86_400_000_000_000,
+            .offset_seconds = 0,
+        },
+    };
+    try std.testing.expectError(error.InvalidArguments, invalid_nanos.toUtcDateTime());
+
+    const invalid_offset = OffsetDateTime{
+        .date = try parseIsoDate("2024-03-10"),
+        .time = .{
+            .nanos_since_midnight = 0,
+            .offset_seconds = 86_401,
+        },
+    };
+    try std.testing.expectError(error.InvalidArguments, invalid_offset.toUtcDateTime());
 }
 
 test "offset decomposition round-trips deterministic instants" {
