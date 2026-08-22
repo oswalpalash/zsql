@@ -591,6 +591,8 @@ qb.reset();
 Builders are deep-copyable. `clone(allocator)` duplicates SQL, placeholder
 state, and owned payload bytes into an independent builder; the source and clone
 can then evolve or reset without affecting each other.
+Use `cloneSql(allocator)` when the rendered statement must outlive the builder
+but bind ownership is still managed by the original builder.
 `appendBuilder` composes another same-dialect builder atomically, renumbering
 PostgreSQL placeholders and copying owned payloads while preserving SQLite `?`
 order. It rejects self-composition and source builders whose placeholder style,

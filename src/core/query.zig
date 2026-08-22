@@ -132,6 +132,15 @@ pub const QueryBuilder = struct {
             return error.IntegerOverflow;
     }
 
+    /// Copy the composed SQL so it can outlive this builder. Bind payload
+    /// ownership is unaffected; use `clone` when binds must be copied too.
+    pub fn cloneSql(
+        self: *const QueryBuilder,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        return allocator.dupe(u8, self.sql.items);
+    }
+
     pub fn appendTrustedSql(self: *QueryBuilder, sql: []const u8) !void {
         try self.sql.appendSlice(self.allocator, sql);
     }
@@ -944,6 +953,41 @@ test "QueryBuilder.appendBuilder cleans every allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         exerciseQueryBuilderAppendAllocations,
+        .{},
+    );
+}
+
+test "QueryBuilder.cloneSql outlives the builder" {
+    const owned = blk: {
+        var qb = QueryBuilder.init(std.testing.allocator, .sqlite);
+        defer qb.deinit();
+        try qb.appendTrustedSql("select ");
+        try qb.ident("created at");
+        try qb.appendTrustedSql(" from logs where id = ");
+        try qb.bind(@as(i64, 12));
+        break :blk try qb.cloneSql(std.testing.allocator);
+    };
+    defer std.testing.allocator.free(owned);
+
+    try std.testing.expectEqualStrings(
+        "select \"created at\" from logs where id = ?",
+        owned,
+    );
+}
+
+fn exerciseQueryBuilderCloneSqlAllocations(allocator: std.mem.Allocator) !void {
+    var qb = QueryBuilder.init(allocator, .postgres);
+    defer qb.deinit();
+    try qb.appendTrustedSql("select 1 where id = ");
+    try qb.bind(@as(i64, 1));
+    const sql = try qb.cloneSql(allocator);
+    allocator.free(sql);
+}
+
+test "QueryBuilder.cloneSql cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseQueryBuilderCloneSqlAllocations,
         .{},
     );
 }
