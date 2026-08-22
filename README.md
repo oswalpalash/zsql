@@ -705,6 +705,9 @@ functions expose that choice directly. Wrappers can format back into caller
 buffers without allocation (for example, `timestamp.formatIsoUtc(&buffer)`).
 Each wrapper exposes its exact `iso_buffer_len`, so callers can size stack
 storage without overestimating expanded-year output.
+PostgreSQL's BC era suffix and historical timezone offsets containing seconds are
+accepted during this explicit conversion and normalized to astronomical-year UTC
+instants.
 
 ### Offline checks
 

@@ -252,6 +252,10 @@ fn isoParseYearDigits(text: []const u8) !i64 {
     return value;
 }
 
+fn isSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+}
+
 fn isoDaysFromCivilYear(year: i64, month: u8, day: u8) !i64 {
     if (month < 1 or month > 12 or day < 1 or day > 31) return error.TypeMismatch;
 
@@ -278,8 +282,10 @@ fn isoDaysFromCivilYear(year: i64, month: u8, day: u8) !i64 {
 }
 
 const IsoParsedDate = struct {
-    days: i64,
     end: usize,
+    year: i64,
+    month: u8,
+    day: u8,
 };
 
 fn isoParseSignedYear(text: []const u8) !i64 {
@@ -302,11 +308,10 @@ fn isoParseSignedYear(text: []const u8) !i64 {
     if (digits.len < 4) return error.TypeMismatch;
     const magnitude: i64 = try isoParseYearDigits(digits);
     const year = sign * magnitude;
-    if (year == 0) return error.TypeMismatch;
     return year;
 }
 
-fn isoParseDatePrefix(text: []const u8) !struct { days: i64, end: usize } {
+fn isoParseDatePrefix(text: []const u8) !IsoParsedDate {
     if (text.len < 10) return error.TypeMismatch;
 
     var year_start: usize = 0;
@@ -332,17 +337,34 @@ fn isoParseDatePrefix(text: []const u8) !struct { days: i64, end: usize } {
     const month = std.math.cast(u8, month_value) orelse return error.TypeMismatch;
     const day = std.math.cast(u8, day_value) orelse return error.TypeMismatch;
 
-    const cast_year = std.math.cast(i32, year) orelse return error.Overflow;
     return .{
-        .days = try isoDaysFromCivilYear(cast_year, month, day),
         .end = date_end,
+        .year = year,
+        .month = month,
+        .day = day,
     };
 }
 
 fn isoParseDateParts(text: []const u8) !struct { days: i64 } {
-    const parsed = try isoParseDatePrefix(text);
-    if (parsed.end != text.len) return error.TypeMismatch;
-    return .{ .days = parsed.days };
+    const era = try isoSplitEra(text);
+    var parsed = try isoParseDatePrefix(era.text);
+    if (parsed.end != era.text.len) return error.TypeMismatch;
+    if (era.bc and parsed.year <= 0) return error.TypeMismatch;
+    if (era.bc) parsed.year = 1 - parsed.year;
+    const cast_year = std.math.cast(i32, parsed.year) orelse return error.Overflow;
+    return .{ .days = try isoDaysFromCivilYear(cast_year, parsed.month, parsed.day) };
+}
+
+const IsoEra = struct { text: []const u8, bc: bool };
+
+fn isoSplitEra(text: []const u8) !IsoEra {
+    if (text.len >= 2 and std.ascii.eqlIgnoreCase(text[text.len - 2 ..], "bc")) {
+        var end = text.len - 2;
+        while (end > 0 and isSpace(text[end - 1])) end -= 1;
+        if (end == 0) return error.TypeMismatch;
+        return .{ .text = text[0..end], .bc = true };
+    }
+    return .{ .text = text, .bc = false };
 }
 
 fn isoSplitTime(text: []const u8, max_fraction_digits: u8) !IsoTimeParts {
@@ -374,30 +396,45 @@ fn isoSplitTime(text: []const u8, max_fraction_digits: u8) !IsoTimeParts {
     return .{ .ns_since_midnight = ns, .fraction_digits = fraction_digits };
 }
 
-fn isoSplitTimestamp(text: []const u8) !struct { days: i64, time: []const u8 } {
-    const parsed = try isoParseDatePrefix(text);
-    if (parsed.end >= text.len) return error.TypeMismatch;
-    switch (text[parsed.end]) {
+const IsoTimestampParts = struct {
+    days: i64,
+    time: []const u8,
+    bc: bool,
+};
+
+fn isoSplitTimestamp(full_text: []const u8) !IsoTimestampParts {
+    const era = try isoSplitEra(full_text);
+    const parsed = try isoParseDatePrefix(era.text);
+    if (parsed.end >= era.text.len) return error.TypeMismatch;
+    switch (era.text[parsed.end]) {
         'T', ' ', 't' => {},
         else => return error.TypeMismatch,
     }
-    return .{ .days = parsed.days, .time = text[parsed.end + 1 ..] };
+    var year = parsed.year;
+    if (era.bc) {
+        if (year <= 0) return error.TypeMismatch;
+        year = 1 - year;
+    }
+    const cast_year = std.math.cast(i32, year) orelse return error.Overflow;
+    const days = try isoDaysFromCivilYear(cast_year, parsed.month, parsed.day);
+    return .{ .days = days, .time = era.text[parsed.end + 1 ..], .bc = era.bc };
 }
 
-fn isoOffsetMinutes(text: []const u8) !i16 {
+fn isoOffsetSeconds(text: []const u8) !i64 {
     if (text.len == 0) return error.TypeMismatch;
     if (text.len == 1 and (text[0] == 'Z' or text[0] == 'z')) return 0;
 
-    const sign: i16 = switch (text[0]) {
+    const sign: i64 = switch (text[0]) {
         '+' => 1,
         '-' => -1,
         else => return error.TypeMismatch,
     };
     const numeric = text[1..];
-    if (numeric.len == 0 or numeric.len > 5) return error.TypeMismatch;
+    if (numeric.len == 0 or numeric.len > 8) return error.TypeMismatch;
 
     var hours: u16 = 0;
     var minutes: u16 = 0;
+    var seconds: u16 = 0;
     if (numeric.len <= 2) {
         hours = @intCast(try isoParseDigits(numeric));
     } else if (numeric.len == 4) {
@@ -406,11 +443,19 @@ fn isoOffsetMinutes(text: []const u8) !i16 {
     } else if (numeric.len == 5 and numeric[2] == ':') {
         hours = @intCast(try isoParseDigits(numeric[0..2]));
         minutes = @intCast(try isoParseDigits(numeric[3..5]));
+    } else if (numeric.len == 6) {
+        hours = @intCast(try isoParseDigits(numeric[0..2]));
+        minutes = @intCast(try isoParseDigits(numeric[2..4]));
+        seconds = @intCast(try isoParseDigits(numeric[4..6]));
+    } else if (numeric.len == 8 and numeric[2] == ':' and numeric[5] == ':') {
+        hours = @intCast(try isoParseDigits(numeric[0..2]));
+        minutes = @intCast(try isoParseDigits(numeric[3..5]));
+        seconds = @intCast(try isoParseDigits(numeric[6..8]));
     } else {
         return error.TypeMismatch;
     }
-    if (hours > 23 or minutes > 59) return error.TypeMismatch;
-    return sign * @as(i16, @intCast(hours * 60 + minutes));
+    if (hours > 23 or minutes > 59 or seconds > 59) return error.TypeMismatch;
+    return sign * (@as(i64, hours) * 3_600 + @as(i64, minutes) * 60 + seconds);
 }
 
 /// Parse an ISO-style `YYYY-MM-DD` date. This is the explicit opt-in path for
@@ -469,14 +514,14 @@ pub fn parseIsoTimestampTz(text: []const u8) !Timestamp {
         }
     }
     const found_offset = offset_start orelse return error.TypeMismatch;
-    const offset_minutes = try isoOffsetMinutes(parts.time[found_offset..]);
+    const offset_seconds = try isoOffsetSeconds(parts.time[found_offset..]);
 
     var naive = try isoCombineDateAndTime(
         parts.days,
         parts.time[0..found_offset],
     );
 
-    const offset_us = std.math.mul(i64, offset_minutes, 60_000_000) catch return error.Overflow;
+    const offset_us = std.math.mul(i64, offset_seconds, 1_000_000) catch return error.Overflow;
     naive.unix_us = std.math.sub(i64, naive.unix_us, offset_us) catch return error.Overflow;
     return naive;
 }
@@ -530,6 +575,16 @@ test "parse ISO temporal values with explicit precision policy" {
 
     const negative_short_offset = try parseIsoTimestampTz("1970-01-01 00:00:00-0100");
     try std.testing.expectEqual(@as(i64, 3_600_000_000), negative_short_offset.unix_us);
+    const second_offset = try parseIsoTimestampTz("1900-01-01 12:00:00-07:52:58");
+    try std.testing.expectEqual(@as(i64, -2_208_917_222_000_000), second_offset.unix_us);
+
+    // PostgreSQL spells pre-Gregorian output with an era suffix but maps it to
+    // the astronomical year used by Date's signed-year representation.
+    const bc_date = try parseIsoDate("0001-01-01 BC");
+    try std.testing.expectEqual(@as(i32, -719528), bc_date.days_since_unix_epoch);
+    const bc_timestamp = try parseIsoTimestampTz("0001-01-01 00:00:00+00 BC");
+    try std.testing.expectEqual(@as(i64, -62_167_219_200_000_000), bc_timestamp.unix_us);
+    try std.testing.expectEqual(@as(i32, -719528), (try parseIsoDate("0000-01-01")).days_since_unix_epoch);
     try std.testing.expectEqual(@as(i64, 0), (try parseIsoTimestampInstant("1970-01-01 01:00:00+01:00")).unix_us);
     try std.testing.expectEqual(@as(i64, 0), (try parseIsoTimestampInstant("1970-01-01T00:00:00Z")).unix_us);
     try std.testing.expectEqual(@as(i64, 0), (try parseIsoTimestampInstant("1970-01-01")).unix_us);
@@ -541,6 +596,8 @@ test "parse ISO temporal values with explicit precision policy" {
     try std.testing.expectError(error.TypeMismatch, parseIsoTimestamp("2000-01-01 00:00:00Z"));
     try std.testing.expectError(error.TypeMismatch, parseIsoTimestampTz("2000-01-01 00:00:00"));
     try std.testing.expectError(error.TypeMismatch, parseIsoTimestampInstant("not-a-time"));
+    try std.testing.expectError(error.TypeMismatch, parseIsoDate("0001-01-01 B.C."));
+    try std.testing.expectError(error.TypeMismatch, parseIsoDate("0000-01-01 BC"));
 
     // Expanded and signed years round-trip across the full wrapper range.
     var buffer: [40]u8 = undefined;
