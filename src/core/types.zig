@@ -169,14 +169,14 @@ pub const Timestamp = struct {
             Date.iso_buffer_len + 1 + TimeTz.iso_buffer_len;
 
         /// Normalize this wall-clock date/time back to the same UTC instant.
-        pub fn utcTimestamp(self: OffsetDateTime) !Timestamp {
+        pub fn utcTimestamp(self: Timestamp.OffsetDateTime) !Timestamp {
             return self.time.utcTimestamp(self.date);
         }
 
         /// Format the shifted local date and timezone-aware time as one ISO
         /// string without allocation.
-        pub fn formatIso(self: OffsetDateTime, buffer: []u8) ![]const u8 {
-            if (buffer.len < OffsetDateTime.iso_buffer_len) return error.NoSpaceLeft;
+        pub fn formatIso(self: Timestamp.OffsetDateTime, buffer: []u8) ![]const u8 {
+            if (buffer.len < Timestamp.OffsetDateTime.iso_buffer_len) return error.NoSpaceLeft;
 
             const date = try self.date.formatIso(buffer);
             var cursor = date.len;
@@ -207,7 +207,7 @@ pub const Timestamp = struct {
 
     /// Decompose into local calendar and timezone-aware time parts using an
     /// explicit UTC offset in seconds.
-    pub fn toOffsetDateTime(self: Timestamp, offset_seconds: i32) !OffsetDateTime {
+    pub fn toOffsetDateTime(self: Timestamp, offset_seconds: i32) !Timestamp.OffsetDateTime {
         if (offset_seconds < -86_400 or offset_seconds > 86_400) return error.InvalidArguments;
 
         const total_seconds = @divFloor(self.unix_us, 1_000_000);
@@ -273,6 +273,12 @@ pub const Timestamp = struct {
         return buffer[0..cursor];
     }
 };
+
+/// First-class spelling for the explicit offset timestamp returned by
+/// decomposition and policy-preserving parsing. The nested declaration remains
+/// available as the same type for compatibility.
+pub const OffsetDateTime = Timestamp.OffsetDateTime;
+
 pub const Numeric = struct { text: []const u8 };
 pub const Uuid = struct {
     bytes: [16]u8,
@@ -730,7 +736,7 @@ pub fn parseIsoTimestampTz(text: []const u8) !Timestamp {
 /// Parse an ISO timestamp into a wall-clock date/time plus its explicit UTC
 /// offset. Unlike timestamp parsers, this preserves nanosecond precision and
 /// does not normalize away the caller's timezone policy.
-pub fn parseIsoOffsetDateTime(text: []const u8) !Timestamp.OffsetDateTime {
+pub fn parseIsoOffsetDateTime(text: []const u8) !OffsetDateTime {
     const parts = try isoSplitTimestamp(text);
     const split = try isoSplitTimestampOffset(parts.time);
     const time = try isoSplitTime(split.local_time, 9);
@@ -1070,9 +1076,8 @@ test "offset decomposition round-trips deterministic instants" {
 }
 
 test "format offset date/times without allocation" {
-    var buffer: [Timestamp.OffsetDateTime.iso_buffer_len]u8 = undefined;
-    var short_buffer: [Timestamp.OffsetDateTime.iso_buffer_len - 1]u8 =
-        undefined;
+    var buffer: [OffsetDateTime.iso_buffer_len]u8 = undefined;
+    var short_buffer: [OffsetDateTime.iso_buffer_len - 1]u8 = undefined;
     const timestamp = try parseIsoTimestampInstant("2024-03-10T01:30:00.25Z");
     const offset = try timestamp.toOffsetDateTime(-2 * 3_600 - 30 * 60);
 
@@ -1088,7 +1093,7 @@ test "format offset date/times without allocation" {
 
     const wide_date = try parseIsoDate("12000-01-01");
     const historical_time = try parseIsoTimeTz("04:05:06.007000000+07:52:58");
-    const wide_offset = Timestamp.OffsetDateTime{
+    const wide_offset = OffsetDateTime{
         .date = wide_date,
         .time = historical_time,
     };
@@ -1097,7 +1102,7 @@ test "format offset date/times without allocation" {
         try wide_offset.formatIso(&buffer),
     );
 
-    const invalid = Timestamp.OffsetDateTime{
+    const invalid = OffsetDateTime{
         .date = wide_date,
         .time = .{
             .nanos_since_midnight = 86_400_000_000_000,
@@ -1108,7 +1113,7 @@ test "format offset date/times without allocation" {
 }
 
 test "offset formatting round-trips temporal extrema" {
-    var buffer: [Timestamp.OffsetDateTime.iso_buffer_len]u8 = undefined;
+    var buffer: [OffsetDateTime.iso_buffer_len]u8 = undefined;
 
     for ([_]i64{ std.math.minInt(i64), 0, std.math.maxInt(i64) }) |unix_us| {
         for ([_]i32{ -86_400, 0, 86_400 }) |offset_seconds| {
@@ -1125,7 +1130,7 @@ test "offset formatting round-trips temporal extrema" {
 }
 
 test "parse explicit offset date/times without normalization" {
-    var buffer: [Timestamp.OffsetDateTime.iso_buffer_len]u8 = undefined;
+    var buffer: [OffsetDateTime.iso_buffer_len]u8 = undefined;
     const parsed = try parseIsoOffsetDateTime("2024-03-09 23:00:00.25-02:30");
 
     try std.testing.expectEqual(@as(i32, 19791), parsed.date.days_since_unix_epoch);
@@ -1179,6 +1184,10 @@ test "parse explicit offset date/times without normalization" {
         error.TypeMismatch,
         parseIsoOffsetDateTime("2024-03-09T23:00:00.1234567890Z"),
     );
+}
+
+test "OffsetDateTime has a first-class public spelling" {
+    try std.testing.expectEqual(Timestamp.OffsetDateTime, OffsetDateTime);
 }
 
 test "parse exact day-long timezone offsets" {

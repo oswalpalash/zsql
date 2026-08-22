@@ -298,7 +298,7 @@ fn convertValue(comptime T: type, value: Value) !T {
         .text => |v| try types.parseIsoTimestampInstant(v),
         else => error.InvalidColumnType,
     };
-    if (T == types.Timestamp.OffsetDateTime) return switch (value) {
+    if (T == types.OffsetDateTime) return switch (value) {
         .text => |v| try types.parseIsoOffsetDateTime(v),
         else => error.InvalidColumnType,
     };
@@ -486,7 +486,7 @@ test "decode maps strict temporal wrappers from text" {
         .{ .text = "04:05:06.007-07:52:58" },
     );
     const offset_date_time = try decode(
-        types.Timestamp.OffsetDateTime,
+        types.OffsetDateTime,
         .{ .text = "2024-03-09 23:00:00.25-02:30" },
     );
     var buffer: [types.TimeTz.iso_buffer_len]u8 = undefined;
@@ -507,7 +507,7 @@ test "decode maps strict temporal wrappers from text" {
     try std.testing.expectError(error.TypeMismatch, decode(types.Timestamp, .{ .text = "not-a-time" }));
     try std.testing.expectError(
         error.TypeMismatch,
-        decode(types.Timestamp.OffsetDateTime, .{ .text = "2024-03-09T23:00:00" }),
+        decode(types.OffsetDateTime, .{ .text = "2024-03-09T23:00:00" }),
     );
     try std.testing.expectError(error.InvalidColumnType, decode(types.Date, .{ .integer = 19782 }));
 }
@@ -516,7 +516,7 @@ test "Row maps optional temporal wrapper fields" {
     const Event = struct {
         occurred_on: ?types.Date,
         occurred_at: ?types.Timestamp,
-        local_at: ?types.Timestamp.OffsetDateTime,
+        local_at: ?types.OffsetDateTime,
     };
 
     const row = try Row.init(&.{ "occurred_on", "occurred_at", "local_at" }, &.{
@@ -540,7 +540,7 @@ test "Row maps optional temporal wrapper fields" {
     try std.testing.expectEqual(@as(?types.Date, null), empty.occurred_on);
     try std.testing.expectEqual(@as(?types.Timestamp, null), empty.occurred_at);
     try std.testing.expectEqual(
-        @as(?types.Timestamp.OffsetDateTime, null),
+        @as(?types.OffsetDateTime, null),
         empty.local_at,
     );
 }

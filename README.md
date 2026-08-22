@@ -703,8 +703,8 @@ emits lowercase hyphenated text without allocation.
 PostgreSQL date/time values remain raw `.text` at the driver boundary: implicit
 parsing would hide timezone and precision policy. When a checked row field or
 `Row.to` field explicitly chooses `types.Date`, `types.Time`, `types.TimeTz`,
-`types.Timestamp`, or `types.Timestamp.OffsetDateTime`, zsql applies its strict
-ISO parser, including signed/expanded years across the supported `Date` range.
+`types.Timestamp`, or `types.OffsetDateTime`, zsql applies its strict ISO
+parser, including signed/expanded years across the supported `Date` range.
 Naive timestamps are interpreted as UTC;
 `Z` and explicit offsets normalize to UTC. The standalone
 `parseIsoTimestamp`, `.parseIsoTimestampTz`, and `.parseIsoTimestampInstant`
@@ -729,7 +729,7 @@ nanosecond-precision UTC `Time`; `Date.toUtcDateTime` performs the checked
 inverse. For explicit timezone rendering, `Timestamp.toOffsetDateTime(offset)`
 returns the shifted calendar date plus an offset-preserving `TimeTz`.
 `OffsetDateTime.formatIso` renders that local date, time, and numeric offset as
-one string in `Timestamp.OffsetDateTime.iso_buffer_len` bytes. Exact day-long
+one string in `types.OffsetDateTime.iso_buffer_len` bytes. Exact day-long
 (`+/-24:00`) offsets are accepted consistently and wider offsets remain invalid.
 
 ### Offline checks
@@ -965,7 +965,7 @@ Generated struct files import `zsql` themselves, map supported SQL domain types
 to `zsql.types.*` (including date, time, timestamp, and timestamptz), and preserve
 database nullability with optional Zig fields.
 Timestamps default to the normalized UTC wrapper. Pass `--timestamps=offset`
-to map timezone-aware timestamps to `Timestamp.OffsetDateTime`; naive timestamps
+to map timezone-aware timestamps to `types.OffsetDateTime`; naive timestamps
 remain UTC-backed in that mode.
 Column fields preserve their exact SQL names through Zig's quoted-identifier
 syntax when needed. Table types remain PascalCase; normalization collisions get

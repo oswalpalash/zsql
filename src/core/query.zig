@@ -360,8 +360,8 @@ pub const QueryBuilder = struct {
     pub fn bindOffsetDateTime(self: *QueryBuilder, value: anytype) !void {
         return self.bindTemporal(
             value,
-            types.Timestamp.OffsetDateTime,
-            "Timestamp.OffsetDateTime",
+            types.OffsetDateTime,
+            "OffsetDateTime",
         );
     }
 
@@ -420,8 +420,8 @@ pub const QueryBuilder = struct {
             return self.storeValue(.{ .text = formatted });
         }
 
-        if (T == types.Timestamp.OffsetDateTime) {
-            var buffer: [types.Timestamp.OffsetDateTime.iso_buffer_len]u8 = undefined;
+        if (T == types.OffsetDateTime) {
+            var buffer: [types.OffsetDateTime.iso_buffer_len]u8 = undefined;
             const formatted = try value.formatIso(&buffer);
             return self.storeValue(.{ .text = formatted });
         }
@@ -736,7 +736,7 @@ test "QueryBuilder.bindOffsetDateTime preserves offsets" {
     var sqlite = QueryBuilder.init(std.testing.allocator, .sqlite);
     defer sqlite.deinit();
     try sqlite.appendTrustedSql("where logged_at > ");
-    try sqlite.bindOffsetDateTime(@as(?types.Timestamp.OffsetDateTime, offset));
+    try sqlite.bindOffsetDateTime(@as(?types.OffsetDateTime, offset));
 
     try std.testing.expectEqualStrings("values ($1, $2)", postgres.sqlSlice());
     try std.testing.expectEqualStrings(
@@ -818,7 +818,7 @@ test "QueryBuilder rejects an invalid offset date/time before mutation" {
     defer qb.deinit();
     try qb.appendTrustedSql("x");
     const date = try types.parseIsoDate("12000-01-01");
-    const invalid = types.Timestamp.OffsetDateTime{
+    const invalid = types.OffsetDateTime{
         .date = date,
         .time = .{ .nanos_since_midnight = 86_400_000_000_000, .offset_seconds = 0 },
     };

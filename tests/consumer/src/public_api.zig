@@ -43,6 +43,25 @@ pub fn validate() void {
             "drivers",
         });
 
+        requireDecls(zsql.types, .{
+            "Text",
+            "Blob",
+            "Numeric",
+            "Uuid",
+            "Date",
+            "Time",
+            "TimeTz",
+            "Timestamp",
+            "OffsetDateTime",
+            "parseIsoDate",
+            "parseIsoTime",
+            "parseIsoTimeTz",
+            "parseIsoTimestamp",
+            "parseIsoTimestampTz",
+            "parseIsoOffsetDateTime",
+            "parseIsoTimestampInstant",
+        });
+
         requireDriver(zsql.drivers.postgres.Driver);
         requireDecls(zsql.drivers.postgres, .{
             "Config",

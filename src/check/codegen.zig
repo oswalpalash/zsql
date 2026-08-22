@@ -66,7 +66,7 @@ fn zigType(sql_type: []const u8, timestamps: TimestampMapping) []const u8 {
     if (eq(sql_type, "timestamp with time zone") or eq(sql_type, "timestamptz")) {
         return switch (timestamps) {
             .utc => "zsql.types.Timestamp",
-            .offset => "zsql.types.Timestamp.OffsetDateTime",
+            .offset => "zsql.types.OffsetDateTime",
         };
     }
     if (eq(sql_type, "time") or eq(sql_type, "time without time zone")) return "zsql.types.Time";
@@ -212,7 +212,7 @@ test "writeStructs maps common schema types" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         offset_writer.buffered(),
-        "created_at: zsql.types.Timestamp.OffsetDateTime,\n",
+        "created_at: zsql.types.OffsetDateTime,\n",
     ) != null);
 }
 
@@ -233,7 +233,7 @@ test "writeStructs keeps naive timestamps out of opt-in offset mode" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         writer.buffered(),
-        "remote_at: zsql.types.Timestamp.OffsetDateTime,\n",
+        "remote_at: zsql.types.OffsetDateTime,\n",
     ) != null);
 }
 

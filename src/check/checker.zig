@@ -2146,7 +2146,7 @@ fn zigTypeName(comptime T: type) ?[]const u8 {
     if (base == sql_types.Time) return "TIME";
     if (base == sql_types.TimeTz) return "TIMETZ";
     if (base == sql_types.Timestamp) return "TIMESTAMP";
-    if (base == sql_types.Timestamp.OffsetDateTime) return "TIMESTAMPTZ";
+    if (base == sql_types.OffsetDateTime) return "TIMESTAMPTZ";
     if (@typeInfo(base) == .@"enum") return "TEXT";
     return null;
 }
@@ -2402,7 +2402,7 @@ test "checkedQuery distinguishes required-offset timestamps" {
 
     const offset = checkedQuery(.{
         .sql = "select recorded_at from events",
-        .row = struct { recorded_at: sql_types.Timestamp.OffsetDateTime },
+        .row = struct { recorded_at: sql_types.OffsetDateTime },
         .from_table = "events",
     });
     try offset.validate(offset_schema);
