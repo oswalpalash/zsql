@@ -79,6 +79,23 @@ pub const TimeTz = struct {
         return @intCast(@mod(local - offset, 86_400_000_000_000));
     }
 
+    /// Combine this timezone-aware time with a calendar date and normalize the
+    /// result to UTC. The wall-clock date may shift when the offset crosses
+    /// midnight.
+    pub fn utcTimestamp(self: TimeTz, date: Date) !Timestamp {
+        if (self.nanos_since_midnight >= 86_400_000_000_000) return error.InvalidArguments;
+        if (self.offset_seconds < -86_400 or self.offset_seconds > 86_400) {
+            return error.InvalidArguments;
+        }
+
+        const day_us = std.math.mul(i64, date.days_since_unix_epoch, 86_400_000_000) catch
+            return error.Overflow;
+        const local_us: i128 = @intCast(self.nanos_since_midnight / 1_000);
+        const offset_us: i128 = @as(i128, self.offset_seconds) * 1_000_000;
+        const total_us: i128 = @as(i128, day_us) + local_us - offset_us;
+        return .{ .unix_us = std.math.cast(i64, total_us) orelse return error.Overflow };
+    }
+
     /// Format the local time plus an explicit numeric UTC offset. A zero offset
     /// remains `+00:00` so the original timezone policy stays visible.
     pub fn formatIso(self: TimeTz, buffer: []u8) ![]const u8 {
@@ -821,6 +838,34 @@ test "parse and format timezone-aware times" {
     try std.testing.expectError(error.TypeMismatch, parseIsoTimeTz("24:00:00+00"));
     try std.testing.expectError(error.TypeMismatch, parseIsoTimeTz("12:00:00"));
     try std.testing.expectError(error.TypeMismatch, parseIsoTimeTz("12:00:00+25:00"));
+}
+
+test "combine timezone-aware time with calendar date in UTC" {
+    var buffer: [Timestamp.iso_buffer_len]u8 = undefined;
+    const epoch_date = try parseIsoDate("1970-01-01");
+    const one_hour_ahead = try parseIsoTimeTz("01:00:00+01:00");
+    const epoch = try one_hour_ahead.utcTimestamp(epoch_date);
+    try std.testing.expectEqual(@as(i64, 0), epoch.unix_us);
+
+    // 2024-02-29 01:30 local at UTC-02:30 is 04:00 UTC on the same date.
+    const same_day_date = try parseIsoDate("2024-02-29");
+    const behind = try parseIsoTimeTz("01:30:00-02:30");
+    const same_day_utc = try behind.utcTimestamp(same_day_date);
+    try std.testing.expectEqualStrings(
+        "2024-02-29T04:00:00Z",
+        try same_day_utc.formatIsoUtc(&buffer),
+    );
+
+    // 1970-01-01 00:30 local at UTC+01:00 is 1969-12-31 23:30 UTC.
+    const ahead = try parseIsoTimeTz("00:30:00+01:00");
+    const previous_day_utc = try ahead.utcTimestamp(epoch_date);
+    try std.testing.expectEqualStrings(
+        "1969-12-31T23:30:00Z",
+        try previous_day_utc.formatIsoUtc(&buffer),
+    );
+
+    const invalid_time = TimeTz{ .nanos_since_midnight = 86_400_000_000_000, .offset_seconds = 0 };
+    try std.testing.expectError(error.InvalidArguments, invalid_time.utcTimestamp(epoch_date));
 }
 
 test "parseUuid accepts canonical text" {

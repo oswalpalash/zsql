@@ -713,7 +713,8 @@ accepted during this explicit conversion and normalized to astronomical-year UTC
 instants.
 `types.TimeTz` preserves both wall-clock time and numeric UTC offset; its parser
 accepts historical second-bearing offsets and its formatter keeps the timezone
-policy visible.
+policy visible. Callers can combine it with a calendar date through
+`utcTimestamp`, which normalizes across day boundaries in UTC.
 
 ### Offline checks
 
