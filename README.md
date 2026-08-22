@@ -585,6 +585,10 @@ try qb.bindTimestampUtc(updated_at);
 qb.reset();
 ```
 
+Builders are deep-copyable. `clone(allocator)` duplicates SQL, placeholder
+state, and owned payload bytes into an independent builder; the source and clone
+can then evolve or reset without affecting each other.
+
 Unsafe raw append is named `rawUnsafe` on purpose.
 `bind` owns copied text/blob payloads and is failure-atomic: allocation failure
 leaves SQL, bind order, ownership, and the next PostgreSQL placeholder unchanged,

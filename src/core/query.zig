@@ -51,6 +51,26 @@ pub const QueryBuilder = struct {
         self.next_index = 1;
     }
 
+    /// Deep-copy SQL and bind state into an independent builder. Borrowed
+    /// text/blob payloads are duplicated immediately, so either builder can be
+    /// mutated or reset without affecting the other.
+    pub fn clone(
+        self: *const QueryBuilder,
+        allocator: std.mem.Allocator,
+    ) !QueryBuilder {
+        var cloned = QueryBuilder.init(allocator, self.dialect);
+        errdefer cloned.deinit();
+
+        try cloned.sql.appendSlice(allocator, self.sql.items);
+        try cloned.binds.ensureTotalCapacityPrecise(allocator, self.binds.items.len);
+        for (self.binds.items) |value| {
+            const stored = try cloned.storeValue(value);
+            cloned.binds.appendAssumeCapacity(stored);
+        }
+        cloned.next_index = self.next_index;
+        return cloned;
+    }
+
     pub fn appendTrustedSql(self: *QueryBuilder, sql: []const u8) !void {
         try self.sql.appendSlice(self.allocator, sql);
     }
@@ -703,6 +723,56 @@ test "QueryBuilder.reset enables leak-free reuse with fresh placeholders" {
         qb.sqlSlice(),
     );
     try std.testing.expectEqualStrings("second", qb.bindsSlice()[0].text);
+}
+
+test "QueryBuilder clone creates an independent owned builder" {
+    const uuid = try types.parseUuid("550E8400-E29B-41D4-A716-4466554400FF");
+    var cloned = blk: {
+        var source = QueryBuilder.init(std.testing.allocator, .postgres);
+        errdefer source.deinit();
+        try source.appendTrustedSql("select ");
+        try source.ident("payload");
+        try source.appendTrustedSql(" where id = ");
+        try source.bind(@as([]const u8, "owned payload"));
+        try source.appendTrustedSql(" and external_id = ");
+        try source.bind(uuid);
+
+        const result = try source.clone(std.testing.allocator);
+        source.deinit();
+        break :blk result;
+    };
+    defer cloned.deinit();
+
+    try std.testing.expectEqualStrings(
+        "select \"payload\" where id = $1 and external_id = $2",
+        cloned.sqlSlice(),
+    );
+    try std.testing.expectEqualStrings("owned payload", cloned.bindsSlice()[0].text);
+    try std.testing.expectEqualStrings(
+        "550e8400-e29b-41d4-a716-4466554400ff",
+        cloned.bindsSlice()[1].text,
+    );
+    try std.testing.expectEqual(@as(usize, 3), cloned.next_index);
+}
+
+fn exerciseQueryBuilderCloneAllocations(allocator: std.mem.Allocator) !void {
+    var source = QueryBuilder.init(allocator, .sqlite);
+    defer source.deinit();
+    const uuid = try types.parseUuid("550e8400-e29b-41d4-a716-4466554400ff");
+    try source.appendTrustedSql("values (");
+    try source.bind(@as([]const u8, "owned"));
+    try source.bind(Value{ .blob = "\x00" });
+    try source.bind(uuid);
+    var cloned = try source.clone(allocator);
+    defer cloned.deinit();
+}
+
+test "QueryBuilder clone cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseQueryBuilderCloneAllocations,
+        .{},
+    );
 }
 
 test "QueryBuilder.identJoined quotes a dynamic identifier list" {
