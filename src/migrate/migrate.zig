@@ -212,6 +212,16 @@ pub fn containsTransactionControl(sql: []const u8, dialect: Dialect) bool {
         const word = sql[index..token_end];
         if (saw_create and eqlWord(word, "trigger")) trigger_statement = true;
 
+        // PostgreSQL permits a backslash to escape the closing quote only in
+        // explicitly prefixed escape strings; ordinary strings treat it literally.
+        if (dialect == .postgres and eqlWord(word, "e") and
+            token_end < sql.len and sql[token_end] == '\'')
+        {
+            index = skipPostgresEscapeString(sql, token_end);
+            statement_start = false;
+            continue;
+        }
+
         if (sqlite_trigger_body_depth) |depth| {
             if (eqlWord(word, "begin") or eqlWord(word, "case")) {
                 sqlite_trigger_body_depth = depth + 1;
@@ -411,9 +421,34 @@ fn skipBracketIdentifier(sql: []const u8, start: usize) usize {
 fn dollarQuoteTagAt(sql: []const u8, start: usize) ?usize {
     var index = start + 1;
     if (index < sql.len and sql[index] == '$') return index;
-    while (index < sql.len and (std.ascii.isAlphanumeric(sql[index]) or sql[index] == '_')) index += 1;
+    if (index >= sql.len) return null;
+    if (!isIdentifierStart(sql[index])) return null;
+    while (index < sql.len and isDollarTagChar(sql[index])) index += 1;
     if (index < sql.len and sql[index] == '$') return index;
     return null;
+}
+
+fn isDollarTagChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+fn skipPostgresEscapeString(sql: []const u8, start: usize) usize {
+    var index = start + 1;
+    while (index < sql.len) {
+        if (sql[index] == '\'') {
+            if (index + 1 < sql.len and sql[index + 1] == '\'') {
+                index += 2;
+                continue;
+            }
+            return index + 1;
+        }
+        if (sql[index] == '\\' and index + 1 < sql.len) {
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    return sql.len;
 }
 
 fn skipDollarQuoted(sql: []const u8, start: usize, tag_end: usize) ?usize {
@@ -587,6 +622,27 @@ test "migration transaction scanner accepts ordinary scripts and quoted words" {
         try std.testing.expect(!containsTransactionControl(sql, .sqlite));
         try std.testing.expect(!containsTransactionControl(sql, .postgres));
     }
+}
+
+test "migration transaction scanner understands PostgreSQL lexical boundaries" {
+    const accepted = [_][]const u8{
+        "select $1, $body$ commit $body$",
+        "select $$begin$$",
+        "select $route_2$ rollback to savepoint $route_2$",
+        "select e'commit\\'s beginning';",
+        "select E'escaped \\' ; commit; select '''",
+    };
+
+    for (accepted) |sql| {
+        try std.testing.expect(!containsTransactionControl(sql, .postgres));
+    }
+    const escaped = "select E'escaped \\' ; commit; select '''";
+    try std.testing.expect(!containsTransactionControl(escaped, .postgres));
+    try std.testing.expect(containsTransactionControl(escaped, .sqlite));
+    try std.testing.expect(containsTransactionControl(
+        "select e'ordinary quote' from t; commit",
+        .sqlite,
+    ));
 }
 
 test "migration transaction scanner accepts SQLite trigger bodies" {
