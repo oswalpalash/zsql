@@ -99,8 +99,7 @@ pub const TimeTz = struct {
             return error.InvalidArguments;
         }
 
-        const day_us = std.math.mul(i64, date.days_since_unix_epoch, 86_400_000_000) catch
-            return error.Overflow;
+        const day_us: i128 = @as(i128, date.days_since_unix_epoch) * 86_400_000_000;
         const local_us: i128 = @intCast(self.nanos_since_midnight / 1_000);
         const offset_us: i128 = @as(i128, self.offset_seconds) * 1_000_000;
         const total_us: i128 = @as(i128, day_us) + local_us - offset_us;
@@ -171,6 +170,43 @@ pub const Timestamp = struct {
         /// Normalize this wall-clock date/time back to the same UTC instant.
         pub fn utcTimestamp(self: Timestamp.OffsetDateTime) !Timestamp {
             return self.time.utcTimestamp(self.date);
+        }
+
+        /// Render the same instant using another explicit UTC offset. Unlike a
+        /// round trip through microsecond-precision `Timestamp`, this retains
+        /// all nine source nanoseconds.
+        pub fn toOffset(
+            self: Timestamp.OffsetDateTime,
+            offset_seconds: i32,
+        ) !Timestamp.OffsetDateTime {
+            if (self.time.nanos_since_midnight >= 86_400_000_000_000 or
+                self.time.offset_seconds < -86_400 or
+                self.time.offset_seconds > 86_400)
+            {
+                return error.InvalidArguments;
+            }
+            if (offset_seconds < -86_400 or offset_seconds > 86_400) {
+                return error.InvalidArguments;
+            }
+
+            const delta_ns: i128 = @as(i128, offset_seconds) * 1_000_000_000 -
+                @as(i128, self.time.offset_seconds) * 1_000_000_000;
+            const local_ns: i128 = @as(i128, self.date.days_since_unix_epoch) *
+                86_400_000_000_000 +
+                @as(i128, self.time.nanos_since_midnight) + delta_ns;
+            const days_i128 = @divFloor(local_ns, 86_400_000_000_000);
+            const nanos_since_midnight: u64 = @intCast(
+                @mod(local_ns, 86_400_000_000_000),
+            );
+            const days = std.math.cast(i32, days_i128) orelse return error.Overflow;
+
+            return .{
+                .date = .{ .days_since_unix_epoch = days },
+                .time = .{
+                    .nanos_since_midnight = nanos_since_midnight,
+                    .offset_seconds = offset_seconds,
+                },
+            };
         }
 
         /// Format the shifted local date and timezone-aware time as one ISO
@@ -1188,6 +1224,83 @@ test "parse explicit offset date/times without normalization" {
 
 test "OffsetDateTime has a first-class public spelling" {
     try std.testing.expectEqual(Timestamp.OffsetDateTime, OffsetDateTime);
+}
+
+test "convert offset date/times while retaining nanoseconds" {
+    var buffer: [OffsetDateTime.iso_buffer_len]u8 = undefined;
+    const source = try parseIsoOffsetDateTime(
+        "2024-03-10T01:30:00.123456789-02:30",
+    );
+
+    const ahead = try source.toOffset(3_600);
+    try std.testing.expectEqual(@as(i32, 19792), ahead.date.days_since_unix_epoch);
+    try std.testing.expectEqual(
+        @as(u64, 5 * 3_600_000_000_000 + 123_456_789),
+        ahead.time.nanos_since_midnight,
+    );
+    try std.testing.expectEqual(@as(i32, 3_600), ahead.time.offset_seconds);
+    try std.testing.expectEqualStrings(
+        "2024-03-10T05:00:00.123456789+01:00",
+        try ahead.formatIso(&buffer),
+    );
+    try std.testing.expectEqual(
+        try source.utcTimestamp(),
+        try ahead.utcTimestamp(),
+    );
+
+    const behind = try (try parseIsoOffsetDateTime(
+        "2024-03-10T01:30:00.123456789+05:30",
+    )).toOffset(-9_000);
+    try std.testing.expectEqual(@as(i32, 19791), behind.date.days_since_unix_epoch);
+    try std.testing.expectEqual(
+        @as(u64, (17 * 3_600 + 30 * 60) * 1_000_000_000 + 123_456_789),
+        behind.time.nanos_since_midnight,
+    );
+    try std.testing.expectEqual(@as(i32, -9_000), behind.time.offset_seconds);
+
+    try std.testing.expectEqual(source, try source.toOffset(source.time.offset_seconds));
+    try std.testing.expectError(error.InvalidArguments, source.toOffset(86_401));
+}
+
+test "offset conversion covers deterministic temporal extrema" {
+    const offsets = [_]i32{ -86_400, 0, 86_400 };
+
+    for ([_]i64{ std.math.minInt(i64), 0, std.math.maxInt(i64) }) |unix_us| {
+        const timestamp = Timestamp{ .unix_us = unix_us };
+        for (offsets) |old_offset| {
+            const source = try timestamp.toOffsetDateTime(old_offset);
+            for (offsets) |new_offset| {
+                const converted = try source.toOffset(new_offset);
+                try std.testing.expectEqual(
+                    try timestamp.toOffsetDateTime(new_offset),
+                    converted,
+                );
+                try std.testing.expectEqual(timestamp, try converted.utcTimestamp());
+            }
+        }
+    }
+}
+
+test "reject invalid offset date/time conversion state" {
+    const date = try parseIsoDate("2024-03-10");
+    const valid_time = TimeTz{ .nanos_since_midnight = 0, .offset_seconds = 0 };
+    const valid = OffsetDateTime{ .date = date, .time = valid_time };
+    try std.testing.expectError(error.InvalidArguments, valid.toOffset(86_401));
+
+    const invalid_nanos = OffsetDateTime{
+        .date = date,
+        .time = .{
+            .nanos_since_midnight = 86_400_000_000_000,
+            .offset_seconds = 0,
+        },
+    };
+    try std.testing.expectError(error.InvalidArguments, invalid_nanos.toOffset(0));
+
+    const invalid_source_offset = OffsetDateTime{
+        .date = date,
+        .time = .{ .nanos_since_midnight = 0, .offset_seconds = 86_401 },
+    };
+    try std.testing.expectError(error.InvalidArguments, invalid_source_offset.toOffset(0));
 }
 
 test "parse exact day-long timezone offsets" {

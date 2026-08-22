@@ -731,6 +731,9 @@ returns the shifted calendar date plus an offset-preserving `TimeTz`.
 `OffsetDateTime.formatIso` renders that local date, time, and numeric offset as
 one string in `types.OffsetDateTime.iso_buffer_len` bytes. Exact day-long
 (`+/-24:00`) offsets are accepted consistently and wider offsets remain invalid.
+`OffsetDateTime.toOffset(offset)` converts the same instant to another explicit
+offset while retaining nanosecond precision and shifting the wall-clock date as
+needed.
 
 ### Offline checks
 
