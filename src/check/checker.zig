@@ -782,7 +782,9 @@ fn aggregateResultType(
                     null,
                 .avg => if (exact_integer or wide_integer or exact_numeric)
                     "NUMERIC"
-                else if (float4 or float8)
+                else if (float4)
+                    "FLOAT4"
+                else if (float8)
                     "FLOAT8"
                 else
                     null,
@@ -3155,7 +3157,8 @@ test "checked rows support bounded aggregate projection aliases" {
         \\select sum(all small_value) as small_sum,
         \\  sum(wide_value) as wide_sum, sum(sample) as sample_sum,
         \\  sum(measurement) as measurement_sum,
-        \\  avg(all amount) as average, avg(sample) as sample_average
+        \\  avg(all amount) as average,
+        \\  avg(sample) as sample_average, avg(measurement) as measurement_average
         \\from metrics
         ,
         .row = struct {
@@ -3165,6 +3168,7 @@ test "checked rows support bounded aggregate projection aliases" {
             measurement_sum: ?f64,
             average: ?sql_types.Numeric,
             sample_average: ?f64,
+            measurement_average: ?f64,
         },
     });
     try postgres_aggregates.validate(pg_schema);
