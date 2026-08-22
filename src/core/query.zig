@@ -340,6 +340,11 @@ pub const QueryBuilder = struct {
         return self.bindTemporal(value, types.Time, "Time");
     }
 
+    /// Bind a timezone-aware time while preserving its numeric UTC offset.
+    pub fn bindTimeTz(self: *QueryBuilder, value: anytype) !void {
+        return self.bindTemporal(value, types.TimeTz, "TimeTz");
+    }
+
     /// Bind a typed UTC timestamp as ISO text ending in `Z`. Optional empty
     /// values bind SQL null.
     pub fn bindTimestampUtc(self: *QueryBuilder, value: anytype) !void {
@@ -392,11 +397,13 @@ pub const QueryBuilder = struct {
             return self.storeValue(.{ .text = formatted });
         }
 
-        if (T == types.Date or T == types.Time or T == types.Timestamp) {
+        if (T == types.Date or T == types.Time or T == types.Timestamp or T == types.TimeTz) {
             var buffer: [types.Timestamp.iso_buffer_len]u8 = undefined;
             const formatted = if (T == types.Date)
                 try value.formatIso(&buffer)
             else if (T == types.Time)
+                try value.formatIso(&buffer)
+            else if (T == types.TimeTz)
                 try value.formatIso(&buffer)
             else
                 try value.formatIsoUtc(&buffer);
@@ -675,6 +682,27 @@ test "QueryBuilder.bindUuid cleans every allocation failure" {
         exerciseQueryBuilderBindUuidAllocations,
         .{},
     );
+}
+
+test "QueryBuilder.bindTimeTz preserves offsets" {
+    const time_tz = try types.parseIsoTimeTz("04:05:06.007000000-07:52:58");
+
+    var postgres = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer postgres.deinit();
+    try postgres.bindTimeTz(time_tz);
+
+    var sqlite = QueryBuilder.init(std.testing.allocator, .sqlite);
+    defer sqlite.deinit();
+    try sqlite.appendTrustedSql("where logged_at > ");
+    try sqlite.bindTimeTz(@as(?types.TimeTz, time_tz));
+
+    try std.testing.expectEqualStrings("$1", postgres.sqlSlice());
+    try std.testing.expectEqualStrings(
+        "04:05:06.007-07:52:58",
+        postgres.bindsSlice()[0].text,
+    );
+    try std.testing.expectEqualStrings("where logged_at > ?", sqlite.sqlSlice());
+    try std.testing.expectEqualStrings("04:05:06.007-07:52:58", sqlite.bindsSlice()[0].text);
 }
 
 test "QueryBuilder binds typed temporal values without allocation" {

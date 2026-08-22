@@ -290,6 +290,10 @@ fn convertValue(comptime T: type, value: Value) !T {
         .text => |v| try types.parseIsoTime(v),
         else => error.InvalidColumnType,
     };
+    if (T == types.TimeTz) return switch (value) {
+        .text => |v| try types.parseIsoTimeTz(v),
+        else => error.InvalidColumnType,
+    };
     if (T == types.Timestamp) return switch (value) {
         .text => |v| try types.parseIsoTimestampInstant(v),
         else => error.InvalidColumnType,
@@ -473,14 +477,21 @@ test "decode maps strict temporal wrappers from text" {
         types.Timestamp,
         .{ .text = "2024-02-29 06:05:06+02:00" },
     );
+    const time_tz = try decode(
+        types.TimeTz,
+        .{ .text = "04:05:06.007-07:52:58" },
+    );
+    var buffer: [types.TimeTz.iso_buffer_len]u8 = undefined;
 
     try std.testing.expectEqual(@as(i32, 19782), date.days_since_unix_epoch);
     try std.testing.expectEqual(@as(u64, ((4 * 60 + 5) * 60 + 6) * 1_000_000_000 + 7_000_000), time.ns_since_midnight);
     try std.testing.expectEqual(@as(i64, 1709179506000007), naive.unix_us);
     try std.testing.expectEqual(@as(i64, 1709179506000000), offset.unix_us);
+    try std.testing.expectEqualStrings("04:05:06.007-07:52:58", try time_tz.formatIso(&buffer));
 
     try std.testing.expectError(error.TypeMismatch, decode(types.Date, .{ .text = "2024-02-30" }));
     try std.testing.expectError(error.TypeMismatch, decode(types.Time, .{ .text = "24:00:00" }));
+    try std.testing.expectError(error.TypeMismatch, decode(types.TimeTz, .{ .text = "12:00:00" }));
     try std.testing.expectError(error.TypeMismatch, decode(types.Timestamp, .{ .text = "not-a-time" }));
     try std.testing.expectError(error.InvalidColumnType, decode(types.Date, .{ .integer = 19782 }));
 }

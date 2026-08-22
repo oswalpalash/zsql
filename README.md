@@ -699,7 +699,7 @@ emits lowercase hyphenated text without allocation.
 
 PostgreSQL date/time values remain raw `.text` at the driver boundary: implicit
 parsing would hide timezone and precision policy. When a checked row field or
-`Row.to` field explicitly chooses `types.Date`, `types.Time`, or
+`Row.to` field explicitly chooses `types.Date`, `types.Time`, `types.TimeTz`, or
 `types.Timestamp`, zsql applies its strict ISO parser, including signed/expanded
 years across the supported `Date` range. Naive timestamps are interpreted as UTC;
 `Z` and explicit offsets normalize to UTC. The standalone
@@ -711,6 +711,9 @@ storage without overestimating expanded-year output.
 PostgreSQL's BC era suffix and historical timezone offsets containing seconds are
 accepted during this explicit conversion and normalized to astronomical-year UTC
 instants.
+`types.TimeTz` preserves both wall-clock time and numeric UTC offset; its parser
+accepts historical second-bearing offsets and its formatter keeps the timezone
+policy visible.
 
 ### Offline checks
 

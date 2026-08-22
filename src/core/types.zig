@@ -63,6 +63,59 @@ pub const Time = struct {
         return buffer[0..total_len];
     }
 };
+pub const TimeTz = struct {
+    /// Local wall-clock nanoseconds since midnight.
+    nanos_since_midnight: u64,
+    /// UTC offset east of UTC in seconds.
+    offset_seconds: i32,
+
+    /// Exact buffer length required by `formatIso` for every valid value.
+    pub const iso_buffer_len: usize = 27;
+
+    /// UTC nanoseconds since midnight, wrapping across the date boundary.
+    pub fn utcNanosSinceMidnight(self: TimeTz) u64 {
+        const local: i128 = @intCast(self.nanos_since_midnight);
+        const offset: i128 = @as(i128, self.offset_seconds) * 1_000_000_000;
+        return @intCast(@mod(local - offset, 86_400_000_000_000));
+    }
+
+    /// Format the local time plus an explicit numeric UTC offset. A zero offset
+    /// remains `+00:00` so the original timezone policy stays visible.
+    pub fn formatIso(self: TimeTz, buffer: []u8) ![]const u8 {
+        if (buffer.len < iso_buffer_len) return error.NoSpaceLeft;
+        if (self.nanos_since_midnight >= 86_400_000_000_000) return error.InvalidArguments;
+        if (self.offset_seconds < -86_400 or self.offset_seconds > 86_400) {
+            return error.InvalidArguments;
+        }
+
+        const local = try (Time{ .ns_since_midnight = self.nanos_since_midnight }).formatIso(buffer[0..Time.iso_buffer_len]);
+        var cursor: usize = local.len;
+
+        var offset: i32 = self.offset_seconds;
+        buffer[cursor] = if (offset < 0) '-' else '+';
+        cursor += 1;
+        if (offset < 0) offset = -offset;
+        const hours: u8 = @intCast(@divTrunc(offset, 3_600));
+        const minutes: u8 = @intCast(@divTrunc(@mod(offset, 3_600), 60));
+        const seconds: u8 = @intCast(@mod(offset, 60));
+
+        const rendered = try std.fmt.bufPrint(
+            buffer[cursor..],
+            "{d:0>2}:{d:0>2}",
+            .{ hours, minutes },
+        );
+        cursor += rendered.len;
+        if (seconds != 0) {
+            const rendered_seconds = try std.fmt.bufPrint(
+                buffer[cursor..],
+                ":{d:0>2}",
+                .{seconds},
+            );
+            cursor += rendered_seconds.len;
+        }
+        return buffer[0..cursor];
+    }
+};
 pub const Timestamp = struct {
     unix_us: i64,
 
@@ -471,6 +524,33 @@ pub fn parseIsoTime(text: []const u8) !Time {
     return .{ .ns_since_midnight = parsed.ns_since_midnight };
 }
 
+/// Parse a timezone-aware ISO time (`HH:MM[:SS[.fraction]]Z|±HH[:MM[:SS]]`).
+pub fn parseIsoTimeTz(text: []const u8) !TimeTz {
+    if (text.len < 2) return error.TypeMismatch;
+
+    var base_end = text.len;
+    var offset_text: []const u8 = "";
+    const last = text[text.len - 1];
+    if (last == 'Z' or last == 'z') {
+        base_end = text.len - 1;
+        offset_text = text[base_end..];
+    } else {
+        if (std.mem.indexOfAnyPos(u8, text, 1, "+-")) |marker| {
+            base_end = marker;
+            offset_text = text[marker..];
+        }
+    }
+    if (base_end == 0 or offset_text.len == 0) return error.TypeMismatch;
+
+    const time = try isoSplitTime(text[0..base_end], 9);
+    const offset_seconds_i64 = try isoOffsetSeconds(offset_text);
+    if (offset_seconds_i64 < -86_400 or offset_seconds_i64 > 86_400) return error.TypeMismatch;
+    return .{
+        .nanos_since_midnight = time.ns_since_midnight,
+        .offset_seconds = @intCast(offset_seconds_i64),
+    };
+}
+
 fn isoCombineDateAndTime(days: i64, time_text: []const u8) !Timestamp {
     const time = try isoSplitTime(time_text, 6);
     // Widen while combining so a negative date plus a positive time can cross
@@ -714,6 +794,33 @@ test "ISO formatter buffer lengths cover temporal extrema" {
         maximum_timestamp,
         try parseIsoTimestampInstant(try maximum_timestamp.formatIsoUtc(&timestamp_buffer)),
     );
+}
+
+test "parse and format timezone-aware times" {
+    const time_tz = try parseIsoTimeTz("04:05:06.007000000+07:52:58");
+    try std.testing.expectEqual(@as(u64, ((4 * 60 + 5) * 60 + 6) * 1_000_000_000 + 7_000_000), time_tz.nanos_since_midnight);
+    try std.testing.expectEqual(@as(i32, 28378), time_tz.offset_seconds);
+
+    var buffer: [TimeTz.iso_buffer_len]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "04:05:06.007+07:52:58",
+        try time_tz.formatIso(&buffer),
+    );
+
+    const zero_offset = try parseIsoTimeTz("23:59:59Z");
+    try std.testing.expectEqual(@as(i32, 0), zero_offset.offset_seconds);
+    var short_buffer: [TimeTz.iso_buffer_len - 1]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, zero_offset.formatIso(&short_buffer));
+
+    const wrapped_utc = (try parseIsoTimeTz("00:00:00+02:00")).utcNanosSinceMidnight();
+    try std.testing.expectEqual(@as(u64, 22 * 3_600_000_000_000), wrapped_utc);
+
+    const crossed_utc = (try parseIsoTimeTz("01:00:00-01:00")).utcNanosSinceMidnight();
+    try std.testing.expectEqual(@as(u64, 2 * 3_600_000_000_000), crossed_utc);
+
+    try std.testing.expectError(error.TypeMismatch, parseIsoTimeTz("24:00:00+00"));
+    try std.testing.expectError(error.TypeMismatch, parseIsoTimeTz("12:00:00"));
+    try std.testing.expectError(error.TypeMismatch, parseIsoTimeTz("12:00:00+25:00"));
 }
 
 test "parseUuid accepts canonical text" {

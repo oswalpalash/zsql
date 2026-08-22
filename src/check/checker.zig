@@ -663,10 +663,11 @@ fn typesCompatible(want: []const u8, have: []const u8) bool {
     // Blob family
     if (isBlobType(a) and isBlobType(b)) return true;
     // Explicit temporal wrappers have distinct SQL families. TIME WITH TIME
-    // ZONE is deliberately excluded because Time has no offset field.
+    // ZONE has its own wrapper.
     if (isDateType(a) and isDateType(b)) return true;
     if (isTimestampType(a) and isTimestampType(b)) return true;
     if (isNaiveTimeType(a) and isNaiveTimeType(b)) return true;
+    if (isTimeTzType(a) and isTimeTzType(b)) return true;
     return false;
 }
 
@@ -676,7 +677,12 @@ fn normalizeTypeName(name: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(name, "double precision")) return "float8";
     if (std.ascii.indexOfIgnoreCase(name, "timestamp") != null) return "timestamp";
     if (std.ascii.eqlIgnoreCase(name, "time without time zone")) return "time";
+    if (std.ascii.eqlIgnoreCase(name, "time with time zone")) return "timetz";
     return name;
+}
+
+fn isTimeTzType(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "timetz");
 }
 
 fn isIntegerType(name: []const u8) bool {
@@ -2125,6 +2131,7 @@ fn zigTypeName(comptime T: type) ?[]const u8 {
     if (base == sql_types.Uuid) return "UUID";
     if (base == sql_types.Date) return "DATE";
     if (base == sql_types.Time) return "TIME";
+    if (base == sql_types.TimeTz) return "TIMETZ";
     if (base == sql_types.Timestamp) return "TIMESTAMP";
     if (@typeInfo(base) == .@"enum") return "TEXT";
     return null;
@@ -2319,14 +2326,16 @@ test "checkedQuery validates explicit temporal row wrappers" {
     const schema = inspect.Schema{ .tables = &.{.{ .name = "events", .columns = &.{
         .{ .name = "occurred_on", .type_name = "date", .nullable = false },
         .{ .name = "local_time", .type_name = "time without time zone", .nullable = true },
+        .{ .name = "remote_time", .type_name = "timetz", .nullable = true },
         .{ .name = "recorded_at", .type_name = "timestamp with time zone", .nullable = false },
     } }} };
 
     const q = checkedQuery(.{
-        .sql = "select occurred_on, local_time, recorded_at from events",
+        .sql = "select occurred_on, local_time, remote_time, recorded_at from events",
         .row = struct {
             occurred_on: sql_types.Date,
             local_time: ?sql_types.Time,
+            remote_time: ?sql_types.TimeTz,
             recorded_at: sql_types.Timestamp,
         },
         .from_table = "events",
