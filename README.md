@@ -593,7 +593,8 @@ state, and owned payload bytes into an independent builder; the source and clone
 can then evolve or reset without affecting each other.
 `appendBuilder` composes another same-dialect builder atomically, renumbering
 PostgreSQL placeholders and copying owned payloads while preserving SQLite `?`
-order.
+order. It rejects self-composition and source builders whose placeholder style,
+bind count, or PostgreSQL sequence is inconsistent.
 
 Unsafe raw append is named `rawUnsafe` on purpose.
 `bind` owns copied text/blob payloads and is failure-atomic: allocation failure

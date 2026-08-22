@@ -78,6 +78,23 @@ pub const QueryBuilder = struct {
     /// ownership path.
     pub fn appendBuilder(self: *QueryBuilder, other: *const QueryBuilder) !void {
         if (self.dialect != other.dialect) return error.InvalidArguments;
+        if (self == other) return error.InvalidArguments;
+
+        const summary = try params.summarize(other.sql.items);
+        switch (self.dialect) {
+            .postgres => {
+                if (summary.named != 0 or summary.positional != 0) return error.InvalidArguments;
+                if (summary.expectedBindCount() != other.binds.items.len or
+                    other.next_index != summary.expectedBindCount() + 1)
+                {
+                    return error.InvalidArguments;
+                }
+            },
+            .sqlite => {
+                if (summary.named != 0 or summary.indexed != 0) return error.InvalidArguments;
+                if (summary.total != other.binds.items.len) return error.InvalidArguments;
+            },
+        }
 
         const sql_len = self.sql.items.len;
         const binds_len = self.binds.items.len;
@@ -854,10 +871,10 @@ test "QueryBuilder.appendBuilder composes placeholders and owns payloads" {
     try sqlite.bind(@as(i64, 7));
     var extra = QueryBuilder.init(std.testing.allocator, .sqlite);
     defer extra.deinit();
-    try extra.appendTrustedSql(" or email = ");
+    try extra.appendTrustedSql(" or score > ");
     try extra.bind(@as([]const u8, "ada@example.test"));
     try sqlite.appendBuilder(&extra);
-    try std.testing.expectEqualStrings("where id = ? or email = ?", sqlite.sqlSlice());
+    try std.testing.expectEqualStrings("where id = ? or score > ?", sqlite.sqlSlice());
     try std.testing.expectEqualStrings("ada@example.test", sqlite.bindsSlice()[1].text);
 }
 
@@ -874,6 +891,41 @@ test "QueryBuilder.appendBuilder rejects dialect mismatch atomically" {
     try std.testing.expectError(error.InvalidArguments, postgres.appendBuilder(&sqlite));
     try std.testing.expectEqualStrings("select 1 where name = $1", postgres.sqlSlice());
     try std.testing.expectEqual(@as(usize, 1), postgres.bindsSlice().len);
+}
+
+test "QueryBuilder.appendBuilder rejects unsafe source builders" {
+    var source = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer source.deinit();
+    try source.appendTrustedSql("where status = ");
+    try source.bind(@as([]const u8, "active"));
+    const sql_before = try std.testing.allocator.dupe(u8, source.sqlSlice());
+    defer std.testing.allocator.free(sql_before);
+
+    // The method takes another builder, not a cloneable self reference.
+    try std.testing.expectError(
+        error.InvalidArguments,
+        source.appendBuilder(&source),
+    );
+    try std.testing.expectEqualStrings(sql_before, source.sqlSlice());
+    try std.testing.expectEqual(@as(usize, 1), source.bindsSlice().len);
+
+    var stale_postgres = QueryBuilder.init(std.testing.allocator, .postgres);
+    defer stale_postgres.deinit();
+    try stale_postgres.rawUnsafe("id = $9");
+    try stale_postgres.bind(@as(i64, 1));
+    try std.testing.expectError(
+        error.InvalidArguments,
+        source.appendBuilder(&stale_postgres),
+    );
+
+    var named_sqlite = QueryBuilder.init(std.testing.allocator, .sqlite);
+    defer named_sqlite.deinit();
+    try named_sqlite.rawUnsafe("email = :email");
+    try named_sqlite.bind(@as([]const u8, "ada@example.test"));
+    try std.testing.expectError(
+        error.InvalidArguments,
+        source.appendBuilder(&named_sqlite),
+    );
 }
 
 fn exerciseQueryBuilderAppendAllocations(allocator: std.mem.Allocator) !void {
