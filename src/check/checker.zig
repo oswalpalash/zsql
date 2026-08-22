@@ -639,6 +639,12 @@ fn typesCompatible(want: []const u8, have: []const u8) bool {
     const a = normalizeTypeName(want);
     const b = normalizeTypeName(have);
     if (std.ascii.eqlIgnoreCase(a, b)) return true;
+    // An offset-preserving timestamp requires wire text that actually carries
+    // an offset. The UTC Timestamp wrapper remains compatible with either
+    // timestamp spelling because its parser accepts both policies.
+    if (isTimestamptzType(a) and !isTimestamptzType(b)) return false;
+    if ((isTimestampType(a) or isTimestamptzType(a)) and
+        (isTimestampType(b) or isTimestamptzType(b))) return true;
     // PostgreSQL inspection emits authoritative int2/int4/int8 and
     // float4/float8 names. Reject narrowing there. Generic SQL aliases come
     // from SQLite affinity declarations, whose width is not authoritative.
@@ -675,10 +681,16 @@ fn normalizeTypeName(name: []const u8) []const u8 {
     // Strip common modifiers: "character varying", "timestamp without time zone"
     if (std.ascii.eqlIgnoreCase(name, "character varying")) return "varchar";
     if (std.ascii.eqlIgnoreCase(name, "double precision")) return "float8";
+    if (isTimestamptzType(name)) return "timestamptz";
     if (std.ascii.indexOfIgnoreCase(name, "timestamp") != null) return "timestamp";
     if (std.ascii.eqlIgnoreCase(name, "time without time zone")) return "time";
     if (std.ascii.eqlIgnoreCase(name, "time with time zone")) return "timetz";
     return name;
+}
+
+fn isTimestamptzType(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "timestamptz") or
+        std.ascii.indexOfIgnoreCase(name, "timestamp with time zone") != null;
 }
 
 fn isTimeTzType(name: []const u8) bool {
@@ -748,7 +760,8 @@ fn isDateType(name: []const u8) bool {
 }
 
 fn isTimestampType(name: []const u8) bool {
-    // normalizeTypeName folds timestamp, timestamptz, and timezone modifiers.
+    // Timestamptz is canonicalized separately so required-offset wrappers can
+    // reject naive sources while remaining in the broader timestamp family.
     return std.ascii.eqlIgnoreCase(name, "timestamp");
 }
 
@@ -2133,6 +2146,7 @@ fn zigTypeName(comptime T: type) ?[]const u8 {
     if (base == sql_types.Time) return "TIME";
     if (base == sql_types.TimeTz) return "TIMETZ";
     if (base == sql_types.Timestamp) return "TIMESTAMP";
+    if (base == sql_types.Timestamp.OffsetDateTime) return "TIMESTAMPTZ";
     if (@typeInfo(base) == .@"enum") return "TEXT";
     return null;
 }
@@ -2376,6 +2390,32 @@ test "checkedQuery rejects temporal family mismatches" {
         .from_table = "events",
     });
     try std.testing.expectError(error.TypeMismatch, timestamp_as_date.validate(schema));
+}
+
+test "checkedQuery distinguishes required-offset timestamps" {
+    const offset_schema = inspect.Schema{ .tables = &.{.{ .name = "events", .columns = &.{
+        .{ .name = "recorded_at", .type_name = "timestamp with time zone", .nullable = false },
+    } }} };
+    const naive_schema = inspect.Schema{ .tables = &.{.{ .name = "events", .columns = &.{
+        .{ .name = "recorded_at", .type_name = "timestamp without time zone", .nullable = false },
+    } }} };
+
+    const offset = checkedQuery(.{
+        .sql = "select recorded_at from events",
+        .row = struct { recorded_at: sql_types.Timestamp.OffsetDateTime },
+        .from_table = "events",
+    });
+    try offset.validate(offset_schema);
+    try std.testing.expect(!typesCompatible("TIMESTAMPTZ", "TIMESTAMP"));
+    try std.testing.expectError(error.TypeMismatch, offset.validate(naive_schema));
+
+    const utc_timestamp = checkedQuery(.{
+        .sql = "select recorded_at from events",
+        .row = struct { recorded_at: sql_types.Timestamp },
+        .from_table = "events",
+    });
+    try utc_timestamp.validate(offset_schema);
+    try utc_timestamp.validate(naive_schema);
 }
 
 test "typed checkedQuery rejects authoritative numeric narrowing" {
