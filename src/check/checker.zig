@@ -1521,7 +1521,9 @@ fn parseAggregateProjection(sc: *Scanner, kind: ProjectionKind) CheckError!?Proj
     sc.advance();
     try sc.skipTrivia();
     const distinct = try sc.matchKeyword("distinct");
-    if (distinct and kind != .count) return null;
+    // COUNT/SUM/AVG/MIN/MAX DISTINCT over one simple column has the same sound
+    // result type as its non-DISTINCT form; unsupported arguments still fall out
+    // below.
     const first = try sc.readIdentOrStar() orelse return null;
 
     var projection = Projection{ .column = first, .kind = kind };
@@ -3183,11 +3185,43 @@ test "checked rows support bounded aggregate projection aliases" {
         .schema = schema,
         .row = &.{.{ .name = "total", .type_name = "NUMERIC", .nullable = true }},
     }));
-    try std.testing.expectError(error.RowFieldNotProjected, checkQuery(.{
-        .sql = "select sum(distinct id) as total from users",
-        .schema = schema,
-        .row = &.{.{ .name = "total", .type_name = "NUMERIC", .nullable = true }},
-    }));
+    const distinct_pg_schema = inspect.Schema{ .dialect = .postgres, .tables = &.{.{
+        .name = "metrics",
+        .columns = &.{
+            .{ .name = "small_value", .type_name = "int4", .nullable = true },
+            .{ .name = "amount", .type_name = "numeric", .nullable = true },
+            .{ .name = "email", .type_name = "text", .nullable = true },
+        },
+    }} };
+    const postgres_distinct = checkedQuery(.{
+        .sql =
+        \\select count(distinct email) as samples,
+        \\  sum(distinct small_value) as total,
+        \\  avg(distinct amount) as average,
+        \\  min(distinct email) as first_email
+        \\from metrics
+        ,
+        .row = struct {
+            samples: i64,
+            total: ?i64,
+            average: ?sql_types.Numeric,
+            first_email: ?[]const u8,
+        },
+    });
+    try postgres_distinct.validate(distinct_pg_schema);
+
+    const distinct_sqlite_schema = inspect.Schema{ .dialect = .sqlite, .tables = &.{.{
+        .name = "samples",
+        .columns = &.{
+            .{ .name = "count_value", .type_name = "INTEGER", .nullable = true },
+            .{ .name = "score", .type_name = "REAL", .nullable = true },
+        },
+    }} };
+    const sqlite_distinct = checkedQuery(.{
+        .sql = "select min(distinct count_value) as first_count, avg(distinct score) as average from samples",
+        .row = struct { first_count: ?i64, average: ?f64 },
+    });
+    try sqlite_distinct.validate(distinct_sqlite_schema);
 
     // Dialect-sensitive and context-sensitive expressions remain outside the
     // bounded inference contract, even when they expose an alias.
@@ -3200,7 +3234,6 @@ test "checked rows support bounded aggregate projection aliases" {
         "select count(*)::bigint as total from users",
         "select \"count\"(id) as total from users",
         "select min(*) as total from users",
-        "select min(distinct id) as total from users",
         "select max(id + 1) as total from users",
     }) |sql| {
         try std.testing.expectError(error.RowFieldNotProjected, checkQuery(.{
