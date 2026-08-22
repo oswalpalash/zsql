@@ -781,8 +781,9 @@ non-null `INT8` (`i64` in typed rows), and column arguments must resolve in
 scope. Explicitly aliased built-in `[ALL | DISTINCT] MIN(simple_column)`,
 `[ALL | DISTINCT] MAX(simple_column)`, and similar aggregate forms are
 supported; MIN/MAX preserve the source type and are always checked as nullable,
-so typed row fields must be optional. `GROUP BY` and `ORDER BY` may refer to a
-unique projection alias.
+so typed row fields must be optional. `GROUP BY`, `HAVING`, and `ORDER BY` may
+refer to a unique projection alias; HAVING aliases resolve back to their
+supported projection.
 
 For known dialects, explicitly aliased simple-column `SUM` and `AVG` have
 conservative result inference: PostgreSQL maps narrow-integer sums to `INT8`,

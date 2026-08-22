@@ -180,7 +180,7 @@ pub fn checkQuery(options: struct {
         try schemaAsScope(options.schema, &table_buf);
 
     var proj_buf: [max_projections]Projection = undefined;
-    const projs = if (check_projections or check_group_by or check_order_by or options.row.len != 0)
+    const projs = if (check_projections or check_where or check_group_by or check_order_by or options.row.len != 0)
         try parseSelectProjections(options.sql, &proj_buf)
     else
         proj_buf[0..0];
@@ -213,7 +213,7 @@ pub fn checkQuery(options: struct {
 
         var having_buf: [max_projections]Projection = undefined;
         const having_refs = try parseHavingColumnRefs(options.sql, &having_buf);
-        try resolveProjectionRefs(options.schema, resolve_scope, having_refs);
+        try resolveOutputRefs(options.schema, resolve_scope, having_refs, projs);
     }
 
     if (check_join_on) {
@@ -3459,6 +3459,17 @@ test "checkQuery where flag also validates HAVING columns" {
         \\from users
         \\group by active
         \\having active = 1 and count(*) > 0
+        ,
+        .schema = schema,
+        .from_table = "users",
+        .check_where = true,
+    });
+    try checkQuery(.{
+        .sql =
+        \\select active, count(*) as n
+        \\from users
+        \\group by active
+        \\having n > 0
         ,
         .schema = schema,
         .from_table = "users",
