@@ -112,9 +112,9 @@ pub const QueryBuilder = struct {
         }
     }
 
-    /// Bind a parameter. Accepts `Value` or common Zig scalars (`bool`, integers,
-    /// floats, `[]const u8`, optionals, and `null`). Values are never
-    /// concatenated into the SQL string.
+    /// Bind a parameter. Accepts `Value`, common Zig scalars (`bool`, integers,
+    /// floats, `[]const u8`, optionals, and `null`), and explicit SQL-domain
+    /// wrappers. Values are never concatenated into the SQL string.
     pub fn bind(self: *QueryBuilder, value: anytype) !void {
         const sql_len = self.sql.items.len;
         const binds_len = self.binds.items.len;
@@ -122,8 +122,7 @@ pub const QueryBuilder = struct {
         const next_index = self.next_index;
         errdefer self.rollbackBind(sql_len, binds_len, owned_len, next_index);
 
-        const coerced = try coerceValue(value);
-        const stored = try self.storeValue(coerced);
+        const stored = try self.prepareStoredValue(value);
         try self.binds.append(self.allocator, stored);
         switch (self.dialect) {
             .postgres => {
@@ -235,9 +234,7 @@ pub const QueryBuilder = struct {
             @compileError("QueryBuilder.bindUuid accepts zsql.types.Uuid or ?zsql.types.Uuid");
         }
 
-        var buffer: [36]u8 = undefined;
-        const formatted = try value.formatCanonical(&buffer);
-        try self.bind(formatted);
+        return self.bind(value);
     }
 
     /// Bind a typed date as ISO calendar text. Optional empty values bind SQL
@@ -284,11 +281,41 @@ pub const QueryBuilder = struct {
                 @typeName(expected) ++ " or its optional");
         }
 
-        // The largest documented formatter minimum is 32 bytes; 48 leaves a
-        // small maintenance margin without introducing an allocation.
-        var buffer: [48]u8 = undefined;
-        const formatted = try format(value, &buffer);
-        return self.bind(formatted);
+        return self.bind(value);
+    }
+
+    fn prepareStoredValue(self: *QueryBuilder, value: anytype) !Value {
+        const T = @TypeOf(value);
+        if (T == @TypeOf(null)) return .{ .null = {} };
+
+        const info = @typeInfo(T);
+        if (info == .optional) {
+            if (value) |inner| return self.prepareStoredValue(inner);
+            return .{ .null = {} };
+        }
+
+        if (T == types.Text) return self.storeValue(.{ .text = value.bytes });
+        if (T == types.Blob) return self.storeValue(.{ .blob = value.bytes });
+        if (T == types.Numeric) return self.storeValue(.{ .text = value.text });
+
+        if (T == types.Uuid) {
+            var buffer: [36]u8 = undefined;
+            const formatted = try value.formatCanonical(&buffer);
+            return self.storeValue(.{ .text = formatted });
+        }
+
+        if (T == types.Date or T == types.Time or T == types.Timestamp) {
+            var buffer: [48]u8 = undefined;
+            const formatted = if (T == types.Date)
+                try value.formatIso(&buffer)
+            else if (T == types.Time)
+                try value.formatIso(&buffer)
+            else
+                try value.formatIsoUtc(&buffer);
+            return self.storeValue(.{ .text = formatted });
+        }
+
+        return self.storeValue(try coerceValue(value));
     }
 
     fn rollbackBind(
@@ -747,6 +774,73 @@ test "QueryBuilder.bindAll binds tuples, arrays, and slices atomically" {
         );
         try std.testing.expectEqual(@as(usize, 2), qb.bindsSlice().len);
     }
+}
+
+test "QueryBuilder.bindAll accepts explicit SQL domain wrappers" {
+    inline for (.{ QueryBuilder.Dialect.postgres, QueryBuilder.Dialect.sqlite }) |dialect| {
+        var qb = QueryBuilder.init(std.testing.allocator, dialect);
+        defer qb.deinit();
+
+        const uuid = try types.parseUuid("550E8400-E29B-41D4-A716-4466554400FF");
+        const values = .{
+            types.Text{ .bytes = "explicit text" },
+            types.Blob{ .bytes = "\x00\x01" },
+            types.Numeric{ .text = "-12.3400" },
+            uuid,
+            try types.parseIsoDate("2024-02-29"),
+            try types.parseIsoTime("04:05:06.007000000"),
+            try types.parseIsoTimestamp("1969-12-31 23:59:59.999999"),
+        };
+        try qb.appendTrustedSql("values (");
+        try qb.bindJoined(values, ", ");
+        try qb.appendTrustedSql(")");
+
+        try std.testing.expectEqual(@as(usize, 7), qb.bindsSlice().len);
+        try std.testing.expectEqualStrings(
+            if (dialect == .postgres)
+                "values ($1, $2, $3, $4, $5, $6, $7)"
+            else
+                "values (?, ?, ?, ?, ?, ?, ?)",
+            qb.sqlSlice(),
+        );
+        try std.testing.expectEqualStrings("explicit text", qb.bindsSlice()[0].text);
+        try std.testing.expectEqualStrings("\x00\x01", qb.bindsSlice()[1].blob);
+        try std.testing.expectEqualStrings("-12.3400", qb.bindsSlice()[2].text);
+        try std.testing.expectEqualStrings(
+            "550e8400-e29b-41d4-a716-4466554400ff",
+            qb.bindsSlice()[3].text,
+        );
+        try std.testing.expectEqualStrings("2024-02-29", qb.bindsSlice()[4].text);
+        try std.testing.expectEqualStrings("04:05:06.007", qb.bindsSlice()[5].text);
+        try std.testing.expectEqualStrings(
+            "1969-12-31T23:59:59.999999Z",
+            qb.bindsSlice()[6].text,
+        );
+        try std.testing.expectEqual(@as(usize, 7), qb.owned.items.len);
+    }
+}
+
+fn exerciseQueryBuilderDomainWrapperAllocations(allocator: std.mem.Allocator) !void {
+    var qb = QueryBuilder.init(allocator, .postgres);
+    defer qb.deinit();
+    const uuid = try types.parseUuid("550e8400-e29b-41d4-a716-4466554400ff");
+    try qb.bindAll(.{
+        types.Text{ .bytes = "owned" },
+        types.Blob{ .bytes = "\x00" },
+        types.Numeric{ .text = "1.2" },
+        uuid,
+        try types.parseIsoDate("2024-02-29"),
+        try types.parseIsoTime("04:05:06.007"),
+        try types.parseIsoTimestamp("1969-12-31 23:59:59.999999"),
+    });
+}
+
+test "QueryBuilder typed wrapper batches clean every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseQueryBuilderDomainWrapperAllocations,
+        .{},
+    );
 }
 
 test "QueryBuilder.bindJoined emits delimited atomic placeholders" {
