@@ -157,6 +157,18 @@ pub const Timestamp = struct {
         time: Time,
     };
 
+    /// A timestamp decomposed into an explicit calendar date and a local time
+    /// that carries its UTC offset.
+    pub const OffsetDateTime = struct {
+        date: Date,
+        time: TimeTz,
+
+        /// Normalize this wall-clock date/time back to the same UTC instant.
+        pub fn utcTimestamp(self: OffsetDateTime) !Timestamp {
+            return self.time.utcTimestamp(self.date);
+        }
+    };
+
     /// Decompose into a UTC calendar date and nanosecond-precision time.
     pub fn toUtcDateTime(self: Timestamp) !UtcDateTime {
         const seconds = @divFloor(self.unix_us, 1_000_000);
@@ -171,6 +183,30 @@ pub const Timestamp = struct {
             .time = .{
                 .ns_since_midnight = @as(u64, second_of_day) * 1_000_000_000 +
                     @as(u64, microseconds) * 1_000,
+            },
+        };
+    }
+
+    /// Decompose into local calendar and timezone-aware time parts using an
+    /// explicit UTC offset in seconds.
+    pub fn toOffsetDateTime(self: Timestamp, offset_seconds: i32) !OffsetDateTime {
+        if (offset_seconds < -86_400 or offset_seconds > 86_400) return error.InvalidArguments;
+
+        const total_seconds = @divFloor(self.unix_us, 1_000_000);
+        const microseconds: u32 = @intCast(@mod(self.unix_us, 1_000_000));
+        const shifted_seconds = std.math.add(i64, total_seconds, offset_seconds) catch
+            return error.Overflow;
+        const days_i64 = @divFloor(shifted_seconds, 86_400);
+        const seconds_of_day_i64 = @mod(shifted_seconds, 86_400);
+        const days = std.math.cast(i32, days_i64) orelse return error.Overflow;
+        const seconds_of_day: u32 = @intCast(seconds_of_day_i64);
+
+        return .{
+            .date = .{ .days_since_unix_epoch = days },
+            .time = .{
+                .nanos_since_midnight = @as(u64, seconds_of_day) * 1_000_000_000 +
+                    @as(u64, microseconds) * 1_000,
+                .offset_seconds = offset_seconds,
             },
         };
     }
@@ -928,6 +964,36 @@ test "decompose UTC timestamps into explicit date and time" {
             try extreme_parts.date.toUtcDateTime(extreme_parts.time),
         );
     }
+}
+
+test "decompose timestamps into explicit offset date and time" {
+    const timestamp = try parseIsoTimestampInstant("2024-03-10T01:30:00.250000Z");
+    const behind = try timestamp.toOffsetDateTime(-2 * 3_600 - 30 * 60);
+
+    try std.testing.expectEqual(@as(i32, 19791), behind.date.days_since_unix_epoch);
+    try std.testing.expectEqual(
+        @as(u64, 23 * 3_600_000_000_000 + 250_000_000),
+        behind.time.nanos_since_midnight,
+    );
+    try std.testing.expectEqual(@as(i32, -9_000), behind.time.offset_seconds);
+
+    var buffer: [TimeTz.iso_buffer_len]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "23:00:00.25-02:30",
+        try behind.time.formatIso(&buffer),
+    );
+    try std.testing.expectEqual(timestamp, try behind.utcTimestamp());
+
+    // Positive offsets can move the wall clock to the next calendar day.
+    const ahead = try timestamp.toOffsetDateTime(23 * 3_600 + 30 * 60);
+    try std.testing.expectEqual(@as(i32, 19793), ahead.date.days_since_unix_epoch);
+    try std.testing.expectEqual(
+        @as(u64, 3_600_000_000_000 + 250_000_000),
+        ahead.time.nanos_since_midnight,
+    );
+    try std.testing.expectEqual(@as(i32, 84_600), ahead.time.offset_seconds);
+
+    try std.testing.expectEqual(timestamp, try ahead.utcTimestamp());
 }
 
 test "parseUuid accepts canonical text" {

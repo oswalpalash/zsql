@@ -717,7 +717,8 @@ policy visible. Callers can combine it with a calendar date through
 `utcTimestamp`, which normalizes across day boundaries in UTC.
 `Timestamp.toUtcDateTime` decomposes an instant into an explicit `Date` and
 nanosecond-precision UTC `Time`; `Date.toUtcDateTime` performs the checked
-inverse.
+inverse. For explicit timezone rendering, `Timestamp.toOffsetDateTime(offset)`
+returns the shifted calendar date plus an offset-preserving `TimeTz`.
 
 ### Offline checks
 
