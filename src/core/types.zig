@@ -90,6 +90,29 @@ pub const TimeTz = struct {
         return @intCast(@mod(local - offset, 86_400_000_000_000));
     }
 
+    /// Render the same instant of day using another explicit UTC offset. The
+    /// wall-clock time wraps across midnight while retaining all nanoseconds.
+    pub fn toOffset(self: TimeTz, offset_seconds: i32) !TimeTz {
+        if (self.nanos_since_midnight >= 86_400_000_000_000 or
+            self.offset_seconds < -86_400 or
+            self.offset_seconds > 86_400)
+        {
+            return error.InvalidArguments;
+        }
+        if (offset_seconds < -86_400 or offset_seconds > 86_400) {
+            return error.InvalidArguments;
+        }
+
+        const utc_ns: i128 = @intCast(self.utcNanosSinceMidnight());
+        const local_ns: i128 = utc_ns + @as(i128, offset_seconds) * 1_000_000_000;
+        return .{
+            .nanos_since_midnight = @intCast(
+                @mod(local_ns, 86_400_000_000_000),
+            ),
+            .offset_seconds = offset_seconds,
+        };
+    }
+
     /// Combine this timezone-aware time with a calendar date and normalize the
     /// result to UTC. The wall-clock date may shift when the offset crosses
     /// midnight.
@@ -1034,6 +1057,68 @@ test "combine timezone-aware time with calendar date in UTC" {
 
     const invalid_time = TimeTz{ .nanos_since_midnight = 86_400_000_000_000, .offset_seconds = 0 };
     try std.testing.expectError(error.InvalidArguments, invalid_time.utcTimestamp(epoch_date));
+}
+
+test "convert timezone-aware times while retaining nanoseconds" {
+    var buffer: [TimeTz.iso_buffer_len]u8 = undefined;
+    const source = try parseIsoTimeTz("01:30:00.123456789-02:30");
+    const ahead = try source.toOffset(3_600);
+
+    try std.testing.expectEqual(
+        @as(u64, 5 * 3_600_000_000_000 + 123_456_789),
+        ahead.nanos_since_midnight,
+    );
+    try std.testing.expectEqual(@as(i32, 3_600), ahead.offset_seconds);
+    try std.testing.expectEqualStrings(
+        "05:00:00.123456789+01:00",
+        try ahead.formatIso(&buffer),
+    );
+    try std.testing.expectEqual(
+        source.utcNanosSinceMidnight(),
+        ahead.utcNanosSinceMidnight(),
+    );
+
+    const wrapped = try (try parseIsoTimeTz(
+        "00:00:00.999999999Z",
+    )).toOffset(-1);
+    try std.testing.expectEqual(
+        @as(u64, 86_400_000_000_000 - 1),
+        wrapped.nanos_since_midnight,
+    );
+    try std.testing.expectEqual(@as(i32, -1), wrapped.offset_seconds);
+
+    for ([_]i32{ -86_400, -3_723, 0, 2_837_8, 86_400 }) |old_offset| {
+        for ([_]i64{ 0, (17 * 3_600 + 30 * 60) * 1_000_000_000 + 123, 86_400_000_000_000 - 1 }) |nanos| {
+            const original = TimeTz{
+                .nanos_since_midnight = @intCast(nanos),
+                .offset_seconds = old_offset,
+            };
+            for ([_]i32{ -86_400, -9_000, 0, 3_600, 86_400 }) |new_offset| {
+                const converted = try original.toOffset(new_offset);
+                try std.testing.expectEqual(
+                    original.utcNanosSinceMidnight(),
+                    converted.utcNanosSinceMidnight(),
+                );
+            }
+        }
+    }
+}
+
+test "reject invalid timezone-aware time conversion state" {
+    const valid = TimeTz{ .nanos_since_midnight = 0, .offset_seconds = 0 };
+    try std.testing.expectError(error.InvalidArguments, valid.toOffset(86_401));
+
+    const invalid_nanos = TimeTz{
+        .nanos_since_midnight = 86_400_000_000_000,
+        .offset_seconds = 0,
+    };
+    try std.testing.expectError(error.InvalidArguments, invalid_nanos.toOffset(0));
+
+    const invalid_offset = TimeTz{
+        .nanos_since_midnight = 0,
+        .offset_seconds = -86_401,
+    };
+    try std.testing.expectError(error.InvalidArguments, invalid_offset.toOffset(0));
 }
 
 test "decompose UTC timestamps into explicit date and time" {
